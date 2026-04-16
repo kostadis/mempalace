@@ -66,12 +66,12 @@ def test_load_config_uses_defaults_when_yaml_missing():
         shutil.rmtree(tmpdir)
 
 
-def test_scan_project_respects_gitignore():
+def test_scan_project_respects_mempalaceignore():
     tmpdir = tempfile.mkdtemp()
     try:
         project_root = Path(tmpdir).resolve()
 
-        write_file(project_root / ".gitignore", "ignored.py\ngenerated/\n")
+        write_file(project_root / ".mempalaceignore", "ignored.py\ngenerated/\n")
         write_file(project_root / "src" / "app.py", "print('hello')\n" * 20)
         write_file(project_root / "ignored.py", "print('ignore me')\n" * 20)
         write_file(project_root / "generated" / "artifact.py", "print('artifact')\n" * 20)
@@ -81,13 +81,13 @@ def test_scan_project_respects_gitignore():
         shutil.rmtree(tmpdir)
 
 
-def test_scan_project_respects_nested_gitignore():
+def test_scan_project_respects_nested_mempalaceignore():
     tmpdir = tempfile.mkdtemp()
     try:
         project_root = Path(tmpdir).resolve()
 
-        write_file(project_root / ".gitignore", "*.log\n")
-        write_file(project_root / "subrepo" / ".gitignore", "tasks/\n")
+        write_file(project_root / ".mempalaceignore", "*.log\n")
+        write_file(project_root / "subrepo" / ".mempalaceignore", "tasks/\n")
         write_file(project_root / "subrepo" / "src" / "main.py", "print('main')\n" * 20)
         write_file(project_root / "subrepo" / "tasks" / "task.py", "print('task')\n" * 20)
         write_file(project_root / "subrepo" / "debug.log", "debug\n" * 20)
@@ -97,13 +97,13 @@ def test_scan_project_respects_nested_gitignore():
         shutil.rmtree(tmpdir)
 
 
-def test_scan_project_allows_nested_gitignore_override():
+def test_scan_project_allows_nested_mempalaceignore_override():
     tmpdir = tempfile.mkdtemp()
     try:
         project_root = Path(tmpdir).resolve()
 
-        write_file(project_root / ".gitignore", "*.csv\n")
-        write_file(project_root / "subrepo" / ".gitignore", "!keep.csv\n")
+        write_file(project_root / ".mempalaceignore", "*.csv\n")
+        write_file(project_root / "subrepo" / ".mempalaceignore", "!keep.csv\n")
         write_file(project_root / "drop.csv", "a,b,c\n" * 20)
         write_file(project_root / "subrepo" / "keep.csv", "a,b,c\n" * 20)
 
@@ -112,12 +112,12 @@ def test_scan_project_allows_nested_gitignore_override():
         shutil.rmtree(tmpdir)
 
 
-def test_scan_project_allows_gitignore_negation_when_parent_dir_is_visible():
+def test_scan_project_allows_mempalaceignore_negation_when_parent_dir_is_visible():
     tmpdir = tempfile.mkdtemp()
     try:
         project_root = Path(tmpdir).resolve()
 
-        write_file(project_root / ".gitignore", "generated/*\n!generated/keep.py\n")
+        write_file(project_root / ".mempalaceignore", "generated/*\n!generated/keep.py\n")
         write_file(project_root / "generated" / "drop.py", "print('drop')\n" * 20)
         write_file(project_root / "generated" / "keep.py", "print('keep')\n" * 20)
 
@@ -131,7 +131,7 @@ def test_scan_project_does_not_reinclude_file_from_ignored_directory():
     try:
         project_root = Path(tmpdir).resolve()
 
-        write_file(project_root / ".gitignore", "generated/\n!generated/keep.py\n")
+        write_file(project_root / ".mempalaceignore", "generated/\n!generated/keep.py\n")
         write_file(project_root / "generated" / "drop.py", "print('drop')\n" * 20)
         write_file(project_root / "generated" / "keep.py", "print('keep')\n" * 20)
 
@@ -140,15 +140,15 @@ def test_scan_project_does_not_reinclude_file_from_ignored_directory():
         shutil.rmtree(tmpdir)
 
 
-def test_scan_project_can_disable_gitignore():
+def test_scan_project_can_disable_mempalaceignore():
     tmpdir = tempfile.mkdtemp()
     try:
         project_root = Path(tmpdir).resolve()
 
-        write_file(project_root / ".gitignore", "data/\n")
+        write_file(project_root / ".mempalaceignore", "data/\n")
         write_file(project_root / "data" / "stuff.csv", "a,b,c\n" * 20)
 
-        assert scanned_files(project_root, respect_gitignore=False) == ["data/stuff.csv"]
+        assert scanned_files(project_root, respect_ignore=False) == ["data/stuff.csv"]
     finally:
         shutil.rmtree(tmpdir)
 
@@ -158,7 +158,7 @@ def test_scan_project_can_include_ignored_directory():
     try:
         project_root = Path(tmpdir).resolve()
 
-        write_file(project_root / ".gitignore", "docs/\n")
+        write_file(project_root / ".mempalaceignore", "docs/\n")
         write_file(project_root / "docs" / "guide.md", "# Guide\n" * 20)
 
         assert scanned_files(project_root, include_ignored=["docs"]) == ["docs/guide.md"]
@@ -171,7 +171,7 @@ def test_scan_project_can_include_specific_ignored_file():
     try:
         project_root = Path(tmpdir).resolve()
 
-        write_file(project_root / ".gitignore", "generated/\n")
+        write_file(project_root / ".mempalaceignore", "generated/\n")
         write_file(project_root / "generated" / "drop.py", "print('drop')\n" * 20)
         write_file(project_root / "generated" / "keep.py", "print('keep')\n" * 20)
 
@@ -187,7 +187,7 @@ def test_scan_project_can_include_exact_file_without_known_extension():
     try:
         project_root = Path(tmpdir).resolve()
 
-        write_file(project_root / ".gitignore", "README\n")
+        write_file(project_root / ".mempalaceignore", "README\n")
         write_file(project_root / "README", "hello\n" * 20)
 
         assert scanned_files(project_root, include_ignored=["README"]) == ["README"]
@@ -204,7 +204,7 @@ def test_scan_project_include_override_beats_skip_dirs():
 
         assert scanned_files(
             project_root,
-            respect_gitignore=False,
+            respect_ignore=False,
             include_ignored=[".pytest_cache"],
         ) == [".pytest_cache/cache.py"]
     finally:
@@ -219,7 +219,7 @@ def test_scan_project_skip_dirs_still_apply_without_override():
         write_file(project_root / ".pytest_cache" / "cache.py", "print('cache')\n" * 20)
         write_file(project_root / "main.py", "print('main')\n" * 20)
 
-        assert scanned_files(project_root, respect_gitignore=False) == ["main.py"]
+        assert scanned_files(project_root, respect_ignore=False) == ["main.py"]
     finally:
         shutil.rmtree(tmpdir)
 

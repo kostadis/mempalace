@@ -141,7 +141,7 @@ def cmd_mine(args):
             agent=args.agent,
             limit=args.limit,
             dry_run=args.dry_run,
-            respect_gitignore=not args.no_gitignore,
+            respect_ignore=not args.no_mempalaceignore,
             include_ignored=include_ignored,
         )
 
@@ -563,9 +563,10 @@ def main():
     )
     p_mine.add_argument("--wing", default=None, help="Wing name (default: directory name)")
     p_mine.add_argument(
+        "--no-mempalaceignore",
         "--no-gitignore",
         action="store_true",
-        help="Don't respect .gitignore files when scanning project files",
+        help="Don't respect .mempalaceignore / .gitignore files when scanning project files",
     )
     p_mine.add_argument(
         "--include-ignored",
