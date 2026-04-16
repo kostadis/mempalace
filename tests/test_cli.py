@@ -160,7 +160,7 @@ def test_cmd_mine_projects_mode(mock_config_cls):
         agent="mempalace",
         limit=0,
         dry_run=False,
-        no_gitignore=False,
+        no_mempalaceignore=False,
         include_ignored=[],
         extract="exchange",
     )
@@ -173,7 +173,7 @@ def test_cmd_mine_projects_mode(mock_config_cls):
             agent="mempalace",
             limit=0,
             dry_run=False,
-            respect_gitignore=True,
+            respect_ignore=True,
             include_ignored=[],
         )
 
@@ -189,7 +189,7 @@ def test_cmd_mine_convos_mode(mock_config_cls):
         agent="me",
         limit=10,
         dry_run=True,
-        no_gitignore=False,
+        no_mempalaceignore=False,
         include_ignored=[],
         extract="general",
     )
@@ -217,7 +217,7 @@ def test_cmd_mine_include_ignored_comma_split(mock_config_cls):
         agent="mempalace",
         limit=0,
         dry_run=False,
-        no_gitignore=False,
+        no_mempalaceignore=False,
         include_ignored=["a.txt,b.txt", "c.txt"],
         extract="exchange",
     )
