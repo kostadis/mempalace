@@ -62,6 +62,7 @@ SKIP_FILENAMES = {
     "mempal.yaml",
     "mempal.yml",
     ".gitignore",
+    ".mempalaceignore",
     "package-lock.json",
 }
 
@@ -84,8 +85,12 @@ MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
 # =============================================================================
 
 
-class GitignoreMatcher:
-    """Lightweight matcher for one directory's .gitignore patterns."""
+class IgnoreMatcher:
+    """Lightweight matcher for one directory's .mempalaceignore patterns.
+
+    Falls back to .gitignore when no .mempalaceignore exists so that
+    projects without a dedicated ignore file still get sensible defaults.
+    """
 
     def __init__(self, base_dir: Path, rules: list):
         self.base_dir = base_dir
@@ -93,12 +98,14 @@ class GitignoreMatcher:
 
     @classmethod
     def from_dir(cls, dir_path: Path):
-        gitignore_path = dir_path / ".gitignore"
-        if not gitignore_path.is_file():
+        ignore_path = dir_path / ".mempalaceignore"
+        if not ignore_path.is_file():
+            ignore_path = dir_path / ".gitignore"
+        if not ignore_path.is_file():
             return None
 
         try:
-            lines = gitignore_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            lines = ignore_path.read_text(encoding="utf-8", errors="replace").splitlines()
         except Exception:
             return None
 
@@ -200,15 +207,15 @@ class GitignoreMatcher:
         return matches(0, 0)
 
 
-def load_gitignore_matcher(dir_path: Path, cache: dict):
-    """Load and cache one directory's .gitignore matcher."""
+def load_ignore_matcher(dir_path: Path, cache: dict):
+    """Load and cache one directory's .mempalaceignore (or .gitignore) matcher."""
     if dir_path not in cache:
-        cache[dir_path] = GitignoreMatcher.from_dir(dir_path)
+        cache[dir_path] = IgnoreMatcher.from_dir(dir_path)
     return cache[dir_path]
 
 
-def is_gitignored(path: Path, matchers: list, is_dir: bool = False) -> bool:
-    """Apply active .gitignore matchers in ancestor order; last match wins."""
+def is_ignored(path: Path, matchers: list, is_dir: bool = False) -> bool:
+    """Apply active ignore matchers in ancestor order; last match wins."""
     ignored = False
     for matcher in matchers:
         decision = matcher.matches(path, is_dir=is_dir)
@@ -218,7 +225,7 @@ def is_gitignored(path: Path, matchers: list, is_dir: bool = False) -> bool:
 
 
 def should_skip_dir(dirname: str) -> bool:
-    """Skip known generated/cache directories before gitignore matching."""
+    """Skip known generated/cache directories before ignore matching."""
     return dirname in SKIP_DIRS or dirname.endswith(".egg-info")
 
 
@@ -916,10 +923,14 @@ def process_file(
 
 def scan_project(
     project_dir: str,
-    respect_gitignore: bool = True,
+    respect_ignore: bool = True,
     include_ignored: list = None,
 ) -> list:
-    """Return list of all readable file paths."""
+    """Return list of all readable file paths.
+
+    Reads ``.mempalaceignore`` files (falls back to ``.gitignore``) to
+    decide which paths to skip during mining.
+    """
     project_path = Path(project_dir).expanduser().resolve()
     files = []
     active_matchers = []
@@ -929,13 +940,13 @@ def scan_project(
     for root, dirs, filenames in os.walk(project_path):
         root_path = Path(root)
 
-        if respect_gitignore:
+        if respect_ignore:
             active_matchers = [
                 matcher
                 for matcher in active_matchers
                 if root_path == matcher.base_dir or matcher.base_dir in root_path.parents
             ]
-            current_matcher = load_gitignore_matcher(root_path, matcher_cache)
+            current_matcher = load_ignore_matcher(root_path, matcher_cache)
             if current_matcher is not None:
                 active_matchers.append(current_matcher)
 
@@ -945,12 +956,12 @@ def scan_project(
             if is_force_included(root_path / d, project_path, include_paths)
             or not should_skip_dir(d)
         ]
-        if respect_gitignore and active_matchers:
+        if respect_ignore and active_matchers:
             dirs[:] = [
                 d
                 for d in dirs
                 if is_force_included(root_path / d, project_path, include_paths)
-                or not is_gitignored(root_path / d, active_matchers, is_dir=True)
+                or not is_ignored(root_path / d, active_matchers, is_dir=True)
             ]
 
         for filename in filenames:
@@ -962,8 +973,8 @@ def scan_project(
                 continue
             if filepath.suffix.lower() not in READABLE_EXTENSIONS and not exact_force_include:
                 continue
-            if respect_gitignore and active_matchers and not force_include:
-                if is_gitignored(filepath, active_matchers, is_dir=False):
+            if respect_ignore and active_matchers and not force_include:
+                if is_ignored(filepath, active_matchers, is_dir=False):
                     continue
             # Skip symlinks — prevents following links to /dev/urandom, etc.
             if filepath.is_symlink():
@@ -990,7 +1001,7 @@ def mine(
     agent: str = "mempalace",
     limit: int = 0,
     dry_run: bool = False,
-    respect_gitignore: bool = True,
+    respect_ignore: bool = True,
     include_ignored: list = None,
     files: list = None,
 ):
@@ -1011,7 +1022,7 @@ def mine(
             agent=agent,
             limit=limit,
             dry_run=dry_run,
-            respect_gitignore=respect_gitignore,
+            respect_ignore=respect_ignore,
             include_ignored=include_ignored,
             files=files,
         )
@@ -1025,7 +1036,7 @@ def mine(
                 agent=agent,
                 limit=limit,
                 dry_run=dry_run,
-                respect_gitignore=respect_gitignore,
+                respect_ignore=respect_ignore,
                 include_ignored=include_ignored,
                 files=files,
             )
@@ -1045,7 +1056,7 @@ def _mine_impl(
     agent: str = "mempalace",
     limit: int = 0,
     dry_run: bool = False,
-    respect_gitignore: bool = True,
+    respect_ignore: bool = True,
     include_ignored: list = None,
     files: list = None,
 ):
@@ -1058,7 +1069,7 @@ def _mine_impl(
     if files is None:
         files = scan_project(
             project_dir,
-            respect_gitignore=respect_gitignore,
+            respect_ignore=respect_ignore,
             include_ignored=include_ignored,
         )
     if limit > 0:
@@ -1076,8 +1087,8 @@ def _mine_impl(
     print(f"  Device:  {describe_device()}")
     if dry_run:
         print("  DRY RUN — nothing will be filed")
-    if not respect_gitignore:
-        print("  .gitignore: DISABLED")
+    if not respect_ignore:
+        print("  .mempalaceignore: DISABLED")
     if include_ignored:
         print(f"  Include: {', '.join(sorted(normalize_include_paths(include_ignored)))}")
     print(f"{'-' * 55}\n")
