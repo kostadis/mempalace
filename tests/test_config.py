@@ -100,6 +100,123 @@ def test_palaces_property_ignores_non_dict():
     assert cfg.palaces == {}
 
 
+# --- walk_up_palace + resolved_palace_path ---
+
+
+def _write_yaml(path, data):
+    import yaml as _yaml
+
+    with open(path, "w") as f:
+        _yaml.safe_dump(data, f)
+
+
+def test_walk_up_finds_yaml_in_start_dir(tmp_path):
+    project = tmp_path / "campaign"
+    project.mkdir()
+    _write_yaml(project / "mempalace.yaml", {"palace": "/palaces/oota", "wing": "narrative"})
+    cfg = MempalaceConfig(config_dir=str(tmp_path / "cfg"))
+    assert cfg.walk_up_palace(start_dir=str(project)) == "/palaces/oota"
+
+
+def test_walk_up_finds_yaml_in_ancestor(tmp_path):
+    project = tmp_path / "campaign"
+    nested = project / "docs" / "chapters"
+    nested.mkdir(parents=True)
+    _write_yaml(project / "mempalace.yaml", {"palace": "/palaces/oota"})
+    cfg = MempalaceConfig(config_dir=str(tmp_path / "cfg"))
+    assert cfg.walk_up_palace(start_dir=str(nested)) == "/palaces/oota"
+
+
+def test_walk_up_returns_none_when_no_yaml(tmp_path):
+    cfg = MempalaceConfig(config_dir=str(tmp_path / "cfg"))
+    assert cfg.walk_up_palace(start_dir=str(tmp_path)) is None
+
+
+def test_walk_up_skips_yaml_without_palace_key(tmp_path):
+    project = tmp_path / "campaign"
+    project.mkdir()
+    _write_yaml(project / "mempalace.yaml", {"wing": "narrative"})
+    cfg = MempalaceConfig(config_dir=str(tmp_path / "cfg"))
+    assert cfg.walk_up_palace(start_dir=str(project)) is None
+
+
+def test_walk_up_resolves_alias(tmp_path):
+    project = tmp_path / "campaign"
+    project.mkdir()
+    _write_yaml(project / "mempalace.yaml", {"palace": "oota"})
+    cfg_dir = tmp_path / "cfg"
+    cfg_dir.mkdir()
+    with open(cfg_dir / "config.json", "w") as f:
+        json.dump({"palaces": {"oota": "/palaces/oota"}}, f)
+    cfg = MempalaceConfig(config_dir=str(cfg_dir))
+    assert cfg.walk_up_palace(start_dir=str(project)) == "/palaces/oota"
+
+
+def test_walk_up_propagates_unknown_alias(tmp_path):
+    project = tmp_path / "campaign"
+    project.mkdir()
+    _write_yaml(project / "mempalace.yaml", {"palace": "missing"})
+    cfg = MempalaceConfig(config_dir=str(tmp_path / "cfg"))
+    with pytest.raises(ValueError, match="unknown palace alias"):
+        cfg.walk_up_palace(start_dir=str(project))
+
+
+def test_walk_up_survives_malformed_yaml(tmp_path):
+    project = tmp_path / "campaign"
+    project.mkdir()
+    (project / "mempalace.yaml").write_text(": : not valid yaml :")
+    cfg = MempalaceConfig(config_dir=str(tmp_path / "cfg"))
+    assert cfg.walk_up_palace(start_dir=str(project)) is None
+
+
+def test_resolved_palace_path_env_wins(tmp_path, monkeypatch):
+    project = tmp_path / "campaign"
+    project.mkdir()
+    _write_yaml(project / "mempalace.yaml", {"palace": "/palaces/oota"})
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", "/env/palace")
+    monkeypatch.chdir(project)
+    cfg = MempalaceConfig(config_dir=str(tmp_path / "cfg"))
+    assert cfg.resolved_palace_path() == "/env/palace"
+
+
+def test_resolved_palace_path_walk_up_wins_over_default(tmp_path, monkeypatch):
+    project = tmp_path / "campaign"
+    project.mkdir()
+    _write_yaml(project / "mempalace.yaml", {"palace": "/palaces/oota"})
+    monkeypatch.delenv("MEMPALACE_PALACE_PATH", raising=False)
+    monkeypatch.delenv("MEMPAL_PALACE_PATH", raising=False)
+    monkeypatch.chdir(project)
+    cfg = MempalaceConfig(config_dir=str(tmp_path / "cfg"))
+    assert cfg.resolved_palace_path() == "/palaces/oota"
+
+
+def test_resolved_palace_path_default_palace_alias(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_PALACE_PATH", raising=False)
+    monkeypatch.delenv("MEMPAL_PALACE_PATH", raising=False)
+    monkeypatch.chdir(tmp_path)  # no yaml here
+    cfg_dir = tmp_path / "cfg"
+    cfg_dir.mkdir()
+    with open(cfg_dir / "config.json", "w") as f:
+        json.dump(
+            {"palaces": {"chat": "/palaces/chat"}, "default_palace": "chat"},
+            f,
+        )
+    cfg = MempalaceConfig(config_dir=str(cfg_dir))
+    assert cfg.resolved_palace_path() == "/palaces/chat"
+
+
+def test_resolved_palace_path_falls_back_to_palace_path(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_PALACE_PATH", raising=False)
+    monkeypatch.delenv("MEMPAL_PALACE_PATH", raising=False)
+    monkeypatch.chdir(tmp_path)
+    cfg_dir = tmp_path / "cfg"
+    cfg_dir.mkdir()
+    with open(cfg_dir / "config.json", "w") as f:
+        json.dump({"palace_path": "/legacy/palace"}, f)
+    cfg = MempalaceConfig(config_dir=str(cfg_dir))
+    assert cfg.resolved_palace_path() == "/legacy/palace"
+
+
 def test_init():
     tmpdir = tempfile.mkdtemp()
     cfg = MempalaceConfig(config_dir=tmpdir)
