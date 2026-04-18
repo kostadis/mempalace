@@ -200,8 +200,10 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Ingest daily summaries into the palace")
+    from .config import DEFAULT_PALACE_PATH
+
     parser.add_argument("--dir", required=True, help="Path to daily_summaries directory")
-    parser.add_argument("--palace", default=os.path.expanduser("~/.mempalace/palace"))
+    parser.add_argument("--palace", default=DEFAULT_PALACE_PATH)
     parser.add_argument("--wing", default="diary")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()

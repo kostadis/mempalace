@@ -27,7 +27,6 @@ Usage:
 
 from __future__ import annotations
 
-import os
 import re
 from datetime import datetime, timezone
 
@@ -309,9 +308,11 @@ if __name__ == "__main__":
         epilog="Exits 0 when no issues found, 1 when one or more issues detected.",
     )
     parser.add_argument("text", nargs="?", help="Text to check (or use --stdin).")
+    from .config import DEFAULT_PALACE_PATH
+
     parser.add_argument(
         "--palace",
-        default=os.path.expanduser("~/.mempalace/palace"),
+        default=DEFAULT_PALACE_PATH,
         help="Path to the palace directory.",
     )
     parser.add_argument("--stdin", action="store_true", help="Read text from stdin.")

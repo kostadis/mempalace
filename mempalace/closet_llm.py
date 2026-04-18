@@ -320,9 +320,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Regenerate closets via a user-configured LLM (OpenAI-compatible API)"
     )
+    from .config import DEFAULT_PALACE_PATH
+
     parser.add_argument(
         "--palace",
-        default=os.path.expanduser("~/.mempalace/palace"),
+        default=DEFAULT_PALACE_PATH,
         help="Path to the palace",
     )
     parser.add_argument("--wing", default=None, help="Limit to one wing")
