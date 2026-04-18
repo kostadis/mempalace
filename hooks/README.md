@@ -69,6 +69,7 @@ Edit `mempal_save_hook.sh` to change:
 - **`STATE_DIR`** — Where hook state is stored (defaults to `~/.mempalace/hook_state/`)
 - **`MEMPAL_DIR`** — Optional **project directory** (code, notes, docs) to also mine on each save trigger, with `--mode projects`. The hook ALWAYS mines the active conversation transcript automatically with `--mode convos` — `MEMPAL_DIR` is purely additive, never an override. Leave blank if you don't want to ingest project files.
 - **`MEMPALACE_PYTHON`** — Optional env var. Python interpreter with mempalace + chromadb installed. Auto-detects: `MEMPALACE_PYTHON` env var → repo `venv/bin/python3` → system `python3`. Set this if your venv is in a non-standard location.
+- **`MEMPAL_CHAT_PALACE`** — Where hook-mined chat state is written. Defaults to `~/.mempalace/palaces/chat`. Override only if you've relocated your chat palace. Hooks **never** write to a curated campaign palace — that isolation is the whole point of the chat palace existing.
 
 ### mempalace CLI
 
