@@ -103,6 +103,79 @@ def test_env_path_legacy_alias_normalized():
         del os.environ["MEMPAL_PALACE_PATH"]
 
 
+# --- resolve_palace (aliases + path expansion) ---
+
+
+def _cfg_with_palaces(aliases):
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"palaces": aliases}, f)
+    return MempalaceConfig(config_dir=tmpdir)
+
+
+def test_resolve_palace_alias_absolute():
+    cfg = _cfg_with_palaces({"oota": "/tmp/palaces/oota"})
+    assert cfg.resolve_palace("oota") == "/tmp/palaces/oota"
+
+
+def test_resolve_palace_alias_expands_tilde():
+    cfg = _cfg_with_palaces({"chat": "~/.mempalace/palaces/chat"})
+    resolved = cfg.resolve_palace("chat")
+    assert resolved.endswith("/.mempalace/palaces/chat")
+    assert "~" not in resolved
+
+
+def test_resolve_palace_absolute_path_passthrough():
+    cfg = _cfg_with_palaces({})
+    assert cfg.resolve_palace("/var/data/palace") == "/var/data/palace"
+
+
+def test_resolve_palace_tilde_path():
+    cfg = _cfg_with_palaces({})
+    resolved = cfg.resolve_palace("~/custom-palace")
+    assert resolved.endswith("/custom-palace")
+    assert "~" not in resolved
+
+
+def test_resolve_palace_unknown_alias_raises():
+    cfg = _cfg_with_palaces({"chat": "/tmp/chat"})
+    with pytest.raises(ValueError, match="unknown palace alias"):
+        cfg.resolve_palace("oota")
+
+
+def test_resolve_palace_unknown_alias_lists_known():
+    cfg = _cfg_with_palaces({"chat": "/tmp/chat", "oota": "/tmp/oota"})
+    with pytest.raises(ValueError) as exc:
+        cfg.resolve_palace("phandalin")
+    msg = str(exc.value)
+    assert "chat" in msg and "oota" in msg
+
+
+def test_resolve_palace_rejects_empty():
+    cfg = _cfg_with_palaces({})
+    with pytest.raises(ValueError):
+        cfg.resolve_palace("")
+
+
+def test_resolve_palace_rejects_non_string():
+    cfg = _cfg_with_palaces({})
+    with pytest.raises(ValueError):
+        cfg.resolve_palace(None)
+
+
+def test_palaces_property_empty_when_unset():
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.palaces == {}
+
+
+def test_palaces_property_ignores_non_dict():
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"palaces": ["chat", "oota"]}, f)
+    cfg = MempalaceConfig(config_dir=tmpdir)
+    assert cfg.palaces == {}
+
+
 def test_init():
     tmpdir = tempfile.mkdtemp()
     cfg = MempalaceConfig(config_dir=tmpdir)

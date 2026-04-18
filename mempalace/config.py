@@ -185,6 +185,44 @@ class MempalaceConfig:
         return self._file_config.get("palace_path", DEFAULT_PALACE_PATH)
 
     @property
+    def palaces(self):
+        """Alias map: short name → palace path.
+
+        Read from the ``palaces`` dict in ``~/.mempalace/config.json``.
+        Values may be absolute, ``~``-prefixed, or relative; ``resolve_palace``
+        normalizes them.
+        """
+        aliases = self._file_config.get("palaces", {})
+        return aliases if isinstance(aliases, dict) else {}
+
+    def resolve_palace(self, value):
+        """Resolve a palace reference (alias or path) to an absolute path.
+
+        - Path-like input (starts with ``/``, ``~``, or ``.``) is expanded
+          and returned as an absolute path.
+        - Bare names are looked up in the ``palaces`` alias map; unknown
+          aliases raise :class:`ValueError` listing the known aliases.
+
+        Used by every caller that takes a user-supplied palace reference
+        (CLI ``--palace``, MCP tool ``palace`` arg, ``mempalace.yaml``
+        ``palace:`` field).
+        """
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("palace reference must be a non-empty string")
+        value = value.strip()
+
+        if value.startswith(("/", "~", ".")):
+            return os.path.abspath(os.path.expanduser(value))
+
+        aliases = self.palaces
+        if value in aliases:
+            return os.path.abspath(os.path.expanduser(aliases[value]))
+
+        known = sorted(aliases) if aliases else []
+        known_str = ", ".join(known) if known else "none"
+        raise ValueError(f"unknown palace alias: {value!r} (known aliases: {known_str})")
+
+    @property
     def collection_name(self):
         """ChromaDB collection name."""
         return self._file_config.get("collection_name", DEFAULT_COLLECTION_NAME)
