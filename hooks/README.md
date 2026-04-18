@@ -68,6 +68,7 @@ Edit `mempal_save_hook.sh` to change:
 - **`SAVE_INTERVAL=15`** — How many human messages between saves. Lower = more frequent saves, higher = less interruption.
 - **`STATE_DIR`** — Where hook state is stored (defaults to `~/.mempalace/hook_state/`)
 - **`MEMPAL_DIR`** — Optional. Set to a conversations directory to auto-run `mempalace mine <dir>` on each save trigger. Leave blank (default) to let the AI handle saving via the block reason message.
+- **`MEMPAL_CHAT_PALACE`** — Where hook-mined chat state is written. Defaults to `~/.mempalace/palaces/chat`. Override only if you've relocated your chat palace. Hooks **never** write to a curated campaign palace — that isolation is the whole point of the chat palace existing.
 
 ### mempalace CLI
 

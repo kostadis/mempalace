@@ -61,6 +61,11 @@ mkdir -p "$STATE_DIR"
 # Leave empty to skip auto-ingest (AI handles saving via the block reason).
 MEMPAL_DIR=""
 
+# Hook writes are chat-palace-only — never touch a curated campaign palace.
+# This is the load-bearing isolation invariant: see docs/design/palace-isolation.md.
+# Override only if you've relocated your chat palace.
+MEMPAL_CHAT_PALACE="${MEMPAL_CHAT_PALACE:-$HOME/.mempalace/palaces/chat}"
+
 # Read JSON input from stdin
 INPUT=$(cat)
 
@@ -153,7 +158,7 @@ if [ "$SINCE_LAST" -ge "$SAVE_INTERVAL" ] && [ "$EXCHANGE_COUNT" -gt 0 ]; then
         MINE_DIR="$MEMPAL_DIR"
     fi
     if [ -n "$MINE_DIR" ]; then
-        "$PYTHON" -m mempalace mine "$MINE_DIR" >> "$STATE_DIR/hook.log" 2>&1 &
+        "$PYTHON" -m mempalace mine "$MINE_DIR" --palace "$MEMPAL_CHAT_PALACE" >> "$STATE_DIR/hook.log" 2>&1 &
     fi
 
     # MEMPAL_VERBOSE toggle:
