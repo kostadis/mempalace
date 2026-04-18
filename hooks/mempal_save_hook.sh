@@ -78,6 +78,11 @@ if [ -z "$MEMPAL_PYTHON_BIN" ] || [ ! -x "$MEMPAL_PYTHON_BIN" ]; then
     MEMPAL_PYTHON_BIN="$(command -v python3 2>/dev/null || echo python3)"
 fi
 
+# Hook writes are chat-palace-only — never touch a curated campaign palace.
+# This is the load-bearing isolation invariant: see docs/design/palace-isolation.md.
+# Override only if you've relocated your chat palace.
+MEMPAL_CHAT_PALACE="${MEMPAL_CHAT_PALACE:-$HOME/.mempalace/palaces/chat}"
+
 # Read JSON input from stdin
 INPUT=$(cat)
 
@@ -169,7 +174,7 @@ if [ "$SINCE_LAST" -ge "$SAVE_INTERVAL" ] && [ "$EXCHANGE_COUNT" -gt 0 ]; then
         MINE_DIR="$MEMPAL_DIR"
     fi
     if [ -n "$MINE_DIR" ]; then
-        mempalace mine "$MINE_DIR" >> "$STATE_DIR/hook.log" 2>&1 &
+        mempalace --palace "$MEMPAL_CHAT_PALACE" mine "$MINE_DIR" >> "$STATE_DIR/hook.log" 2>&1 &
     fi
 
     # MEMPAL_VERBOSE toggle:

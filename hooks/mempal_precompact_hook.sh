@@ -61,6 +61,11 @@ if [ -z "$MEMPAL_PYTHON_BIN" ] || [ ! -x "$MEMPAL_PYTHON_BIN" ]; then
     MEMPAL_PYTHON_BIN="$(command -v python3 2>/dev/null || echo python3)"
 fi
 
+# Hook writes are chat-palace-only — never touch a curated campaign palace.
+# This is the load-bearing isolation invariant: see docs/design/palace-isolation.md.
+# Override only if you've relocated your chat palace.
+MEMPAL_CHAT_PALACE="${MEMPAL_CHAT_PALACE:-$HOME/.mempalace/palaces/chat}"
+
 # Read JSON input from stdin
 INPUT=$(cat)
 
@@ -72,7 +77,7 @@ echo "[$(date '+%H:%M:%S')] PRE-COMPACT triggered for session $SESSION_ID" >> "$
 if [ -n "$MEMPAL_DIR" ] && [ -d "$MEMPAL_DIR" ]; then
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     REPO_DIR="$(dirname "$SCRIPT_DIR")"
-    mempalace mine "$MEMPAL_DIR" >> "$STATE_DIR/hook.log" 2>&1
+    mempalace --palace "$MEMPAL_CHAT_PALACE" mine "$MEMPAL_DIR" >> "$STATE_DIR/hook.log" 2>&1
 fi
 
 # Silent: return empty JSON to not block. "decision": "allow" is invalid —
