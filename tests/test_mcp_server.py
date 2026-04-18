@@ -476,9 +476,9 @@ class TestWriteTools:
 
         assert result1["success"] is True
         assert result2["success"] is True
-        assert (
-            result1["drawer_id"] != result2["drawer_id"]
-        ), "Documents with shared header but different content must have distinct drawer IDs"
+        assert result1["drawer_id"] != result2["drawer_id"], (
+            "Documents with shared header but different content must have distinct drawer IDs"
+        )
 
     def test_delete_drawer(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -803,6 +803,7 @@ class TestCacheInvalidation:
     def test_mtime_change_invalidates_cache(self, monkeypatch, config, palace_path, kg):
         """When mtime changes, the cached collection should be replaced."""
         _patch_mcp_server(monkeypatch, config, kg)
+        import os as _os
         from mempalace import mcp_server
 
         # Create a real collection so _get_collection succeeds
@@ -814,8 +815,9 @@ class TestCacheInvalidation:
         assert col1 is not None
 
         # Simulate an external write changing the mtime
-        old_mtime = mcp_server._palace_db_mtime
-        monkeypatch.setattr(mcp_server, "_palace_db_mtime", old_mtime - 10.0)
+        key = _os.path.abspath(_os.path.expanduser(config.palace_path))
+        entry = mcp_server._palace_caches[key]
+        entry["mtime"] = entry["mtime"] - 10.0
 
         # _get_collection should detect the mtime drift and reconnect
         col2 = mcp_server._get_collection()
@@ -824,6 +826,7 @@ class TestCacheInvalidation:
     def test_inode_change_invalidates_cache(self, monkeypatch, config, palace_path, kg):
         """When inode changes (file replaced), the cached collection should be replaced."""
         _patch_mcp_server(monkeypatch, config, kg)
+        import os as _os
         from mempalace import mcp_server
 
         _client, _col = _get_collection(palace_path, create=True)
@@ -834,7 +837,8 @@ class TestCacheInvalidation:
         assert col1 is not None
 
         # Simulate a rebuild that changes the inode
-        monkeypatch.setattr(mcp_server, "_palace_db_inode", 99999)
+        key = _os.path.abspath(_os.path.expanduser(config.palace_path))
+        mcp_server._palace_caches[key]["inode"] = 99999
 
         col2 = mcp_server._get_collection()
         assert col2 is not None
@@ -855,7 +859,8 @@ class TestCacheInvalidation:
         # Prime the cache
         col1 = mcp_server._get_collection()
         assert col1 is not None
-        assert mcp_server._collection_cache is not None
+        key = os.path.abspath(os.path.expanduser(config.palace_path))
+        assert mcp_server._palace_caches[key]["collection"] is not None
 
         # Delete the DB file to simulate a rebuild in progress
         db_file = os.path.join(palace_path, "chroma.sqlite3")
@@ -866,8 +871,9 @@ class TestCacheInvalidation:
         # because the backend can't open a missing DB without create=True
         mcp_server._get_collection()
         # The key assertion: the old cached collection was dropped
-        assert mcp_server._palace_db_inode == 0
-        assert mcp_server._palace_db_mtime == 0.0
+        entry = mcp_server._palace_caches[key]
+        assert entry["inode"] == 0
+        assert entry["mtime"] == 0.0
 
     def test_reconnect_reports_failure_when_no_palace(self, monkeypatch, config, kg):
         """tool_reconnect should report failure when no collection is available."""
@@ -916,7 +922,8 @@ class TestCacheInvalidation:
         col1 = mcp_server._get_collection(create=True)
         assert col1 is not None
 
-        client = mcp_server._client_cache
+        entry = mcp_server._cache_entry(mcp_server._config.palace_path)
+        client = entry["client"]
         assert client is not None
 
         # Patch at the class level — chromadb's mtime-change detection
@@ -933,8 +940,97 @@ class TestCacheInvalidation:
             )
 
         monkeypatch.setattr(client_cls, "get_or_create_collection", _spy)
-        mcp_server._collection_cache = None
+        entry["collection"] = None
 
         col2 = mcp_server._get_collection(create=True)
         assert col2 is not None
         assert calls == [], f"get_or_create_collection was called: {calls}"
+
+
+# ── Cross-Palace Tools (palace= arg) ───────────────────────────────────
+
+
+class TestCrossPalaceArg:
+    """Read tools accept an explicit ``palace=`` arg that overrides the default.
+
+    This is the load-bearing UX of palace isolation: from a campaign workspace
+    the AI must be able to ``mempalace_search(palace='chat')`` without the
+    server resurrecting a chat-palace process. Each call routes through
+    ``_resolve_palace_arg`` and ``_get_collection(palace_path=...)``.
+    """
+
+    def _make_alt_palace(self, tmp_dir, doc_text, drawer_id):
+        """Create a second palace with one identifying drawer."""
+        import os
+        import chromadb
+
+        alt_path = os.path.join(tmp_dir, "alt_palace")
+        os.makedirs(alt_path, exist_ok=True)
+        client = chromadb.PersistentClient(path=alt_path)
+        col = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
+        )
+        col.add(
+            ids=[drawer_id],
+            documents=[doc_text],
+            metadatas=[
+                {
+                    "wing": "altwing",
+                    "room": "altroom",
+                    "source_file": "alt.txt",
+                    "chunk_index": 0,
+                    "added_by": "test",
+                    "filed_at": "2026-04-01T00:00:00",
+                }
+            ],
+        )
+        del client
+        return alt_path
+
+    def test_status_palace_arg_targets_other_palace(
+        self, monkeypatch, tmp_dir, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        alt_path = self._make_alt_palace(tmp_dir, "alt-only content", "drawer_alt_aaa")
+        from mempalace.mcp_server import tool_status
+
+        # Default palace has 4 seeded drawers; alt has 1.
+        default = tool_status()
+        alt = tool_status(palace=alt_path)
+        assert default["palace_path"] != alt["palace_path"]
+        assert alt["palace_path"].endswith("alt_palace")
+        assert alt["total_drawers"] == 1
+        assert default["total_drawers"] == 4
+
+    def test_search_palace_arg_targets_other_palace(
+        self, monkeypatch, tmp_dir, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        alt_path = self._make_alt_palace(
+            tmp_dir, "unique-alt-marker-zebra-quokka", "drawer_alt_bbb"
+        )
+        from mempalace.mcp_server import tool_search
+
+        # Marker exists only in the alt palace.
+        result = tool_search(query="unique-alt-marker-zebra-quokka", palace=alt_path)
+        assert "results" in result
+        assert any("zebra-quokka" in r["text"] for r in result["results"])
+
+        # Same marker in default palace returns nothing matching.
+        default = tool_search(query="unique-alt-marker-zebra-quokka")
+        assert not any("zebra-quokka" in r["text"] for r in default.get("results", []))
+
+    def test_palace_arg_unknown_alias_returns_error(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """Unknown palace alias must fail loudly with ``error`` field, not silently
+        fall through to the default palace."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_search, tool_status
+
+        for result in (
+            tool_status(palace="no-such-alias-xyz"),
+            tool_search(query="anything", palace="no-such-alias-xyz"),
+        ):
+            assert "error" in result
+            assert "no-such-alias-xyz" in result["error"]
