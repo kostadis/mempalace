@@ -44,12 +44,80 @@ from datetime import date, datetime
 from pathlib import Path
 
 
-DEFAULT_KG_PATH = os.path.expanduser("~/.mempalace/knowledge_graph.sqlite3")
+KG_FILENAME = "knowledge_graph.sqlite3"
+LEGACY_GLOBAL_KG_PATH = os.path.expanduser(f"~/.mempalace/{KG_FILENAME}")
+# Kept for compatibility with older callers/tests; new code should rely on
+# ``KnowledgeGraph(palace_path=...)`` and let the class build the path.
+DEFAULT_KG_PATH = LEGACY_GLOBAL_KG_PATH
+
+
+def _palace_kg_path(palace_path: str) -> str:
+    return os.path.join(os.path.abspath(os.path.expanduser(palace_path)), KG_FILENAME)
+
+
+def _maybe_migrate_legacy_kg(target_db_path: str) -> None:
+    """One-shot move of ``~/.mempalace/knowledge_graph.sqlite3`` into the
+    default palace when it still lives at the old global location.
+
+    Guards:
+    - Only migrates when ``target_db_path`` is the legacy file under the
+      **default** palace — custom palaces never inherit the shared KG.
+    - No-op if the target already exists (palace already populated) or the
+      legacy file doesn't exist.
+    - Also moves SQLite WAL/SHM sidecars if present.
+    """
+    from .config import DEFAULT_PALACE_PATH
+
+    expected_default_target = _palace_kg_path(DEFAULT_PALACE_PATH)
+    if os.path.abspath(target_db_path) != expected_default_target:
+        return
+    if os.path.exists(target_db_path):
+        return
+    if not os.path.exists(LEGACY_GLOBAL_KG_PATH):
+        return
+    target_dir = Path(target_db_path).parent
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for suffix in ("", "-wal", "-shm"):
+        src = LEGACY_GLOBAL_KG_PATH + suffix
+        dst = target_db_path + suffix
+        if os.path.exists(src) and not os.path.exists(dst):
+            try:
+                os.replace(src, dst)
+            except OSError:
+                pass
 
 
 class KnowledgeGraph:
-    def __init__(self, db_path: str = None):
-        self.db_path = db_path or DEFAULT_KG_PATH
+    def __init__(self, db_path: str = None, palace_path: str = None):
+        """Open (or create) a knowledge-graph SQLite DB.
+
+        Preferred form: ``KnowledgeGraph(palace_path=...)`` — the DB lives at
+        ``<palace_path>/knowledge_graph.sqlite3`` so every palace has its own
+        isolated graph.
+
+        Back-compat: ``KnowledgeGraph(db_path=...)`` uses the caller-supplied
+        path verbatim. ``KnowledgeGraph()`` resolves against the default
+        palace via ``MempalaceConfig().palace_path``.
+
+        On first open against the *default* palace, any pre-existing
+        ``~/.mempalace/knowledge_graph.sqlite3`` is moved into the palace dir
+        so upgrading users don't lose temporal data. Non-default palaces
+        never inherit the legacy file — they start empty.
+        """
+        if db_path is not None and palace_path is not None:
+            raise ValueError("Pass either db_path or palace_path, not both")
+
+        if db_path is not None:
+            self.db_path = db_path
+        elif palace_path is not None:
+            self.db_path = _palace_kg_path(palace_path)
+        else:
+            from .config import MempalaceConfig
+
+            self.db_path = _palace_kg_path(MempalaceConfig().palace_path)
+
+        _maybe_migrate_legacy_kg(self.db_path)
+
         db_parent = Path(self.db_path).parent
         db_parent.mkdir(parents=True, exist_ok=True)
         try:
