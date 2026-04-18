@@ -92,8 +92,71 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
     return value
 
 
-DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
+LEGACY_PALACE_DIR = os.path.expanduser("~/.mempalace/palace")
+DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palaces/chat")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
+
+
+def _maybe_migrate_legacy_palace_dir():
+    """One-shot rename of ``~/.mempalace/palace/`` → ``~/.mempalace/palaces/chat/``.
+
+    Matches the palace-isolation design: pre-isolation users had a single
+    ``~/.mempalace/palace/`` directory that held every wing — campaign canon
+    and chat-hook mining mixed together. We promote it to the canonical
+    chat palace so hook-written state keeps a home after the upgrade, and
+    register a ``chat`` alias so ``--palace chat`` works immediately.
+
+    Guards:
+    - Skip if legacy dir doesn't exist (clean install / already migrated).
+    - Skip if destination already exists (user set up a new-style palace
+      manually; don't clobber).
+    - Best-effort: filesystem failures are swallowed so a broken upgrade
+      can't brick every subsequent ``MempalaceConfig()`` call.
+    """
+    if not os.path.isdir(LEGACY_PALACE_DIR):
+        return
+    if os.path.exists(DEFAULT_PALACE_PATH):
+        return
+    try:
+        os.makedirs(os.path.dirname(DEFAULT_PALACE_PATH), exist_ok=True)
+        os.rename(LEGACY_PALACE_DIR, DEFAULT_PALACE_PATH)
+    except OSError:
+        return
+
+    config_file = os.path.join(os.path.expanduser("~/.mempalace"), "config.json")
+    if not os.path.isfile(config_file):
+        return
+    try:
+        with open(config_file, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return
+    if not isinstance(cfg, dict):
+        return
+
+    changed = False
+    pinned = cfg.get("palace_path")
+    if isinstance(pinned, str):
+        if os.path.abspath(os.path.expanduser(pinned)) == LEGACY_PALACE_DIR:
+            cfg["palace_path"] = DEFAULT_PALACE_PATH
+            changed = True
+
+    aliases = cfg.get("palaces")
+    if not isinstance(aliases, dict):
+        aliases = {}
+        cfg["palaces"] = aliases
+        changed = True
+    if "chat" not in aliases:
+        aliases["chat"] = DEFAULT_PALACE_PATH
+        changed = True
+
+    if changed:
+        try:
+            with open(config_file, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2, ensure_ascii=False)
+        except OSError:
+            pass
+
 
 DEFAULT_TOPIC_WINGS = [
     "emotions",
@@ -159,6 +222,8 @@ class MempalaceConfig:
             config_dir: Override config directory (useful for testing).
                         Defaults to ~/.mempalace.
         """
+        if config_dir is None:
+            _maybe_migrate_legacy_palace_dir()
         self._config_dir = (
             Path(config_dir) if config_dir else Path(os.path.expanduser("~/.mempalace"))
         )
