@@ -1,6 +1,7 @@
 """Tests for mempalace.cli — the main CLI dispatcher."""
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -22,12 +23,29 @@ from mempalace.cli import (
 )
 
 
+def _mock_config(mock_config_cls, palace_path=None):
+    """Wire a mocked MempalaceConfig to mirror the palace-resolution contract.
+
+    ``resolved_palace_path()`` returns the configured ``palace_path`` (the
+    fallback path the CLI lands on when no ``--palace`` is given), and
+    ``resolve_palace(value)`` mimics the real expand-and-absolutize
+    behaviour so tests that pass ``--palace`` continue to get the expected
+    path back.
+    """
+    instance = mock_config_cls.return_value
+    if palace_path is not None:
+        instance.palace_path = palace_path
+        instance.resolved_palace_path.return_value = palace_path
+    instance.resolve_palace.side_effect = lambda v: os.path.abspath(os.path.expanduser(v))
+    return instance
+
+
 # ── cmd_status ─────────────────────────────────────────────────────────
 
 
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_status_default_palace(mock_config_cls):
-    mock_config_cls.return_value.palace_path = "/fake/palace"
+    _mock_config(mock_config_cls, "/fake/palace")
     args = argparse.Namespace(palace=None)
     mock_miner = MagicMock()
     with patch.dict("sys.modules", {"mempalace.miner": mock_miner}):
@@ -37,13 +55,12 @@ def test_cmd_status_default_palace(mock_config_cls):
 
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_status_custom_palace(mock_config_cls):
+    _mock_config(mock_config_cls)
     args = argparse.Namespace(palace="~/my_palace")
     mock_miner = MagicMock()
     with patch.dict("sys.modules", {"mempalace.miner": mock_miner}):
         cmd_status(args)
-        import os
-
-        expected = os.path.expanduser("~/my_palace")
+        expected = os.path.abspath(os.path.expanduser("~/my_palace"))
         mock_miner.status.assert_called_once_with(palace_path=expected)
 
 
@@ -52,7 +69,7 @@ def test_cmd_status_custom_palace(mock_config_cls):
 
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_search_calls_search(mock_config_cls):
-    mock_config_cls.return_value.palace_path = "/fake/palace"
+    _mock_config(mock_config_cls, "/fake/palace")
     args = argparse.Namespace(
         palace=None, query="test query", wing="mywing", room="myroom", results=3
     )
@@ -69,7 +86,7 @@ def test_cmd_search_calls_search(mock_config_cls):
 
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_search_error_exits(mock_config_cls):
-    mock_config_cls.return_value.palace_path = "/fake/palace"
+    _mock_config(mock_config_cls, "/fake/palace")
     args = argparse.Namespace(palace=None, query="q", wing=None, room=None, results=5)
     from mempalace.searcher import SearchError
 
@@ -151,7 +168,7 @@ def test_cmd_init_with_entities_zero_total(mock_config_cls, tmp_path, capsys):
 
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_mine_projects_mode(mock_config_cls):
-    mock_config_cls.return_value.palace_path = "/fake/palace"
+    _mock_config(mock_config_cls, "/fake/palace")
     args = argparse.Namespace(
         dir="/src",
         palace=None,
@@ -180,7 +197,7 @@ def test_cmd_mine_projects_mode(mock_config_cls):
 
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_mine_convos_mode(mock_config_cls):
-    mock_config_cls.return_value.palace_path = "/fake/palace"
+    _mock_config(mock_config_cls, "/fake/palace")
     args = argparse.Namespace(
         dir="/chats",
         palace=None,
@@ -208,7 +225,7 @@ def test_cmd_mine_convos_mode(mock_config_cls):
 
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_mine_include_ignored_comma_split(mock_config_cls):
-    mock_config_cls.return_value.palace_path = "/fake/palace"
+    _mock_config(mock_config_cls, "/fake/palace")
     args = argparse.Namespace(
         dir="/src",
         palace=None,
@@ -233,7 +250,7 @@ def test_cmd_mine_include_ignored_comma_split(mock_config_cls):
 
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_wakeup(mock_config_cls, capsys):
-    mock_config_cls.return_value.palace_path = "/fake/palace"
+    _mock_config(mock_config_cls, "/fake/palace")
     args = argparse.Namespace(palace=None, wing=None)
     mock_stack = MagicMock()
     mock_stack.wake_up.return_value = "Hello world context"
@@ -424,7 +441,7 @@ def _mock_backend_for(col=None, new_col=None):
 
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_repair_no_palace(mock_config_cls, tmp_path, capsys):
-    mock_config_cls.return_value.palace_path = str(tmp_path / "nonexistent")
+    _mock_config(mock_config_cls, str(tmp_path / "nonexistent"))
     args = argparse.Namespace(palace=None)
     with patch("mempalace.backends.chroma.ChromaBackend"):
         cmd_repair(args)
@@ -436,7 +453,7 @@ def test_cmd_repair_no_palace(mock_config_cls, tmp_path, capsys):
 def test_cmd_repair_requires_palace_database(mock_config_cls, tmp_path, capsys):
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()
-    mock_config_cls.return_value.palace_path = str(palace_dir)
+    _mock_config(mock_config_cls, str(palace_dir))
     args = argparse.Namespace(palace=None)
     with patch("mempalace.backends.chroma.ChromaBackend"):
         cmd_repair(args)
@@ -449,7 +466,7 @@ def test_cmd_repair_error_reading(mock_config_cls, tmp_path, capsys):
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()
     (palace_dir / "chroma.sqlite3").write_text("db")
-    mock_config_cls.return_value.palace_path = str(palace_dir)
+    _mock_config(mock_config_cls, str(palace_dir))
     args = argparse.Namespace(palace=None)
     mock_backend = MagicMock()
     mock_backend.get_collection.side_effect = Exception("corrupt db")
@@ -464,7 +481,7 @@ def test_cmd_repair_zero_drawers(mock_config_cls, tmp_path, capsys):
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()
     (palace_dir / "chroma.sqlite3").write_text("db")
-    mock_config_cls.return_value.palace_path = str(palace_dir)
+    _mock_config(mock_config_cls, str(palace_dir))
     args = argparse.Namespace(palace=None)
     mock_col = MagicMock()
     mock_col.count.return_value = 0
@@ -480,7 +497,7 @@ def test_cmd_repair_success(mock_config_cls, tmp_path, capsys):
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()
     (palace_dir / "chroma.sqlite3").write_text("db")
-    mock_config_cls.return_value.palace_path = str(palace_dir)
+    _mock_config(mock_config_cls, str(palace_dir))
     args = argparse.Namespace(palace=None, yes=True)
     mock_col = MagicMock()
     mock_col.count.return_value = 2
@@ -503,7 +520,7 @@ def test_cmd_repair_aborts_without_confirmation(mock_config_cls, tmp_path, capsy
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()
     (palace_dir / "chroma.sqlite3").write_text("db")
-    mock_config_cls.return_value.palace_path = str(palace_dir)
+    _mock_config(mock_config_cls, str(palace_dir))
     args = argparse.Namespace(palace=None)
     mock_col = MagicMock()
     mock_col.count.return_value = 1
@@ -523,7 +540,7 @@ def test_cmd_repair_aborts_without_confirmation(mock_config_cls, tmp_path, capsy
 
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_compress_no_palace(mock_config_cls, capsys):
-    mock_config_cls.return_value.palace_path = "/fake/palace"
+    _mock_config(mock_config_cls, "/fake/palace")
     args = argparse.Namespace(palace=None, wing=None, dry_run=False, config=None)
     mock_backend = MagicMock()
     mock_backend.get_collection.side_effect = Exception("no palace")
@@ -536,7 +553,7 @@ def test_cmd_compress_no_palace(mock_config_cls, capsys):
 
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_compress_no_drawers(mock_config_cls, capsys):
-    mock_config_cls.return_value.palace_path = "/fake/palace"
+    _mock_config(mock_config_cls, "/fake/palace")
     args = argparse.Namespace(palace=None, wing="mywing", dry_run=False, config=None)
     mock_col = MagicMock()
     mock_col.get.return_value = {"documents": [], "metadatas": [], "ids": []}
@@ -558,7 +575,7 @@ def _make_mock_dialect_module(dialect_instance):
 
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_compress_dry_run(mock_config_cls, capsys):
-    mock_config_cls.return_value.palace_path = "/fake/palace"
+    _mock_config(mock_config_cls, "/fake/palace")
     args = argparse.Namespace(palace=None, wing=None, dry_run=True, config=None)
     mock_col = MagicMock()
     mock_col.get.side_effect = [
@@ -596,7 +613,7 @@ def test_cmd_compress_dry_run(mock_config_cls, capsys):
 
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_compress_with_config(mock_config_cls, tmp_path, capsys):
-    mock_config_cls.return_value.palace_path = "/fake/palace"
+    _mock_config(mock_config_cls, "/fake/palace")
     config_file = tmp_path / "entities.json"
     config_file.write_text('{"people": [], "projects": []}')
     args = argparse.Namespace(palace=None, wing=None, dry_run=True, config=str(config_file))
@@ -619,7 +636,7 @@ def test_cmd_compress_with_config(mock_config_cls, tmp_path, capsys):
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_compress_stores_results(mock_config_cls, capsys):
     """Non-dry-run compress stores to mempalace_compressed collection."""
-    mock_config_cls.return_value.palace_path = "/fake/palace"
+    _mock_config(mock_config_cls, "/fake/palace")
     args = argparse.Namespace(palace=None, wing=None, dry_run=False, config=None)
     mock_col = MagicMock()
     mock_col.get.side_effect = [

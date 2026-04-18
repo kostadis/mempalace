@@ -39,6 +39,21 @@ from .config import MempalaceConfig
 _MEMPALACE_PROJECT_FILES = ("mempalace.yaml", "entities.json")
 
 
+def _resolve_cli_palace(args):
+    """Resolve ``--palace`` CLI arg or fall back to the walk-up chain.
+
+    Explicit ``--palace`` accepts aliases as well as paths (via
+    ``resolve_palace``). Without ``--palace``, ``resolved_palace_path``
+    walks up from CWD looking for ``mempalace.yaml`` with a ``palace:``
+    key before falling through to config and default. Returns an
+    absolute path.
+    """
+    cfg = MempalaceConfig()
+    if args.palace:
+        return cfg.resolve_palace(args.palace)
+    return cfg.resolved_palace_path()
+
+
 def _ensure_mempalace_files_gitignored(project_dir) -> bool:
     """If project_dir is a git repo, ensure MemPalace's per-project files
     are listed in .gitignore so they don't get committed by accident.
@@ -113,7 +128,7 @@ def cmd_init(args):
 
 
 def cmd_mine(args):
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    palace_path = _resolve_cli_palace(args)
     include_ignored = []
     for raw in args.include_ignored or []:
         include_ignored.extend(part.strip() for part in raw.split(",") if part.strip())
@@ -148,7 +163,7 @@ def cmd_mine(args):
 def cmd_search(args):
     from .searcher import search, SearchError
 
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    palace_path = _resolve_cli_palace(args)
     try:
         search(
             query=args.query,
@@ -165,7 +180,7 @@ def cmd_wakeup(args):
     """Show L0 (identity) + L1 (essential story) — the wake-up context."""
     from .layers import MemoryStack
 
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    palace_path = _resolve_cli_palace(args)
     stack = MemoryStack(palace_path=palace_path)
 
     text = stack.wake_up(wing=args.wing)
@@ -202,7 +217,7 @@ def cmd_migrate(args):
     """Migrate palace from a different ChromaDB version."""
     from .migrate import migrate
 
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    palace_path = _resolve_cli_palace(args)
     migrate(
         palace_path=palace_path,
         dry_run=args.dry_run,
@@ -213,7 +228,7 @@ def cmd_migrate(args):
 def cmd_status(args):
     from .miner import status
 
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    palace_path = _resolve_cli_palace(args)
     status(palace_path=palace_path)
 
 
@@ -223,9 +238,7 @@ def cmd_repair(args):
     from .backends.chroma import ChromaBackend
     from .migrate import confirm_destructive_action, contains_palace_database
 
-    palace_path = os.path.abspath(
-        os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
-    )
+    palace_path = _resolve_cli_palace(args)
     db_path = os.path.join(palace_path, "chroma.sqlite3")
 
     if not os.path.isdir(palace_path):
@@ -348,7 +361,7 @@ def cmd_compress(args):
     from .backends.chroma import ChromaBackend
     from .dialect import Dialect
 
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    palace_path = _resolve_cli_palace(args)
 
     # Load dialect (with optional entity config)
     config_path = args.config
