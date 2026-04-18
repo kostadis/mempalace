@@ -92,18 +92,87 @@ def _parse_args():
 _args = _parse_args()
 
 if _args.palace:
-    os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(_args.palace)
+    # Resolve through the alias map so --palace chat / --palace oota / --palace
+    # /abs/path all work. Pin as env var so every MempalaceConfig().palace_path
+    # in this process agrees on the default palace.
+    try:
+        _resolved_launch = MempalaceConfig().resolve_palace(_args.palace)
+    except ValueError as e:
+        raise SystemExit(f"mcp_server: --palace {_args.palace!r}: {e}")
+    os.environ["MEMPALACE_PALACE_PATH"] = _resolved_launch
+elif not (os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get("MEMPAL_PALACE_PATH")):
+    # No explicit launch argument → walk up from CWD looking for a
+    # ``mempalace.yaml`` with a ``palace:`` key. This is how a per-workspace
+    # MCP launcher picks up the campaign palace without hardcoding a path.
+    _walked = MempalaceConfig().walk_up_palace()
+    if _walked:
+        os.environ["MEMPALACE_PALACE_PATH"] = _walked
 
 _config = MempalaceConfig()
-# KG co-locates with the palace. KnowledgeGraph auto-migrates the legacy
-# ~/.mempalace/knowledge_graph.sqlite3 into the default palace on first open.
+# KG for the active default palace. ``_get_kg(palace_path)`` below falls back
+# here when called with the default path so tests that monkeypatch ``_kg``
+# keep working.
 _kg = KnowledgeGraph(palace_path=_config.palace_path)
 
 
-_client_cache = None
-_collection_cache = None
-_palace_db_inode = 0  # inode of chroma.sqlite3 at cache time
-_palace_db_mtime = 0.0  # mtime of chroma.sqlite3 at cache time
+# ==================== PER-PALACE CACHE ====================
+# One entry per palace path. Supports cross-palace reads ( ``palace=`` arg on
+# tools) without resurrecting a connection for every call. Inode/mtime live
+# in the entry so rebuilds of one palace don't blow away caches for the
+# others.
+_palace_caches: dict = {}
+_kg_cache: dict = {}
+
+
+def _cache_entry(palace_path: str) -> dict:
+    key = os.path.abspath(os.path.expanduser(palace_path))
+    entry = _palace_caches.get(key)
+    if entry is None:
+        entry = {
+            "client": None,
+            "collection": None,
+            "inode": 0,
+            "mtime": 0.0,
+            "metadata": None,
+            "metadata_time": 0,
+        }
+        _palace_caches[key] = entry
+    return entry
+
+
+def _resolve_palace_arg(palace=None) -> str:
+    """Resolve a tool-provided ``palace`` argument to an absolute path.
+
+    - ``None`` / empty → active default (``_config.palace_path``).
+    - Alias or path → ``_config.resolve_palace(...)`` (raises ValueError on
+      unknown aliases, which the caller converts to an error dict).
+    """
+    if palace is None or not str(palace).strip():
+        return os.path.abspath(os.path.expanduser(_config.palace_path))
+    return _config.resolve_palace(palace)
+
+
+def _default_palace_path() -> str:
+    return os.path.abspath(os.path.expanduser(_config.palace_path))
+
+
+def _get_kg(palace_path=None):
+    """Return the KG for ``palace_path``, reusing the singleton when possible.
+
+    The singleton ``_kg`` is what tests monkeypatch; we keep it as the KG for
+    the active default palace so test patches still apply. Calls for other
+    palaces get their own KG from ``_kg_cache``.
+    """
+    if palace_path is None:
+        return _kg
+    palace_path = os.path.abspath(os.path.expanduser(palace_path))
+    if palace_path == _default_palace_path():
+        return _kg
+    kg = _kg_cache.get(palace_path)
+    if kg is None:
+        kg = KnowledgeGraph(palace_path=palace_path)
+        _kg_cache[palace_path] = kg
+    return kg
 
 
 # ==================== WRITE-AHEAD LOG ====================
@@ -156,8 +225,9 @@ def _wal_log(operation: str, params: dict, result: dict = None):
         logger.error(f"WAL write failed: {e}")
 
 
-def _get_client():
-    """Return a ChromaDB PersistentClient, reconnecting if the database changed on disk.
+def _get_client(palace_path=None):
+    """Return a ChromaDB PersistentClient for ``palace_path``, reconnecting if
+    the database changed on disk.
 
     Detects palace rebuilds (repair/nuke/purge) by checking the inode of
     chroma.sqlite3.  A full rebuild replaces the file, changing the inode.
@@ -167,15 +237,14 @@ def _get_client():
 
     Note: FAT/exFAT may return 0 for st_ino — the ``current_inode != 0``
     guard skips reconnect detection on those filesystems (safe fallback).
+
+    ``palace_path=None`` routes to the active default palace.
     """
-    global \
-        _client_cache, \
-        _collection_cache, \
-        _palace_db_inode, \
-        _palace_db_mtime, \
-        _metadata_cache, \
-        _metadata_cache_time
-    db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
+    if palace_path is None:
+        palace_path = _config.palace_path
+    palace_path = os.path.abspath(os.path.expanduser(palace_path))
+    entry = _cache_entry(palace_path)
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
     try:
         st = os.stat(db_path)
         current_inode = st.st_ino
@@ -188,44 +257,52 @@ def _get_client():
     # collection, invalidate so we don't serve stale data.  Without this,
     # both stored and current values are 0 on the first call after deletion,
     # making inode_changed and mtime_changed both False.
-    if not os.path.isfile(db_path) and _collection_cache is not None:
-        _client_cache = None
-        _collection_cache = None
-        _palace_db_inode = 0
-        _palace_db_mtime = 0.0
+    if not os.path.isfile(db_path) and entry["collection"] is not None:
+        entry["client"] = None
+        entry["collection"] = None
+        entry["inode"] = 0
+        entry["mtime"] = 0.0
         # Fall through to normal reconnect which will handle missing DB
 
-    inode_changed = current_inode != 0 and current_inode != _palace_db_inode
-    mtime_changed = current_mtime != 0.0 and abs(current_mtime - _palace_db_mtime) > 0.01
+    inode_changed = current_inode != 0 and current_inode != entry["inode"]
+    mtime_changed = current_mtime != 0.0 and abs(current_mtime - entry["mtime"]) > 0.01
 
-    if _client_cache is None or inode_changed or mtime_changed:
-        _client_cache = ChromaBackend.make_client(_config.palace_path)
-        _collection_cache = None
-        _metadata_cache = None
-        _metadata_cache_time = 0
-        _palace_db_inode = current_inode
-        _palace_db_mtime = current_mtime
-    return _client_cache
+    if entry["client"] is None or inode_changed or mtime_changed:
+        entry["client"] = ChromaBackend.make_client(palace_path)
+        entry["collection"] = None
+        entry["metadata"] = None
+        entry["metadata_time"] = 0
+        entry["inode"] = current_inode
+        entry["mtime"] = current_mtime
+    return entry["client"]
 
 
-def _get_collection(create=False):
-    """Return the ChromaDB collection, caching the client between calls."""
-    global _collection_cache, _metadata_cache, _metadata_cache_time
+def _get_collection(palace_path=None, create=False):
+    """Return the ChromaDB collection for ``palace_path``, caching between calls.
+
+    ``palace_path=None`` routes to the active default palace so every
+    untouched tool (and every call site that hasn't been threaded through yet)
+    keeps working against the default.
+    """
+    if palace_path is None:
+        palace_path = _config.palace_path
+    palace_path = os.path.abspath(os.path.expanduser(palace_path))
+    entry = _cache_entry(palace_path)
     try:
-        client = _get_client()
+        client = _get_client(palace_path)
         if create:
-            _collection_cache = ChromaCollection(
+            entry["collection"] = ChromaCollection(
                 client.get_or_create_collection(
                     _config.collection_name, metadata={"hnsw:space": "cosine"}
                 )
             )
-            _metadata_cache = None
-            _metadata_cache_time = 0
-        elif _collection_cache is None:
-            _collection_cache = ChromaCollection(client.get_collection(_config.collection_name))
-            _metadata_cache = None
-            _metadata_cache_time = 0
-        return _collection_cache
+            entry["metadata"] = None
+            entry["metadata_time"] = 0
+        elif entry["collection"] is None:
+            entry["collection"] = ChromaCollection(client.get_collection(_config.collection_name))
+            entry["metadata"] = None
+            entry["metadata_time"] = 0
+        return entry["collection"]
     except Exception:
         return None
 
@@ -257,27 +334,40 @@ def _fetch_all_metadata(col, where=None):
     return all_meta
 
 
-_metadata_cache = None
-_metadata_cache_time = 0
 _METADATA_CACHE_TTL = 5.0  # seconds
 _MAX_RESULTS = 100  # upper bound for search/list limit params
 
 
-def _get_cached_metadata(col, where=None):
-    """Return cached metadata if fresh, else fetch and cache."""
-    global _metadata_cache, _metadata_cache_time
+def _get_cached_metadata(col, palace_path=None, where=None):
+    """Return cached metadata for ``palace_path`` if fresh, else fetch and cache."""
+    if palace_path is None:
+        palace_path = _config.palace_path
+    entry = _cache_entry(palace_path)
     now = time.time()
     if (
         where is None
-        and _metadata_cache is not None
-        and (now - _metadata_cache_time) < _METADATA_CACHE_TTL
+        and entry["metadata"] is not None
+        and (now - entry["metadata_time"]) < _METADATA_CACHE_TTL
     ):
-        return _metadata_cache
+        return entry["metadata"]
     result = _fetch_all_metadata(col, where=where)
     if where is None:
-        _metadata_cache = result
-        _metadata_cache_time = now
+        entry["metadata"] = result
+        entry["metadata_time"] = now
     return result
+
+
+def _invalidate_metadata_cache(palace_path=None):
+    """Drop the cached-metadata list for ``palace_path`` (default palace if None).
+
+    Called after every write so the next read recomputes wing/room counts
+    instead of serving stale numbers.
+    """
+    if palace_path is None:
+        palace_path = _config.palace_path
+    entry = _cache_entry(palace_path)
+    entry["metadata"] = None
+    entry["metadata_time"] = 0
 
 
 def _sanitize_optional_name(value: str = None, field_name: str = "name") -> str:
@@ -290,12 +380,16 @@ def _sanitize_optional_name(value: str = None, field_name: str = "name") -> str:
 # ==================== READ TOOLS ====================
 
 
-def tool_status():
+def tool_status(palace: str = None):
+    try:
+        resolved = _resolve_palace_arg(palace)
+    except ValueError as e:
+        return {"error": str(e)}
     # Use create=True only when a palace DB already exists on disk -- this
     # bootstraps the ChromaDB collection on a valid-but-empty palace without
     # accidentally creating a palace in a non-existent directory (#830).
-    db_exists = os.path.isfile(os.path.join(_config.palace_path, "chroma.sqlite3"))
-    col = _get_collection(create=db_exists)
+    db_exists = os.path.isfile(os.path.join(resolved, "chroma.sqlite3"))
+    col = _get_collection(palace_path=resolved, create=db_exists)
     if not col:
         return _no_palace()
     count = col.count()
@@ -305,12 +399,12 @@ def tool_status():
         "total_drawers": count,
         "wings": wings,
         "rooms": rooms,
-        "palace_path": _config.palace_path,
+        "palace_path": resolved,
         "protocol": PALACE_PROTOCOL,
         "aaak_dialect": AAAK_SPEC,
     }
     try:
-        all_meta = _get_cached_metadata(col)
+        all_meta = _get_cached_metadata(col, palace_path=resolved)
         for m in all_meta:
             w = m.get("wing", "unknown")
             r = m.get("room", "unknown")
@@ -426,11 +520,13 @@ def tool_search(
     max_distance: float = 1.5,
     min_similarity: float = None,
     context: str = None,
+    palace: str = None,
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
         wing = _sanitize_optional_name(wing, "wing")
         room = _sanitize_optional_name(room, "room")
+        resolved = _resolve_palace_arg(palace)
     except ValueError as e:
         return {"error": str(e)}
     # Backwards compat: accept old name
@@ -441,7 +537,7 @@ def tool_search(
     sanitized = sanitize_query(query)
     result = search_memories(
         sanitized["clean_query"],
-        palace_path=_config.palace_path,
+        palace_path=resolved,
         wing=wing,
         room=room,
         n_results=limit,
@@ -599,7 +695,6 @@ def tool_add_drawer(
     wing: str, room: str, content: str, source_file: str = None, added_by: str = "mcp"
 ):
     """File verbatim content into a wing/room. Checks for duplicates first."""
-    global _metadata_cache
     try:
         wing = sanitize_name(wing, "wing")
         room = sanitize_name(room, "room")
@@ -650,7 +745,7 @@ def tool_add_drawer(
                 }
             ],
         )
-        _metadata_cache = None
+        _invalidate_metadata_cache()
         logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
         return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
     except Exception as e:
@@ -659,7 +754,6 @@ def tool_add_drawer(
 
 def tool_delete_drawer(drawer_id: str):
     """Delete a single drawer by ID."""
-    global _metadata_cache
     col = _get_collection()
     if not col:
         return _no_palace()
@@ -681,7 +775,7 @@ def tool_delete_drawer(drawer_id: str):
 
     try:
         col.delete(ids=[drawer_id])
-        _metadata_cache = None
+        _invalidate_metadata_cache()
         logger.info(f"Deleted drawer: {drawer_id}")
         return {"success": True, "drawer_id": drawer_id}
     except Exception as e:
@@ -763,8 +857,6 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
 
 def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, room: str = None):
     """Update an existing drawer's content and/or metadata."""
-    global _metadata_cache
-
     if content is None and wing is None and room is None:
         return {"success": True, "drawer_id": drawer_id, "noop": True}
 
@@ -817,7 +909,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         update_kwargs["metadatas"] = [new_meta]
         col.update(**update_kwargs)
 
-        _metadata_cache = None
+        _invalidate_metadata_cache()
 
         logger.info(f"Updated drawer: {drawer_id}")
         return {
@@ -833,15 +925,17 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 # ==================== KNOWLEDGE GRAPH ====================
 
 
-def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
+def tool_kg_query(entity: str, as_of: str = None, direction: str = "both", palace: str = None):
     """Query the knowledge graph for an entity's relationships."""
     try:
         entity = sanitize_kg_value(entity, "entity")
+        resolved = _resolve_palace_arg(palace)
     except ValueError as e:
         return {"error": str(e)}
     if direction not in ("outgoing", "incoming", "both"):
         return {"error": "direction must be 'outgoing', 'incoming', or 'both'"}
-    results = _kg.query_entity(entity, as_of=as_of, direction=direction)
+    kg = _get_kg(resolved)
+    results = kg.query_entity(entity, as_of=as_of, direction=direction)
     return {"entity": entity, "as_of": as_of, "facts": results, "count": len(results)}
 
 
@@ -1110,15 +1204,14 @@ def tool_memories_filed_away():
 
 
 def tool_reconnect():
-    """Force the MCP server to drop the cached ChromaDB collection and reconnect.
+    """Force the MCP server to drop all cached ChromaDB collections and reconnect.
 
-    Use after external scripts or CLI commands modify the palace database
-    directly, which can leave the in-memory HNSW index stale.
+    Use after external scripts or CLI commands modify any palace database
+    directly, which can leave the in-memory HNSW index stale. Clears every
+    palace entry in the cache — the next read rebuilds the client/collection
+    for whichever palace is touched.
     """
-    global _collection_cache, _palace_db_inode, _palace_db_mtime
-    _collection_cache = None
-    _palace_db_inode = 0
-    _palace_db_mtime = 0.0
+    _palace_caches.clear()
     try:
         col = _get_collection()
         if col is None:
@@ -1136,8 +1229,16 @@ def tool_reconnect():
 
 TOOLS = {
     "mempalace_status": {
-        "description": "Palace overview — total drawers, wing and room counts",
-        "input_schema": {"type": "object", "properties": {}},
+        "description": "Palace overview — total drawers, wing and room counts. Optional `palace` cross-inspects another palace (alias like 'chat' or absolute path).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "palace": {
+                    "type": "string",
+                    "description": "Palace alias or path (optional — defaults to the active workspace palace). Use 'chat' to inspect the chat palace from a campaign workspace.",
+                },
+            },
+        },
         "handler": tool_status,
     },
     "mempalace_list_wings": {
@@ -1181,6 +1282,10 @@ TOOLS = {
                 "direction": {
                     "type": "string",
                     "description": "outgoing (entity→?), incoming (?→entity), or both (default: both)",
+                },
+                "palace": {
+                    "type": "string",
+                    "description": "Palace alias or path (optional — defaults to the active workspace palace). Use 'chat' to query the chat palace's knowledge graph.",
                 },
             },
             "required": ["entity"],
@@ -1364,6 +1469,10 @@ TOOLS = {
                 "context": {
                     "type": "string",
                     "description": "Background context for the search (optional). NOT used for embedding — only for future re-ranking.",
+                },
+                "palace": {
+                    "type": "string",
+                    "description": "Palace alias or path (optional — defaults to the active workspace palace). Use 'chat' to cross-search the chat palace from a campaign workspace.",
                 },
             },
             "required": ["query"],
