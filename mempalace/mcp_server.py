@@ -95,12 +95,9 @@ if _args.palace:
     os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(_args.palace)
 
 _config = MempalaceConfig()
-# Only override KG path when --palace is explicitly provided; otherwise use
-# KnowledgeGraph's default (~/.mempalace/knowledge_graph.sqlite3).
-if _args.palace:
-    _kg = KnowledgeGraph(db_path=os.path.join(_config.palace_path, "knowledge_graph.sqlite3"))
-else:
-    _kg = KnowledgeGraph()
+# KG co-locates with the palace. KnowledgeGraph auto-migrates the legacy
+# ~/.mempalace/knowledge_graph.sqlite3 into the default palace on first open.
+_kg = KnowledgeGraph(palace_path=_config.palace_path)
 
 
 _client_cache = None
