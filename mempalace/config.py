@@ -222,6 +222,70 @@ class MempalaceConfig:
         known_str = ", ".join(known) if known else "none"
         raise ValueError(f"unknown palace alias: {value!r} (known aliases: {known_str})")
 
+    def walk_up_palace(self, start_dir=None):
+        """Walk up from ``start_dir`` looking for ``mempalace.yaml`` declaring a palace.
+
+        Returns the resolved absolute palace path (via ``resolve_palace``) if a
+        yaml is found with a usable ``palace:`` key; otherwise ``None``.
+
+        Malformed yaml, missing key, or non-string values cause the walk to
+        continue up — the caller gets ``None`` only after reaching the
+        filesystem root with no match. An unknown-alias ValueError from
+        ``resolve_palace`` is propagated: a declared-but-unresolvable palace
+        is a user error, not a walk-past condition.
+        """
+        try:
+            start = Path(start_dir).resolve() if start_dir else Path.cwd().resolve()
+        except (OSError, RuntimeError):
+            return None
+
+        current = start
+        for _ in range(256):
+            yaml_path = current / "mempalace.yaml"
+            if yaml_path.is_file():
+                try:
+                    import yaml
+
+                    with open(yaml_path, "r", encoding="utf-8") as f:
+                        data = yaml.safe_load(f)
+                except (OSError, yaml.YAMLError):
+                    data = None
+                if isinstance(data, dict):
+                    value = data.get("palace")
+                    if isinstance(value, str) and value.strip():
+                        return self.resolve_palace(value)
+            if current.parent == current:
+                break
+            current = current.parent
+        return None
+
+    def resolved_palace_path(self, start_dir=None):
+        """Resolve the active palace path using the full precedence chain.
+
+        Order:
+        1. ``MEMPALACE_PALACE_PATH`` / ``MEMPAL_PALACE_PATH`` env var
+        2. Walk-up ``mempalace.yaml`` ``palace:`` key from ``start_dir`` (or CWD)
+        3. ``default_palace`` in ``~/.mempalace/config.json`` (alias or path)
+        4. Existing ``palace_path`` fallback (``palace_path`` file field or
+           ``DEFAULT_PALACE_PATH``)
+
+        Step 7 of the palace-isolation design replaces step 4 with a loud
+        error; until then the legacy default keeps existing users working.
+        """
+        env_val = os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get("MEMPAL_PALACE_PATH")
+        if env_val:
+            return os.path.abspath(os.path.expanduser(env_val))
+
+        walk_result = self.walk_up_palace(start_dir=start_dir)
+        if walk_result is not None:
+            return walk_result
+
+        default_ref = self._file_config.get("default_palace")
+        if isinstance(default_ref, str) and default_ref.strip():
+            return self.resolve_palace(default_ref)
+
+        return os.path.abspath(os.path.expanduser(self.palace_path))
+
     @property
     def collection_name(self):
         """ChromaDB collection name."""
