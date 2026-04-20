@@ -26,6 +26,24 @@ os.environ["USERPROFILE"] = _session_tmp
 os.environ["HOMEDRIVE"] = os.path.splitdrive(_session_tmp)[0] or "C:"
 os.environ["HOMEPATH"] = os.path.splitdrive(_session_tmp)[1] or _session_tmp
 
+# Seed a minimal config.json with ``default_palace`` so the MCP server's
+# import-time resolution doesn't trip the step-7 "no palace declared"
+# loud-fail. This mirrors what a real install gets via ``mempalace init``.
+# Each test still patches ``_config`` to point at its own isolated fixture
+# palace, so this is purely a session-wide safety net for module load.
+import json as _json  # noqa: E402
+
+_session_config_dir = os.path.join(_session_tmp, ".mempalace")
+os.makedirs(_session_config_dir, exist_ok=True)
+with open(os.path.join(_session_config_dir, "config.json"), "w") as _cf:
+    _json.dump(
+        {
+            "default_palace": "chat",
+            "palaces": {"chat": os.path.join(_session_config_dir, "palaces", "chat")},
+        },
+        _cf,
+    )
+
 # Now it is safe to import mempalace modules that trigger initialisation.
 import chromadb  # noqa: E402
 import pytest  # noqa: E402

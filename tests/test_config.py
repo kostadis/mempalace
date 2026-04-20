@@ -281,7 +281,13 @@ def test_resolved_palace_path_default_palace_alias(tmp_path, monkeypatch):
     assert cfg.resolved_palace_path() == "/palaces/chat"
 
 
-def test_resolved_palace_path_falls_back_to_palace_path(tmp_path, monkeypatch):
+def test_resolved_palace_path_loud_fails_when_only_legacy_palace_path_set(tmp_path, monkeypatch):
+    """Palace-isolation step 7: the legacy ``palace_path`` field is no longer
+    a silent fallback. If the user has only that field — no env var, no
+    walk-up yaml, no ``default_palace`` — raise PalaceNotDeclared so they
+    have to opt into a default explicitly."""
+    from mempalace.config import PalaceNotDeclared
+
     monkeypatch.delenv("MEMPALACE_PALACE_PATH", raising=False)
     monkeypatch.delenv("MEMPAL_PALACE_PATH", raising=False)
     monkeypatch.chdir(tmp_path)
@@ -290,7 +296,93 @@ def test_resolved_palace_path_falls_back_to_palace_path(tmp_path, monkeypatch):
     with open(cfg_dir / "config.json", "w") as f:
         json.dump({"palace_path": "/legacy/palace"}, f)
     cfg = MempalaceConfig(config_dir=str(cfg_dir))
-    assert cfg.resolved_palace_path() == "/legacy/palace"
+    with pytest.raises(PalaceNotDeclared):
+        cfg.resolved_palace_path()
+
+
+def test_resolved_palace_path_loud_fails_with_no_declaration_at_all(tmp_path, monkeypatch):
+    """Step 7 invariant: empty config + no walk-up + no env var raises."""
+    from mempalace.config import PalaceNotDeclared
+
+    monkeypatch.delenv("MEMPALACE_PALACE_PATH", raising=False)
+    monkeypatch.delenv("MEMPAL_PALACE_PATH", raising=False)
+    monkeypatch.chdir(tmp_path)
+    cfg = MempalaceConfig(config_dir=str(tmp_path / "cfg"))
+    with pytest.raises(PalaceNotDeclared, match="no palace declared"):
+        cfg.resolved_palace_path()
+
+
+def test_init_writes_default_palace_so_loud_fail_does_not_strand_fresh_users(tmp_path):
+    """``mempalace init`` must seed ``default_palace`` so a fresh-install
+    user can run CLI commands without immediately tripping the step-7
+    loud-fail. Otherwise the recommended onboarding (``pip install`` →
+    ``mempalace init``) would land on a broken state."""
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    cfg.init()
+    with open(tmp_path / "config.json") as f:
+        written = json.load(f)
+    assert written.get("default_palace") == "chat"
+    assert "chat" in written.get("palaces", {})
+
+
+def test_legacy_palace_migration_seeds_default_palace(tmp_path, monkeypatch):
+    """Pre-isolation users with a ``~/.mempalace/palace/`` dir + config without
+    ``default_palace`` would trip the step-7 loud-fail on first upgrade.
+    The migration seeds ``default_palace`` (from existing ``palace_path`` if
+    set, else "chat") so they keep working."""
+    from mempalace import config as cfg_mod
+
+    home = tmp_path / "home"
+    legacy = home / ".mempalace" / "palace"
+    legacy.mkdir(parents=True)
+    new_dest = home / ".mempalace" / "palaces" / "chat"
+    config_file = home / ".mempalace" / "config.json"
+    with open(config_file, "w") as f:
+        json.dump({"palace_path": str(legacy)}, f)
+
+    monkeypatch.setattr(cfg_mod, "LEGACY_PALACE_DIR", str(legacy))
+    monkeypatch.setattr(cfg_mod, "DEFAULT_PALACE_PATH", str(new_dest))
+    monkeypatch.setenv("HOME", str(home))
+
+    cfg_mod._maybe_migrate_legacy_palace_dir()
+
+    with open(config_file) as f:
+        migrated = json.load(f)
+    # default_palace must resolve to a still-valid location after the rename.
+    # Since the user's pinned path matched the legacy dir we just moved, we
+    # use the "chat" alias (which points at the new dest) rather than the
+    # now-stale legacy path string.
+    assert migrated["default_palace"] == "chat"
+    assert migrated["palaces"]["chat"] == str(new_dest)
+    assert migrated["palace_path"] == str(new_dest)
+    assert new_dest.exists()
+    assert not legacy.exists()
+
+
+def test_legacy_palace_migration_defaults_to_chat_when_no_palace_path(tmp_path, monkeypatch):
+    """If a pre-isolation config has no ``palace_path`` field at all, the
+    migration should still seed ``default_palace`` — landing on the canonical
+    "chat" alias since there is no user-pinned location to honor."""
+    from mempalace import config as cfg_mod
+
+    home = tmp_path / "home"
+    legacy = home / ".mempalace" / "palace"
+    legacy.mkdir(parents=True)
+    new_dest = home / ".mempalace" / "palaces" / "chat"
+    config_file = home / ".mempalace" / "config.json"
+    with open(config_file, "w") as f:
+        json.dump({"collection_name": "mempalace_drawers"}, f)
+
+    monkeypatch.setattr(cfg_mod, "LEGACY_PALACE_DIR", str(legacy))
+    monkeypatch.setattr(cfg_mod, "DEFAULT_PALACE_PATH", str(new_dest))
+    monkeypatch.setenv("HOME", str(home))
+
+    cfg_mod._maybe_migrate_legacy_palace_dir()
+
+    with open(config_file) as f:
+        migrated = json.load(f)
+    assert migrated["default_palace"] == "chat"
+    assert migrated["palaces"]["chat"] == str(new_dest)
 
 
 def test_init():
