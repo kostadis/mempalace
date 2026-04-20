@@ -2,11 +2,15 @@
 
 ## Global Config
 
-Located at `~/.mempalace/config.json`:
+Located at `~/.mempalace/config.json`. Created by `mempalace init`:
 
 ```json
 {
-  "palace_path": "/custom/path/to/palace",
+  "default_palace": "chat",
+  "palaces": {
+    "chat": "~/.mempalace/palaces/chat",
+    "oota": "~/.mempalace/palaces/oota"
+  },
   "collection_name": "mempalace_drawers",
   "people_map": {"Kai": "KAI", "Priya": "PRI"}
 }
@@ -14,9 +18,45 @@ Located at `~/.mempalace/config.json`:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `palace_path` | `~/.mempalace/palace` | Where ChromaDB stores your drawers |
+| `default_palace` | `chat` | Alias used when no `--palace` and no walk-up `mempalace.yaml` |
+| `palaces` | `{"chat": "~/.mempalace/palaces/chat"}` | Alias map: short name → directory |
 | `collection_name` | `mempalace_drawers` | ChromaDB collection name |
 | `people_map` | `{}` | Entity name → AAAK code mappings |
+
+::: tip
+The legacy `palace_path` key is still read for backwards compatibility but is no longer the primary mechanism. Use `default_palace` + `palaces` for new installs.
+:::
+
+## Palace Selection
+
+A **palace** is one physical directory with its own ChromaDB, knowledge graph, and entity registry. You can have many — for example, one per project — and they never share data.
+
+When a CLI command needs to pick a palace, it walks this precedence chain top to bottom:
+
+1. `--palace <alias-or-path>` flag on the command
+2. `MEMPALACE_PALACE_PATH` environment variable
+3. Walk-up: nearest `mempalace.yaml` from `$CWD` with a `palace:` key
+4. `default_palace` in `~/.mempalace/config.json`
+5. **Error: `no palace declared`** — no silent fallback
+
+If you run a command from a directory with no `mempalace.yaml` ancestor and no `default_palace` in config, the CLI exits with code 2 and tells you the three ways to declare one. This is intentional: it prevents writes from landing in an unintended palace.
+
+### Aliases
+
+Anywhere a palace is accepted (`--palace`, `mempalace.yaml`, `default_palace`), you can use either an alias from the `palaces` map or an absolute/`~`-prefixed path:
+
+```bash
+mempalace search "drow alliance" --palace oota          # alias
+mempalace search "drow alliance" --palace ~/data/oota   # path
+```
+
+### Hooks always use the chat palace
+
+Save and pre-compact hooks ignore the precedence chain and always write to the chat palace (`$MEMPAL_CHAT_PALACE`, default `~/.mempalace/palaces/chat`). This keeps automatic mining of conversation transcripts from contaminating curated project palaces.
+
+### Migrating from a single-palace install
+
+On first run after upgrading, `~/.mempalace/palace/` is renamed to `~/.mempalace/palaces/chat/` and your `config.json` gets a `chat` alias plus a `default_palace` entry. No data loss; your existing workflow keeps working without flag changes.
 
 ## Project Config
 
@@ -30,8 +70,10 @@ rooms:
   - backend
   - frontend
   - decisions
-palace_path: ~/.mempalace/palace
+palace: myproject   # alias from ~/.mempalace/config.json, or an absolute path
 ```
+
+The `palace:` key makes any `mempalace` command run from this directory (or any subdirectory) target that palace automatically — no `--palace` flag needed.
 
 ### `entities.json`
 
@@ -64,22 +106,28 @@ Write your identity file in first person from the AI's perspective. This becomes
 
 ## Palace Path Override
 
-All commands accept `--palace <path>` to override the default location:
+All commands accept `--palace <alias-or-path>` to override the default selection:
 
 ```bash
-mempalace search "query" --palace /tmp/test-palace
-mempalace mine ~/data/ --palace /tmp/test-palace
+mempalace search "query" --palace chat              # alias
+mempalace search "query" --palace /tmp/test-palace  # path
+mempalace mine ~/data/ --palace oota
 ```
 
-The MCP server also accepts `--palace`:
+The MCP server also accepts `--palace`, and read tools take an optional per-call `palace` argument so a single MCP registration can cross-search multiple palaces:
 
 ```bash
-python -m mempalace.mcp_server --palace /custom/palace
+python -m mempalace.mcp_server --palace oota
+```
+
+```text
+mcp__mempalace__search(query="drow alliance", palace="chat")
 ```
 
 ## Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `MEMPALACE_PALACE_PATH` | Override palace path (same as `--palace`) |
+| `MEMPALACE_PALACE_PATH` | Override palace path (same as `--palace`); accepts alias or path |
+| `MEMPAL_CHAT_PALACE` | Override the hook chat-palace path (default `~/.mempalace/palaces/chat`) |
 | `MEMPAL_DIR` | Directory for auto-mining in hooks |

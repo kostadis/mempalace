@@ -1,6 +1,6 @@
 # Palace Isolation — Design
 
-Status: draft
+Status: implemented (v3.3.0)
 Branch: `feat/palace-isolation`
 
 ## Problem

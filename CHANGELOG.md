@@ -107,6 +107,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [3.3.0] — 2026-04-13
 
+### Breaking Changes
+- **Palace isolation** — multi-palace support replaces the single-palace model. `~/.mempalace/palace/` is migrated to `~/.mempalace/palaces/chat/` on first run. The CLI now selects a palace by precedence: `--palace` flag → `MEMPALACE_PALACE_PATH` env var → walk-up `mempalace.yaml` `palace:` key → `default_palace` in `~/.mempalace/config.json`. If none of these resolve, commands exit with `error: no palace declared` instead of silently writing to the legacy location. `mempalace init` and the legacy-dir migration both seed `default_palace: "chat"` so existing users and fresh installs keep working without changes. Hooks always write to the chat palace regardless of `$CWD`. See [Configuration → Palace Selection](https://mempalace.io/guide/configuration#palace-selection) for the new model.
+
 ### New Features
 - Closet layer — a compact searchable index of pointers to verbatim drawers, enabling fast topical lookup without reading all content (#788)
 - BM25 hybrid search — closets boost ranking, drawers remain the source of truth (#795, #829)
