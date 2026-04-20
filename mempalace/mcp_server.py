@@ -102,11 +102,28 @@ if _args.palace:
     os.environ["MEMPALACE_PALACE_PATH"] = _resolved_launch
 elif not (os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get("MEMPAL_PALACE_PATH")):
     # No explicit launch argument → walk up from CWD looking for a
-    # ``mempalace.yaml`` with a ``palace:`` key. This is how a per-workspace
-    # MCP launcher picks up the campaign palace without hardcoding a path.
+    # ``mempalace.yaml`` with a ``palace:`` key, then fall through to the
+    # full resolution chain (``default_palace`` in config). Loud-fail if
+    # nothing declares a palace (palace-isolation step 7) — a silent
+    # fall-through to the chat palace would let the MCP server quietly
+    # accept writes meant for a campaign palace.
+    #
+    # Only the walk-up result is pinned via env var (so every fresh
+    # ``MempalaceConfig()`` in this process picks up the campaign palace).
+    # When the resolution comes from ``default_palace`` we leave the env
+    # var alone — the file-level config already encodes the answer and
+    # callers that monkeypatch ``_config`` (tests) need the property to
+    # honour the patched file config rather than a process-wide override.
+    from .config import PalaceNotDeclared
+
     _walked = MempalaceConfig().walk_up_palace()
     if _walked:
         os.environ["MEMPALACE_PALACE_PATH"] = _walked
+    else:
+        try:
+            MempalaceConfig().resolved_palace_path()
+        except PalaceNotDeclared as e:
+            raise SystemExit(f"mcp_server: {e}")
 
 _config = MempalaceConfig()
 # KG for the active default palace. ``_get_kg(palace_path)`` below falls back

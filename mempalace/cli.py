@@ -33,7 +33,7 @@ import shlex
 import argparse
 from pathlib import Path
 
-from .config import MempalaceConfig
+from .config import MempalaceConfig, PalaceNotDeclared
 from .version import __version__
 
 
@@ -46,13 +46,22 @@ def _resolve_cli_palace(args):
     Explicit ``--palace`` accepts aliases as well as paths (via
     ``resolve_palace``). Without ``--palace``, ``resolved_palace_path``
     walks up from CWD looking for ``mempalace.yaml`` with a ``palace:``
-    key before falling through to config and default. Returns an
-    absolute path.
+    key before checking ``default_palace`` in config. If nothing
+    declares a palace, prints a friendly error and exits — there is
+    no silent fall-through to the chat palace (palace-isolation step 7).
+    Returns an absolute path.
     """
     cfg = MempalaceConfig()
-    if args.palace:
-        return cfg.resolve_palace(args.palace)
-    return cfg.resolved_palace_path()
+    try:
+        if args.palace:
+            return cfg.resolve_palace(args.palace)
+        return cfg.resolved_palace_path()
+    except PalaceNotDeclared as e:
+        print(f"\n  error: {e}\n", file=sys.stderr)
+        sys.exit(2)
+    except ValueError as e:
+        print(f"\n  error: --palace {args.palace!r}: {e}\n", file=sys.stderr)
+        sys.exit(2)
 
 
 def _ensure_mempalace_files_gitignored(project_dir) -> bool:

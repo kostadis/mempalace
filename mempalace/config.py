@@ -87,6 +87,17 @@ DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palaces/chat")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
 
 
+class PalaceNotDeclared(Exception):
+    """Raised when no palace is declared in env, walk-up yaml, or config.
+
+    Step 7 of the palace-isolation design: there is no implicit fallback
+    to the chat palace from arbitrary directories. The user must say
+    where they want their reads/writes to land, either via ``--palace``,
+    a ``mempalace.yaml`` walk-up file, or a ``default_palace`` entry in
+    ``~/.mempalace/config.json``.
+    """
+
+
 def _maybe_migrate_legacy_palace_dir():
     """One-shot rename of ``~/.mempalace/palace/`` → ``~/.mempalace/palaces/chat/``.
 
@@ -138,6 +149,22 @@ def _maybe_migrate_legacy_palace_dir():
         changed = True
     if "chat" not in aliases:
         aliases["chat"] = DEFAULT_PALACE_PATH
+        changed = True
+
+    # Seed ``default_palace`` so step 7's loud-fail doesn't strand a
+    # pre-isolation user the moment they upgrade. If they had a custom
+    # ``palace_path`` we honor it; if it matched the legacy dir we just
+    # renamed (or was unset) we land on the chat alias, which now points
+    # at the new dest.
+    if "default_palace" not in cfg:
+        if (
+            isinstance(pinned, str)
+            and pinned.strip()
+            and os.path.abspath(os.path.expanduser(pinned)) != LEGACY_PALACE_DIR
+        ):
+            cfg["default_palace"] = pinned
+        else:
+            cfg["default_palace"] = "chat"
         changed = True
 
     if changed:
@@ -318,11 +345,13 @@ class MempalaceConfig:
         1. ``MEMPALACE_PALACE_PATH`` / ``MEMPAL_PALACE_PATH`` env var
         2. Walk-up ``mempalace.yaml`` ``palace:`` key from ``start_dir`` (or CWD)
         3. ``default_palace`` in ``~/.mempalace/config.json`` (alias or path)
-        4. Existing ``palace_path`` fallback (``palace_path`` file field or
-           ``DEFAULT_PALACE_PATH``)
 
-        Step 7 of the palace-isolation design replaces step 4 with a loud
-        error; until then the legacy default keeps existing users working.
+        If none of those declare a palace, raises :class:`PalaceNotDeclared`.
+        Step 7 of the palace-isolation design eliminates the silent
+        fall-through to the chat palace: users must declare where reads
+        and writes land. To restore the old "chat is the default
+        everywhere" behavior, set ``"default_palace": "chat"`` in
+        ``~/.mempalace/config.json``.
         """
         env_val = os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get("MEMPAL_PALACE_PATH")
         if env_val:
@@ -336,7 +365,11 @@ class MempalaceConfig:
         if isinstance(default_ref, str) and default_ref.strip():
             return self.resolve_palace(default_ref)
 
-        return os.path.abspath(os.path.expanduser(self.palace_path))
+        raise PalaceNotDeclared(
+            "no palace declared — run from a directory containing "
+            "`mempalace.yaml` with a `palace:` key, pass `--palace <alias-or-path>`, "
+            "or set `default_palace` in ~/.mempalace/config.json"
+        )
 
     @property
     def collection_name(self):
@@ -432,6 +465,8 @@ class MempalaceConfig:
         if not self._config_file.exists():
             default_config = {
                 "palace_path": DEFAULT_PALACE_PATH,
+                "default_palace": "chat",
+                "palaces": {"chat": DEFAULT_PALACE_PATH},
                 "collection_name": DEFAULT_COLLECTION_NAME,
                 "topic_wings": DEFAULT_TOPIC_WINGS,
                 "hall_keywords": DEFAULT_HALL_KEYWORDS,
