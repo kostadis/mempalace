@@ -5,9 +5,12 @@ Priority: env vars > config file (~/.mempalace/config.json) > defaults
 """
 
 import json
+import logging
 import os
 import re
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 # ── Input validation ──────────────────────────────────────────────────────────
@@ -95,6 +98,93 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
 LEGACY_PALACE_DIR = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palaces/chat")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
+
+
+# Filesystem types that break ChromaDB / SQLite mmap + flock + fsync semantics
+# when the palace is stored on them. On WSL2 these are the DrvFs-backed
+# Windows drive mounts (/mnt/c, /mnt/d, /mnt/g …) which /proc/mounts reports
+# as fstype "9p" with an "aname=drvfs;" option.
+#
+# ext4 / xfs / btrfs / tmpfs (and any future native Linux fs) are fine.
+_BAD_FSTYPES = {"9p", "drvfs", "cifs", "smbfs", "smb3", "nfs", "nfs4", "fuse.sshfs"}
+
+# Process-local cache so we only warn once per (resolved) palace path.
+_storage_warned: set = set()
+
+
+def _find_mount_for(path: str):
+    """Return (mountpoint, fstype, options) for the deepest mount prefix of ``path``.
+
+    Returns ``None`` if /proc/mounts can't be read (non-Linux, chroot, etc.).
+    """
+    try:
+        path_abs = os.path.abspath(path)
+    except (OSError, ValueError):
+        return None
+
+    try:
+        with open("/proc/mounts", "r", encoding="utf-8") as f:
+            mounts = f.readlines()
+    except OSError:
+        return None
+
+    best = None  # (mountpoint_len, mountpoint, fstype, options)
+    for line in mounts:
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        mountpoint, fstype, options = parts[1], parts[2], parts[3]
+        # Mount line uses octal escapes for embedded spaces (`\040`).
+        mountpoint = mountpoint.encode().decode("unicode_escape", errors="replace")
+        if mountpoint == path_abs or path_abs.startswith(mountpoint.rstrip("/") + "/"):
+            mp_len = len(mountpoint.rstrip("/"))
+            if best is None or mp_len > best[0]:
+                best = (mp_len, mountpoint, fstype, options)
+
+    if best is None:
+        return None
+    return (best[1], best[2], best[3])
+
+
+def check_palace_storage(path: str) -> str:
+    """Warn once when ``path`` resides on a filesystem that breaks ChromaDB/SQLite.
+
+    Returns the warning message (also logged at WARNING level) on the first
+    call per path; subsequent calls are no-ops and return an empty string.
+    Returns empty string on native Linux filesystems (ext4/xfs/btrfs/tmpfs).
+
+    Specifically targeted at WSL2 users who symlink or point their palace
+    onto a DrvFs-backed mount (``/mnt/c/…``). A dedicated VHD mounted at
+    e.g. ``/mnt/data`` as ext4 is fine and never warns.
+    """
+    try:
+        resolved = os.path.realpath(os.path.expanduser(path))
+    except (OSError, ValueError):
+        return ""
+    if resolved in _storage_warned:
+        return ""
+
+    mount_info = _find_mount_for(resolved)
+    if mount_info is None:
+        return ""
+    mountpoint, fstype, options = mount_info
+
+    is_bad = fstype in _BAD_FSTYPES or "aname=drvfs" in options
+    if not is_bad:
+        return ""
+
+    _storage_warned.add(resolved)
+    msg = (
+        f"palace at {resolved} is on {fstype} mount {mountpoint!r} "
+        f"(options: {options[:80]}{'…' if len(options) > 80 else ''}) — "
+        "ChromaDB + SQLite rely on mmap/flock/fsync semantics that DrvFs/9P/CIFS "
+        "do not provide correctly. Writes may corrupt indices under concurrent "
+        "mining. Relocate the palace onto a native Linux filesystem "
+        "(e.g. a dedicated VHD mounted at /mnt/data as ext4, or $HOME on the "
+        "WSL2 root filesystem)."
+    )
+    logger.warning(msg)
+    return msg
 
 
 class PalaceNotDeclared(Exception):
