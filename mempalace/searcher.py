@@ -158,6 +158,35 @@ def build_where_filter(wing: str = None, room: str = None) -> dict:
     return {}
 
 
+def _build_where_filter_multi(wing_filters=None, room_filters=None) -> dict:
+    """Build ChromaDB where filter supporting multi-valued wing/room scopes.
+
+    Used by ``search_within`` to express ``wing IN {a, b, c}`` and/or
+    ``room IN {x, y}`` in a single query — the common shape for the leaf
+    step of hierarchical descent, where wing/room pruning has already
+    identified several candidate scopes.
+
+    Single-value lists degrade to a plain ``{"field": value}`` so older
+    Chroma versions (which don't accept ``$in`` on single values in all
+    positions) behave identically to ``build_where_filter``.
+    """
+    def _clause(field: str, values) -> dict:
+        if not values:
+            return {}
+        vals = [v for v in values if v]
+        if not vals:
+            return {}
+        if len(vals) == 1:
+            return {field: vals[0]}
+        return {field: {"$in": list(vals)}}
+
+    wing_clause = _clause("wing", wing_filters)
+    room_clause = _clause("room", room_filters)
+    if wing_clause and room_clause:
+        return {"$and": [wing_clause, room_clause]}
+    return wing_clause or room_clause or {}
+
+
 def _extract_drawer_ids_from_closet(closet_doc: str) -> list:
     """Parse all `→drawer_id_a,drawer_id_b` pointers out of a closet document.
 
@@ -301,28 +330,38 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     print()
 
 
-def search_memories(
+def search_within(
     query: str,
     palace_path: str,
-    wing: str = None,
-    room: str = None,
+    *,
+    wing_filters=None,
+    room_filters=None,
+    ids=None,
     n_results: int = 5,
     max_distance: float = 0.0,
 ) -> dict:
-    """Programmatic search — returns a dict instead of printing.
+    """Generic scoped search primitive — the leaf of hierarchical descent.
 
-    Used by the MCP server and other callers that need data.
+    Superset of :func:`search_memories`: supports multi-valued wing/room
+    scopes (``wing IN {a, b, c}``, ``room IN {x, y}``) and post-filtering
+    to a specific set of drawer IDs. Otherwise identical to
+    ``search_memories`` — same hybrid retrieval pipeline (drawer vector
+    query + closet rank boost + BM25 rerank + drawer-grep hydration) and
+    same hit shape.
 
     Args:
-        query: Natural language search query.
+        query: Natural-language search query.
         palace_path: Path to the ChromaDB palace directory.
-        wing: Optional wing filter.
-        room: Optional room filter.
-        n_results: Max results to return.
-        max_distance: Max cosine distance threshold. The palace collection uses
-            cosine distance (hnsw:space=cosine) — 0 = identical, 2 = opposite.
-            Results with distance > this value are filtered out. A value of
-            0.0 disables filtering. Typical useful range: 0.3–1.0.
+        wing_filters: Optional iterable of wing names to restrict the search to.
+        room_filters: Optional iterable of room names to restrict the search to.
+        ids: Optional iterable of drawer IDs; results are post-filtered to
+            this set. Use when a prior pruning step has chosen specific
+            drawers and you want to rerank them against a fresh query.
+        n_results: Maximum hits to return.
+        max_distance: Cosine-distance cutoff (0 disables).
+
+    Returns a dict with ``query``, ``filters`` (the multi-valued scopes),
+    ``total_before_filter``, and ``results`` (list of hit dicts).
     """
     try:
         drawers_col = get_collection(palace_path, create=False)
@@ -333,7 +372,12 @@ def search_memories(
             "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
         }
 
-    where = build_where_filter(wing, room)
+    # Normalize filter args to deterministic lists.
+    wing_list = [w for w in (wing_filters or []) if w]
+    room_list = [r for r in (room_filters or []) if r]
+    id_set = set(ids) if ids else None
+
+    where = _build_where_filter_multi(wing_list, room_list)
 
     # Hybrid retrieval: always query drawers directly (the floor), then use
     # closet hits to boost rankings. Closets are a ranking SIGNAL, never a
@@ -387,13 +431,19 @@ def search_memories(
     CLOSET_DISTANCE_CAP = 1.5  # cosine dist > 1.5 = too weak to use as signal
 
     scored: list = []
-    for doc, meta, dist in zip(
+    for drawer_id, doc, meta, dist in zip(
+        _first_or_empty(drawer_results, "ids"),
         _first_or_empty(drawer_results, "documents"),
         _first_or_empty(drawer_results, "metadatas"),
         _first_or_empty(drawer_results, "distances"),
     ):
         # Filter on raw distance before rounding to avoid precision loss.
         if max_distance > 0.0 and dist > max_distance:
+            continue
+        # Drawer-ID post-filter: used by callers that have already chosen
+        # a specific subset of drawers via hierarchical pruning and want
+        # them reranked against this query.
+        if id_set is not None and drawer_id not in id_set:
             continue
 
         meta = meta or {}
@@ -410,6 +460,7 @@ def search_memories(
 
         effective_dist = dist - boost
         entry = {
+            "drawer_id": drawer_id,
             "text": doc,
             "wing": meta.get("wing", "unknown"),
             "room": meta.get("room", "unknown"),
@@ -499,7 +550,42 @@ def search_memories(
 
     return {
         "query": query,
-        "filters": {"wing": wing, "room": room},
+        "filters": {
+            "wing_filters": wing_list or None,
+            "room_filters": room_list or None,
+            "ids": list(id_set) if id_set is not None else None,
+        },
         "total_before_filter": len(_first_or_empty(drawer_results, "documents")),
         "results": hits,
     }
+
+
+def search_memories(
+    query: str,
+    palace_path: str,
+    wing: str = None,
+    room: str = None,
+    n_results: int = 5,
+    max_distance: float = 0.0,
+) -> dict:
+    """Programmatic search — single-wing, single-room convenience wrapper.
+
+    Thin shim over :func:`search_within` that preserves the historical
+    single-value filter shape in the ``filters`` return block, so MCP
+    tools and scripts that peek at it don't break.
+
+    Used by the MCP server and other callers that need data rather than
+    printed output.
+    """
+    result = search_within(
+        query,
+        palace_path,
+        wing_filters=[wing] if wing else None,
+        room_filters=[room] if room else None,
+        n_results=n_results,
+        max_distance=max_distance,
+    )
+    # Preserve the pre-search_within return shape for existing consumers.
+    if "filters" in result:
+        result["filters"] = {"wing": wing, "room": room}
+    return result
