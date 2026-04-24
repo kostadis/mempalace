@@ -1,0 +1,281 @@
+{
+  "benchmark": "hierarchical_aaak",
+  "version": 1,
+  "description": "Gate 1 fixture for RLM-style hierarchical retrieval. Tests whether the deterministic room/wing index layer preserves navigation signal against a flat-search baseline on a generic multi-wing palace (research notes + chat archive shape — no RPG content; that benchmark lives in CampaignGenerator).",
+  "fixture": {
+    "seed": 1729,
+    "filler_per_room": 40,
+    "wings": [
+      {
+        "name": "research-notes",
+        "rooms": ["backend", "frontend", "infra"]
+      },
+      {
+        "name": "team-chat",
+        "rooms": ["incidents", "planning", "kudos"]
+      },
+      {
+        "name": "reading-journal",
+        "rooms": ["papers", "books"]
+      }
+    ],
+    "drawers": [
+      {
+        "id": "rn_be_001", "wing": "research-notes", "room": "backend", "source_file": "auth.md",
+        "text": "JWT rotation policy: refresh every 15 minutes with a sliding window. Tokens live in HttpOnly cookies keyed on user-agent hash.",
+        "closet_lines": [
+          "jwt rotation policy|JWT;HttpOnly|→rn_be_001",
+          "sliding window refresh|JWT|→rn_be_001",
+          "httponly cookies|HttpOnly|→rn_be_001"
+        ]
+      },
+      {
+        "id": "rn_be_002", "wing": "research-notes", "room": "backend", "source_file": "db.md",
+        "text": "PostgreSQL vacuum autovacuum threshold set at 50 percent for the users table. Connection pool sized at 20 with overflow 10 via pgbouncer.",
+        "closet_lines": [
+          "postgres autovacuum threshold|Postgres|→rn_be_002",
+          "connection pool sizing|Postgres;pgbouncer|→rn_be_002",
+          "pgbouncer overflow|pgbouncer|→rn_be_002"
+        ]
+      },
+      {
+        "id": "rn_be_003", "wing": "research-notes", "room": "backend", "source_file": "rate-limit.md",
+        "text": "Nginx rate limiting configured at 100 requests per second with burst of 50. Redis-backed leaky bucket for per-tenant quotas.",
+        "closet_lines": [
+          "nginx rate limiting|Nginx|→rn_be_003",
+          "leaky bucket per tenant|Redis|→rn_be_003"
+        ]
+      },
+      {
+        "id": "rn_fe_001", "wing": "research-notes", "room": "frontend", "source_file": "react.md",
+        "text": "React concurrent mode uses startTransition to mark state updates as non-urgent. useDeferredValue defers renders of expensive components.",
+        "closet_lines": [
+          "startTransition non-urgent updates|React|→rn_fe_001",
+          "useDeferredValue expensive components|React|→rn_fe_001"
+        ]
+      },
+      {
+        "id": "rn_fe_002", "wing": "research-notes", "room": "frontend", "source_file": "fetch.md",
+        "text": "TanStack Query centralizes server state. Retries exponential backoff; staleTime 30s. Query key invariants documented in every hook.",
+        "closet_lines": [
+          "tanstack query server state|React;TanStack|→rn_fe_002",
+          "exponential backoff retries|TanStack|→rn_fe_002"
+        ]
+      },
+      {
+        "id": "rn_infra_001", "wing": "research-notes", "room": "infra", "source_file": "k8s.md",
+        "text": "Kubernetes horizontal pod autoscaler targets 70 percent CPU utilization with min 3 max 20 replicas. Cold-start latency tracked via readiness probes.",
+        "closet_lines": [
+          "kubernetes hpa cpu target|Kubernetes|→rn_infra_001",
+          "readiness probe cold start|Kubernetes|→rn_infra_001"
+        ]
+      },
+      {
+        "id": "rn_infra_002", "wing": "research-notes", "room": "infra", "source_file": "lambda.md",
+        "text": "AWS Lambda cold start mitigation uses provisioned concurrency of 10 instances and SnapStart for Java runtimes.",
+        "closet_lines": [
+          "lambda provisioned concurrency|AWS;Lambda|→rn_infra_002",
+          "snapstart java cold start|Lambda|→rn_infra_002"
+        ]
+      },
+      {
+        "id": "rn_infra_003", "wing": "research-notes", "room": "infra", "source_file": "terraform.md",
+        "text": "Terraform state locking uses DynamoDB with consistent reads. Workspaces split prod/stage to prevent cross-env drift.",
+        "closet_lines": [
+          "terraform dynamodb state lock|Terraform;DynamoDB|→rn_infra_003",
+          "workspaces prod stage split|Terraform|→rn_infra_003"
+        ]
+      },
+      {
+        "id": "tc_inc_001", "wing": "team-chat", "room": "incidents", "source_file": "incident-2026-02-14.md",
+        "text": "Incident: checkout p99 latency jumped to 2.4 seconds at 14:02. Root cause: runaway pgbouncer connection from misbehaving worker. Remediated by capping worker concurrency to 4.",
+        "closet_lines": [
+          "checkout p99 latency spike|Postgres;pgbouncer|→tc_inc_001",
+          "worker concurrency cap|pgbouncer|→tc_inc_001"
+        ]
+      },
+      {
+        "id": "tc_inc_002", "wing": "team-chat", "room": "incidents", "source_file": "incident-2026-03-02.md",
+        "text": "Incident: Lambda throttling for image-resize after 10x traffic spike. Raised reserved concurrency to 200; added SQS in front for backpressure.",
+        "closet_lines": [
+          "lambda throttling traffic spike|Lambda;AWS|→tc_inc_002",
+          "sqs backpressure image resize|Lambda|→tc_inc_002"
+        ]
+      },
+      {
+        "id": "tc_plan_001", "wing": "team-chat", "room": "planning", "source_file": "sprint-42.md",
+        "text": "Sprint 42 plan: migrate auth to passkeys by Q3. Evaluate ChromaDB alternatives (Qdrant, Weaviate) for our vector search prototype.",
+        "closet_lines": [
+          "migrate auth to passkeys|Auth|→tc_plan_001",
+          "chromadb alternatives qdrant weaviate|Chroma;Qdrant;Weaviate|→tc_plan_001"
+        ]
+      },
+      {
+        "id": "tc_plan_002", "wing": "team-chat", "room": "planning", "source_file": "sprint-43.md",
+        "text": "Sprint 43 plan: harden rate limiting, add per-tenant quotas on top of nginx. Dog-food the observability dashboards in staging for a week.",
+        "closet_lines": [
+          "per-tenant rate limit quotas|Nginx|→tc_plan_002",
+          "observability dog-food staging|Observability|→tc_plan_002"
+        ]
+      },
+      {
+        "id": "tc_kudos_001", "wing": "team-chat", "room": "kudos", "source_file": "kudos-q1.md",
+        "text": "Kudos to Alice for the JWT rotation rollout landing without a single user complaint. And to Bob for the 3am incident response on the pgbouncer meltdown.",
+        "closet_lines": [
+          "alice jwt rollout kudos|Alice;JWT|→tc_kudos_001",
+          "bob pgbouncer incident response|Bob;pgbouncer|→tc_kudos_001"
+        ]
+      },
+      {
+        "id": "rj_papers_001", "wing": "reading-journal", "room": "papers", "source_file": "rlm-paper.md",
+        "text": "MIT RLM paper: hierarchical retrieval over multi-million-token corpora with sub-corpus pruning at each level. Key contribution: LLM-summarized intermediate levels — which we reject in favor of deterministic projections.",
+        "closet_lines": [
+          "rlm hierarchical retrieval|RLM|→rj_papers_001",
+          "sub-corpus pruning multi-million|RLM|→rj_papers_001"
+        ]
+      },
+      {
+        "id": "rj_papers_002", "wing": "reading-journal", "room": "papers", "source_file": "bm25-survey.md",
+        "text": "Okapi BM25 survey. IDF smoothing with log((N-df+0.5)/(df+0.5)+1) stays non-negative, useful for reranking small candidate sets after vector retrieval.",
+        "closet_lines": [
+          "okapi bm25 idf smoothing|BM25|→rj_papers_002",
+          "rerank candidates vector retrieval|BM25|→rj_papers_002"
+        ]
+      },
+      {
+        "id": "rj_books_001", "wing": "reading-journal", "room": "books", "source_file": "designing-data-intensive-apps.md",
+        "text": "Designing Data-Intensive Applications — Ch. 5 on replication. Single-leader vs multi-leader tradeoffs under WAN partitions. Notes on conflict resolution via version vectors.",
+        "closet_lines": [
+          "ddia replication tradeoffs|DDIA|→rj_books_001",
+          "version vectors conflict resolution|DDIA|→rj_books_001"
+        ]
+      },
+      {
+        "id": "rj_books_002", "wing": "reading-journal", "room": "books", "source_file": "site-reliability.md",
+        "text": "SRE book chapter on error budgets. Key insight: 100 percent reliability is the wrong target — it precludes shipping. Burn-rate alerts beat raw uptime SLOs.",
+        "closet_lines": [
+          "sre error budgets|SRE|→rj_books_002",
+          "burn-rate alerts uptime slos|SRE|→rj_books_002"
+        ]
+      }
+    ]
+  },
+  "queries": [
+    {
+      "id": "q01",
+      "query": "jwt rotation refresh policy",
+      "expected_drawer_ids": ["rn_be_001"],
+      "expected_wing": "research-notes",
+      "expected_room": "backend",
+      "notes": "Narrow auth research note; the jwt rollout kudos drawer is a weak distractor."
+    },
+    {
+      "id": "q02",
+      "query": "postgres connection pool pgbouncer overflow",
+      "expected_drawer_ids": ["rn_be_002"],
+      "expected_wing": "research-notes",
+      "expected_room": "backend"
+    },
+    {
+      "id": "q03",
+      "query": "nginx rate limiting per tenant",
+      "expected_drawer_ids": ["rn_be_003", "tc_plan_002"],
+      "expected_wing": "research-notes",
+      "expected_room": "backend",
+      "notes": "Cross-wing recall: matches both the research note and the planning item."
+    },
+    {
+      "id": "q04",
+      "query": "react startTransition non-urgent state update",
+      "expected_drawer_ids": ["rn_fe_001"],
+      "expected_wing": "research-notes",
+      "expected_room": "frontend"
+    },
+    {
+      "id": "q05",
+      "query": "tanstack query server state retries",
+      "expected_drawer_ids": ["rn_fe_002"],
+      "expected_wing": "research-notes",
+      "expected_room": "frontend"
+    },
+    {
+      "id": "q06",
+      "query": "kubernetes horizontal pod autoscaler cpu target",
+      "expected_drawer_ids": ["rn_infra_001"],
+      "expected_wing": "research-notes",
+      "expected_room": "infra"
+    },
+    {
+      "id": "q07",
+      "query": "lambda cold start provisioned concurrency",
+      "expected_drawer_ids": ["rn_infra_002", "tc_inc_002"],
+      "expected_wing": "research-notes",
+      "expected_room": "infra",
+      "notes": "Cross-wing: research note + incident report about lambda throttling."
+    },
+    {
+      "id": "q08",
+      "query": "terraform state locking dynamodb",
+      "expected_drawer_ids": ["rn_infra_003"],
+      "expected_wing": "research-notes",
+      "expected_room": "infra"
+    },
+    {
+      "id": "q09",
+      "query": "pgbouncer incident checkout latency",
+      "expected_drawer_ids": ["tc_inc_001"],
+      "expected_wing": "team-chat",
+      "expected_room": "incidents"
+    },
+    {
+      "id": "q10",
+      "query": "migrate auth to passkeys sprint",
+      "expected_drawer_ids": ["tc_plan_001"],
+      "expected_wing": "team-chat",
+      "expected_room": "planning"
+    },
+    {
+      "id": "q11",
+      "query": "chromadb alternatives qdrant weaviate",
+      "expected_drawer_ids": ["tc_plan_001"],
+      "expected_wing": "team-chat",
+      "expected_room": "planning"
+    },
+    {
+      "id": "q12",
+      "query": "kudos jwt rollout rotation alice",
+      "expected_drawer_ids": ["tc_kudos_001"],
+      "expected_wing": "team-chat",
+      "expected_room": "kudos",
+      "notes": "Entity-driven: the jwt rotation research note is a plausible distractor."
+    },
+    {
+      "id": "q13",
+      "query": "rlm hierarchical retrieval sub-corpus pruning",
+      "expected_drawer_ids": ["rj_papers_001"],
+      "expected_wing": "reading-journal",
+      "expected_room": "papers"
+    },
+    {
+      "id": "q14",
+      "query": "okapi bm25 idf smoothing rerank",
+      "expected_drawer_ids": ["rj_papers_002"],
+      "expected_wing": "reading-journal",
+      "expected_room": "papers"
+    },
+    {
+      "id": "q15",
+      "query": "sre error budget burn rate alerts",
+      "expected_drawer_ids": ["rj_books_002"],
+      "expected_wing": "reading-journal",
+      "expected_room": "books"
+    }
+  ],
+  "gate_thresholds": {
+    "recall_at_10_delta_max": 0.05,
+    "precision_at_10_delta_max": 0.0,
+    "drawers_scored_reduction_min": 2.0,
+    "indices_size_mb_max": 50,
+    "human_readable_paths_min": 10
+  }
+}
