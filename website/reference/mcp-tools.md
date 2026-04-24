@@ -61,6 +61,36 @@ Semantic search. Returns verbatim drawer content with similarity scores.
 
 ---
 
+### `mempalace_search_hierarchical`
+
+Hierarchical retrieval that prunes at the wing and room level using
+deterministic AAAK roll-up indices before scoring drawers. Cheap on
+large palaces because most drawers are never visited. Returns the
+wing → room → drawer path alongside drawer hits.
+
+Falls back to a flat scoped search (marked `fallback: true`) when the
+indices are empty or a specific `wing_filter` / `room_filter` is
+supplied — so the tool is always useful even on a freshly mined palace.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `query` | string | **Yes** | Short keyword query (max 250 chars) |
+| `limit` | integer | No | Max drawer results (default: 5) |
+| `wing_filter` | string | No | Force a specific wing (skips wing-level pruning) |
+| `room_filter` | string | No | Force a specific room |
+| `max_depth` | integer | No | `0` = wings only, `1` = wings + rooms, `2` = full drawer descent (default) |
+| `budget` | integer | No | Hard cap on total drawer hits |
+| `max_distance` | number | No | Max cosine distance for drawer hits (default: 1.5) |
+| `min_similarity` | number | No | Alternate scale: min similarity 0–1 |
+| `palace` | string | No | Palace alias or path |
+
+**Returns:** `{ query, max_depth, path: { wings: [...], rooms: [...] }, results: [...], fallback }`
+
+The room and wing indices are rebuilt by `recursive_indexer.rebuild_all()`
+or incrementally via `rebuild_dirty()` once miners mark rooms dirty.
+
+---
+
 ### `mempalace_check_duplicate`
 
 Check if content already exists in the palace before filing.

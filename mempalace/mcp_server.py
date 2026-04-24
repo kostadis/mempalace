@@ -68,7 +68,11 @@ from .backends.chroma import (  # noqa: E402
     hnsw_capacity_status,
 )
 from .query_sanitizer import sanitize_query  # noqa: E402
-from .searcher import search_memories  # noqa: E402
+from .searcher import search_memories, search_within  # noqa: E402
+from .palace import (  # noqa: E402
+    get_room_indices_collection,
+    get_wing_indices_collection,
+)
 from .palace_graph import (  # noqa: E402
     traverse,
     find_tunnels,
@@ -752,6 +756,245 @@ def tool_search(
     if context:
         result["context_received"] = True
     return result
+
+
+def tool_search_hierarchical(
+    query: str,
+    limit: int = 5,
+    wing_filter: str = None,
+    room_filter: str = None,
+    max_depth: int = 2,
+    budget: int = None,
+    max_distance: float = 1.5,
+    min_similarity: float = None,
+    palace: str = None,
+):
+    """Hierarchical retrieval: wing → room → drawer with pruning at each level.
+
+    ``max_depth`` controls how deep the descent goes:
+        * 0 — return wing-level AAAK hits only (cheapest; good for wake-up)
+        * 1 — wing → room pruning (no drawer lookup yet)
+        * 2 — full descent with drawer-level ``search_within`` (default)
+
+    If ``wing_filter`` / ``room_filter`` are supplied, they force the scope
+    from the start — the wing/room index layers are skipped and the query
+    runs as a scoped ``search_within``. This is the "I already know where
+    to look" shortcut.
+
+    If the wing index collection is empty (fresh palace, or the
+    ``recursive_indexer`` hasn't run yet), the tool falls back to a flat
+    ``search_within`` and sets ``fallback=True`` in the return — so the
+    feature never silently produces zero hits just because indices
+    haven't been built.
+    """
+    # ── input handling ─────────────────────────────────────────────────
+    limit = max(1, min(limit, _MAX_RESULTS))
+    max_depth = max(0, min(int(max_depth), 2))
+    try:
+        wing_filter = _sanitize_optional_name(wing_filter, "wing")
+        room_filter = _sanitize_optional_name(room_filter, "room")
+        resolved = _resolve_palace_arg(palace)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    dist = (1.0 - min_similarity) if min_similarity is not None else max_distance
+    sanitized = sanitize_query(query)
+    clean_query = sanitized["clean_query"]
+
+    def _attach_sanitizer_info(result: dict) -> dict:
+        if sanitized["was_sanitized"]:
+            result["query_sanitized"] = True
+            result["sanitizer"] = {
+                "method": sanitized["method"],
+                "original_length": sanitized["original_length"],
+                "clean_length": sanitized["clean_length"],
+                "clean_query": sanitized["clean_query"],
+            }
+        return result
+
+    def _shortcut_flat_search(reason: str) -> dict:
+        """Caller specified a narrow scope or no indices exist; go flat."""
+        r = search_within(
+            clean_query,
+            palace_path=resolved,
+            wing_filters=[wing_filter] if wing_filter else None,
+            room_filters=[room_filter] if room_filter else None,
+            n_results=limit,
+            max_distance=dist,
+        )
+        r["max_depth"] = max_depth
+        r["path"] = {"wings": [], "rooms": []}
+        r["fallback"] = True
+        r["fallback_reason"] = reason
+        return _attach_sanitizer_info(r)
+
+    # Narrow scope already known → no pruning, just scoped drawer search.
+    if wing_filter or room_filter:
+        return _shortcut_flat_search("explicit wing/room filter supplied")
+
+    # ── wing-level prune ──────────────────────────────────────────────
+    try:
+        wing_col = get_wing_indices_collection(resolved, create=True)
+    except Exception as exc:
+        return _shortcut_flat_search(f"wing index collection unavailable: {exc}")
+
+    try:
+        wing_count = wing_col.count()
+    except Exception:
+        wing_count = 0
+    if wing_count == 0:
+        return _shortcut_flat_search(
+            "wing indices empty — run recursive_indexer.rebuild_all"
+        )
+
+    # Over-fetch so downstream budget/dedup has room to work.
+    wing_fetch = max(4, limit * 2)
+    try:
+        wing_hits = wing_col.query(
+            query_texts=[clean_query],
+            n_results=wing_fetch,
+            include=["documents", "metadatas", "distances"],
+        )
+    except Exception as exc:
+        return _shortcut_flat_search(f"wing index query failed: {exc}")
+
+    # Chroma returns list-of-lists from .query(); both dict and typed.
+    def _q_field(q, key):
+        if isinstance(q, dict):
+            outer = q.get(key)
+        else:
+            outer = getattr(q, key, None)
+        if not outer:
+            return []
+        return outer[0] or []
+
+    wing_metas = _q_field(wing_hits, "metadatas")
+    wing_docs = _q_field(wing_hits, "documents")
+    wing_dists = _q_field(wing_hits, "distances")
+
+    wings_pruned: list = []
+    selected_wings: list = []
+    seen_wings: set = set()
+    for meta, doc, d in zip(wing_metas, wing_docs, wing_dists):
+        meta = meta or {}
+        w = meta.get("wing")
+        if not isinstance(w, str) or w in seen_wings:
+            continue
+        seen_wings.add(w)
+        wings_pruned.append(
+            {
+                "wing": w,
+                "distance": round(float(d), 4),
+                "similarity": round(max(0.0, 1 - float(d)), 3),
+                "top_entities": meta.get("top_entities", ""),
+                "room_count": int(meta.get("room_count", 0) or 0),
+                "drawer_count": int(meta.get("drawer_count", 0) or 0),
+                "kept_lines": int(meta.get("kept_lines", 0) or 0),
+                "preview": (doc or "").split("\n", 3)[0][:200],
+            }
+        )
+        selected_wings.append(w)
+        if len(selected_wings) >= max(2, limit):
+            break
+
+    if max_depth == 0 or not selected_wings:
+        result = {
+            "query": clean_query,
+            "max_depth": max_depth,
+            "path": {"wings": wings_pruned, "rooms": []},
+            "fallback": False,
+        }
+        return _attach_sanitizer_info(result)
+
+    # ── room-level prune (within selected wings) ──────────────────────
+    try:
+        room_col = get_room_indices_collection(resolved, create=True)
+    except Exception as exc:
+        result = {
+            "query": clean_query,
+            "max_depth": max_depth,
+            "path": {"wings": wings_pruned, "rooms": []},
+            "fallback": True,
+            "fallback_reason": f"room index collection unavailable: {exc}",
+        }
+        return _attach_sanitizer_info(result)
+
+    where = (
+        {"wing": selected_wings[0]}
+        if len(selected_wings) == 1
+        else {"wing": {"$in": selected_wings}}
+    )
+    rooms_pruned: list = []
+    selected_rooms: list = []
+    try:
+        room_hits = room_col.query(
+            query_texts=[clean_query],
+            n_results=max(4, limit * 3),
+            where=where,
+            include=["documents", "metadatas", "distances"],
+        )
+        r_metas = _q_field(room_hits, "metadatas")
+        r_docs = _q_field(room_hits, "documents")
+        r_dists = _q_field(room_hits, "distances")
+        for meta, doc, d in zip(r_metas, r_docs, r_dists):
+            meta = meta or {}
+            wing_name = meta.get("wing")
+            room_name = meta.get("room")
+            if not isinstance(wing_name, str) or not isinstance(room_name, str):
+                continue
+            rooms_pruned.append(
+                {
+                    "wing": wing_name,
+                    "room": room_name,
+                    "distance": round(float(d), 4),
+                    "similarity": round(max(0.0, 1 - float(d)), 3),
+                    "drawer_count": int(meta.get("drawer_count", 0) or 0),
+                    "top_entities": meta.get("top_entities", ""),
+                    "preview": (doc or "").split("\n", 3)[0][:200],
+                }
+            )
+            selected_rooms.append(room_name)
+    except Exception as exc:
+        logger.warning("tool_search_hierarchical: room-index query failed: %s", exc)
+
+    # max_depth == 1 → stop here, return paths without a drawer sweep.
+    if max_depth == 1:
+        result = {
+            "query": clean_query,
+            "max_depth": max_depth,
+            "path": {"wings": wings_pruned, "rooms": rooms_pruned},
+            "fallback": False,
+        }
+        return _attach_sanitizer_info(result)
+
+    # ── leaf drawer query (scoped to selected wings/rooms) ────────────
+    room_filters = sorted(set(selected_rooms)) or None
+    drawer_limit = limit
+    if budget is not None and isinstance(budget, int) and budget > 0:
+        drawer_limit = max(1, min(drawer_limit, budget))
+
+    leaf = search_within(
+        clean_query,
+        palace_path=resolved,
+        wing_filters=selected_wings or None,
+        room_filters=room_filters,
+        n_results=drawer_limit,
+        max_distance=dist,
+    )
+
+    result = {
+        "query": clean_query,
+        "max_depth": max_depth,
+        "path": {"wings": wings_pruned, "rooms": rooms_pruned},
+        "results": leaf.get("results", []),
+        "total_before_filter": leaf.get("total_before_filter", 0),
+        "fallback": False,
+    }
+    if "error" in leaf:
+        result["error"] = leaf["error"]
+        result["fallback"] = True
+        result["fallback_reason"] = f"drawer-level search failed: {leaf['error']}"
+    return _attach_sanitizer_info(result)
 
 
 def tool_check_duplicate(content: str, threshold: float = 0.9):
@@ -1721,6 +1964,76 @@ TOOLS = {
             "required": ["query"],
         },
         "handler": tool_search,
+    },
+    "mempalace_search_hierarchical": {
+        "description": (
+            "Hierarchical retrieval: prune at wing and room levels using the "
+            "deterministic AAAK roll-up indices before scoring drawers. Cheap "
+            "on large palaces because most drawers are never visited. Returns "
+            "the wing→room→drawer path alongside drawer hits. Falls back to a "
+            "flat scoped search (marked `fallback: true`) when indices are "
+            "empty or a specific wing/room filter is supplied."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Short keyword query. Max 250 chars.",
+                    "maxLength": 250,
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max drawer results (default 5)",
+                    "minimum": 1,
+                    "maximum": 100,
+                },
+                "wing_filter": {
+                    "type": "string",
+                    "description": (
+                        "Force the search to a specific wing (skips wing-level "
+                        "pruning)."
+                    ),
+                },
+                "room_filter": {
+                    "type": "string",
+                    "description": "Force the search to a specific room.",
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "description": (
+                        "0 = wings only (wake-up cheap), 1 = wings + rooms, "
+                        "2 = full descent to drawers (default)."
+                    ),
+                    "minimum": 0,
+                    "maximum": 2,
+                },
+                "budget": {
+                    "type": "integer",
+                    "description": (
+                        "Optional hard cap on total drawer hits (trims `limit`)."
+                    ),
+                    "minimum": 1,
+                },
+                "max_distance": {
+                    "type": "number",
+                    "description": (
+                        "Max cosine distance for drawer hits "
+                        "(0=identical, 2=opposite; default 1.5)."
+                    ),
+                },
+                "min_similarity": {
+                    "type": "number",
+                    "description": "Alternate scale: min similarity 0-1.",
+                },
+                "palace": {
+                    "type": "string",
+                    "description": "Palace alias or path (optional).",
+                },
+            },
+            "required": ["query"],
+        },
+        "handler": tool_search_hierarchical,
     },
     "mempalace_check_duplicate": {
         "description": "Check if content already exists in the palace before filing",

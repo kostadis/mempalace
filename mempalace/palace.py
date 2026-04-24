@@ -10,6 +10,7 @@ import os
 import re
 
 from .backends.chroma import ChromaBackend
+from .config import check_palace_storage
 
 SKIP_DIRS = {
     ".git",
@@ -56,6 +57,11 @@ def get_collection(
     create: bool = True,
 ):
     """Get the palace collection through the backend layer."""
+    # One-shot warning if the palace path sits on a DrvFs / 9P / CIFS /
+    # NFS mount that breaks ChromaDB + SQLite mmap/flock/fsync semantics.
+    # No-op on native Linux filesystems (ext4/xfs/btrfs/tmpfs), which is the
+    # common case ($HOME on the WSL2 root VHD or a dedicated VHD at /mnt/data).
+    check_palace_storage(palace_path)
     return _DEFAULT_BACKEND.get_collection(
         palace_path,
         collection_name=collection_name,
@@ -66,6 +72,162 @@ def get_collection(
 def get_closets_collection(palace_path: str, create: bool = True):
     """Get the closets collection — the searchable index layer."""
     return get_collection(palace_path, collection_name="mempalace_closets", create=create)
+
+
+def get_room_indices_collection(palace_path: str, create: bool = True):
+    """Get the room-level index collection.
+
+    Holds one document per (wing, room) — a deterministic, rank-bucketed
+    projection of that room's leaf closets. Written by ``recursive_indexer``;
+    consumed by ``tool_search_hierarchical`` as the middle pruning layer.
+    """
+    return get_collection(palace_path, collection_name="mempalace_room_indices", create=create)
+
+
+def get_wing_indices_collection(palace_path: str, create: bool = True):
+    """Get the wing-level index collection.
+
+    Holds one document per wing — a union + top-N projection over that
+    wing's room indices. The outermost pruning layer for hierarchical
+    retrieval; a ``max_depth=0`` query can stop here without touching
+    room indices or leaf closets.
+    """
+    return get_collection(palace_path, collection_name="mempalace_wing_indices", create=create)
+
+
+# === Dirty-flag plumbing =====================================================
+#
+# Leaf drawers are mined constantly; room/wing indices should not be
+# rebuilt on every single drawer write — that would make mining O(n²)
+# across a palace. Instead, writers call ``mark_room_dirty`` /
+# ``mark_wing_dirty`` to record that some room / wing needs re-aggregation,
+# and ``recursive_indexer`` picks up the flags under ``mine_lock`` and
+# batches the work.
+#
+# State lives in ``<palace_path>/.dirty/rooms/`` and ``.dirty/wings/`` as
+# small JSON files keyed by a sha-16 of the wing|room identifier. One file
+# per dirty item, idempotent write, unlinked on clear. File-system based
+# so it survives process crashes and is cross-process safe.
+
+
+_DIRTY_DIRNAME = ".dirty"
+
+
+def _dirty_dir(palace_path: str, kind: str) -> str:
+    assert kind in ("rooms", "wings")
+    return os.path.join(palace_path, _DIRTY_DIRNAME, kind)
+
+
+def _dirty_key(wing: str, room: str = None) -> str:
+    raw = wing if room is None else f"{wing}|{room}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _write_dirty_file(dir_path: str, key: str, payload: dict) -> None:
+    os.makedirs(dir_path, exist_ok=True)
+    path = os.path.join(dir_path, f"{key}.json")
+    # Atomic write: temp + rename. Avoids torn reads if indexer glob()s
+    # mid-write on another thread.
+    import json
+    import tempfile
+
+    fd, tmp_path = tempfile.mkstemp(prefix=key + ".", suffix=".tmp", dir=dir_path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def mark_room_dirty(palace_path: str, wing: str, room: str) -> None:
+    """Record that ``(wing, room)``'s index is stale and must be rebuilt.
+
+    Idempotent. Safe to call under a write-heavy mining loop — writes are
+    atomic via tempfile + rename. Automatically marks the containing wing
+    dirty too, since any room-level change invalidates the wing roll-up.
+    """
+    _write_dirty_file(
+        _dirty_dir(palace_path, "rooms"),
+        _dirty_key(wing, room),
+        {"wing": wing, "room": room},
+    )
+    mark_wing_dirty(palace_path, wing)
+
+
+def mark_wing_dirty(palace_path: str, wing: str) -> None:
+    """Record that ``wing``'s index is stale and must be rebuilt. Idempotent."""
+    _write_dirty_file(
+        _dirty_dir(palace_path, "wings"),
+        _dirty_key(wing),
+        {"wing": wing},
+    )
+
+
+def _iter_dirty_entries(dir_path: str):
+    import json
+
+    if not os.path.isdir(dir_path):
+        return
+    try:
+        entries = os.listdir(dir_path)
+    except OSError:
+        return
+    for entry in sorted(entries):
+        if not entry.endswith(".json"):
+            continue
+        full = os.path.join(dir_path, entry)
+        try:
+            with open(full, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        yield (entry[:-5], payload, full)  # (key, payload, full_path)
+
+
+def iter_dirty_rooms(palace_path: str):
+    """Yield ``(wing, room, key)`` for every dirty room. Stable sort."""
+    for key, payload, _ in _iter_dirty_entries(_dirty_dir(palace_path, "rooms")):
+        wing = payload.get("wing")
+        room = payload.get("room")
+        if isinstance(wing, str) and isinstance(room, str):
+            yield (wing, room, key)
+
+
+def iter_dirty_wings(palace_path: str):
+    """Yield ``(wing, key)`` for every dirty wing. Stable sort."""
+    for key, payload, _ in _iter_dirty_entries(_dirty_dir(palace_path, "wings")):
+        wing = payload.get("wing")
+        if isinstance(wing, str):
+            yield (wing, key)
+
+
+def clear_room_dirty(palace_path: str, wing: str, room: str) -> bool:
+    """Remove the dirty flag for ``(wing, room)``. Returns True if one was removed."""
+    path = os.path.join(_dirty_dir(palace_path, "rooms"), f"{_dirty_key(wing, room)}.json")
+    try:
+        os.unlink(path)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
+def clear_wing_dirty(palace_path: str, wing: str) -> bool:
+    """Remove the dirty flag for ``wing``. Returns True if one was removed."""
+    path = os.path.join(_dirty_dir(palace_path, "wings"), f"{_dirty_key(wing)}.json")
+    try:
+        os.unlink(path)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
 
 
 CLOSET_CHAR_LIMIT = 1500  # fill closet until ~1500 chars, then start a new one
