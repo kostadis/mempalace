@@ -297,6 +297,192 @@ _STOP_WORDS = {
 }
 
 
+# === Rank-bucketed projection helpers (public API) ===
+#
+# Pure, deterministic, order-stable functions over AAAK pointer lines. Used
+# by ``recursive_indexer.py`` to aggregate leaf closets into room-level and
+# wing-level indices without invoking an LLM — the whole index path stays
+# drift-free and rebuildable from leaves.
+#
+# Format reminder (see ``palace.build_closet_lines``):
+#
+#     topic|entities|→drawer_id_a,drawer_id_b
+#
+# ``topic`` may itself contain a semicolon-free quoted fragment. ``entities``
+# is a ``;``-separated list (possibly empty). The arrow marker is the
+# single character ``→`` (U+2192); older exports used ``->`` as an ASCII
+# fallback, and we parse both.
+
+_CLOSET_ARROW_RE = re.compile(r"→|->")
+
+
+def parse_closet_line(line):
+    """Parse one AAAK pointer line into ``(topic, entities, drawer_ids)``.
+
+    Returns ``None`` for blank or malformed lines. Whitespace around each
+    field is stripped. ``entities`` is returned as a list (possibly empty).
+    ``drawer_ids`` is likewise a list. The topic is left as-is — it may
+    contain a quoted fragment verbatim.
+
+    Examples:
+
+        >>> parse_closet_line("jwt auth||→drawer_a,drawer_b")
+        ('jwt auth', [], ['drawer_a', 'drawer_b'])
+        >>> parse_closet_line('"the stone giants"|Grundar;Xalvosh|→d1')
+        ('"the stone giants"', ['Grundar', 'Xalvosh'], ['d1'])
+    """
+    if not isinstance(line, str):
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    # Split on the last arrow so a topic that happens to contain "->"
+    # inside a quoted fragment is preserved intact.
+    arrow_match = None
+    for m in _CLOSET_ARROW_RE.finditer(stripped):
+        arrow_match = m
+    if arrow_match is None:
+        return None
+    head = stripped[: arrow_match.start()].rstrip()
+    tail = stripped[arrow_match.end() :].strip()
+    if head.endswith("|"):
+        head = head[:-1]
+    parts = head.split("|")
+    if len(parts) < 2:
+        return None
+    # topic is everything up to the second-to-last field; entities is the last.
+    entities_field = parts[-1].strip()
+    topic = "|".join(parts[:-1]).strip()
+    if not topic:
+        return None
+    entities = [e.strip() for e in entities_field.split(";") if e.strip()]
+    drawer_ids = [d.strip() for d in tail.split(",") if d.strip()]
+    return (topic, entities, drawer_ids)
+
+
+def frequency_top_n(items, n=5, key=None, min_count=1):
+    """Return the top-``n`` most frequent elements of ``items``.
+
+    Ties are broken by first-seen order (deterministic on any iterable with
+    a stable traversal order). Elements whose count is below ``min_count``
+    are dropped before ranking.
+
+    Args:
+        items: iterable of hashable values (or anything projectable through ``key``).
+        n: maximum number of (element, count) pairs to return.
+        key: optional callable mapping each item to the bucket used for
+            counting. Falsy bucket values cause the item to be skipped —
+            useful for "filter and count in one pass".
+        min_count: drop buckets with fewer than this many occurrences.
+
+    Returns:
+        list of ``(bucket, count)`` tuples, ordered by count desc then
+        first-seen.
+    """
+    if n <= 0:
+        return []
+    counts = {}
+    order = {}
+    idx = 0
+    for item in items:
+        bucket = key(item) if key is not None else item
+        if not bucket and bucket != 0:  # skip None / empty string / empty list
+            continue
+        if bucket not in counts:
+            counts[bucket] = 0
+            order[bucket] = idx
+            idx += 1
+        counts[bucket] += 1
+    ranked = [(b, c) for b, c in counts.items() if c >= min_count]
+    ranked.sort(key=lambda bc: (-bc[1], order[bc[0]]))
+    return ranked[:n]
+
+
+def project_closet_lines(lines, n=50, dedupe_on="topic"):
+    """Aggregate AAAK pointer lines into a top-``n`` rank-bucketed projection.
+
+    ``dedupe_on`` controls the grouping key:
+      - ``"topic"``: dedupe by the parsed topic field. The first-seen line
+        with a given topic wins — downstream callers typically want the
+        raw line preserved for citation.
+      - ``"line"``: dedupe by the full line text (exact duplicates).
+
+    Malformed lines are skipped rather than raising — aggregation must be
+    robust against partial / future pointer variants.
+
+    Returns a list of ``(representative_line, count)`` tuples ordered by
+    frequency desc (ties broken by first-seen). Suitable for writing
+    straight into a room- or wing-level index document.
+    """
+    if dedupe_on not in ("topic", "line"):
+        raise ValueError(f"dedupe_on must be 'topic' or 'line', got {dedupe_on!r}")
+    if n <= 0:
+        return []
+
+    counts = {}
+    first_line = {}
+    order = {}
+    idx = 0
+    for line in lines:
+        if not isinstance(line, str):
+            continue
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if dedupe_on == "topic":
+            parsed = parse_closet_line(stripped)
+            if parsed is None:
+                continue
+            bucket = parsed[0]
+        else:
+            bucket = stripped
+        if bucket not in counts:
+            counts[bucket] = 0
+            first_line[bucket] = stripped
+            order[bucket] = idx
+            idx += 1
+        counts[bucket] += 1
+
+    ranked = sorted(counts.items(), key=lambda bc: (-bc[1], order[bc[0]]))
+    return [(first_line[b], c) for b, c in ranked[:n]]
+
+
+def aggregate_entity_sets(entity_fields, n=10):
+    """Across a stream of AAAK entity fields, pick the top-``n`` entities.
+
+    Each input is either a semicolon-joined string (e.g. ``"Grundar;Xalvosh"``)
+    or an already-split list of entity names. Empty strings and ``None``
+    are ignored. Counting is case-sensitive — callers that want case-fold
+    behavior should normalize upstream (the closet layer preserves
+    capitalization deliberately so proper nouns survive).
+
+    Returns a list of ``(entity, count)`` tuples ordered by frequency desc.
+    """
+    if n <= 0:
+        return []
+
+    def _iter_entities():
+        for field in entity_fields:
+            if field is None:
+                continue
+            if isinstance(field, str):
+                if not field.strip():
+                    continue
+                for part in field.split(";"):
+                    p = part.strip()
+                    if p:
+                        yield p
+            else:
+                try:
+                    for p in field:
+                        if isinstance(p, str) and p.strip():
+                            yield p.strip()
+                except TypeError:
+                    continue
+
+    return frequency_top_n(_iter_entities(), n=n)
+
+
 class Dialect:
     """
     AAAK Dialect encoder -- works on plain text or structured zettel data.
