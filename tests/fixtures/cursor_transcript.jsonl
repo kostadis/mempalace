@@ -1,0 +1,7 @@
+{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Monday, Apr 27, 2026, 4:18 PM (UTC-7)</timestamp>\n<user_query>\nfirst real question\n</user_query>"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"Let me check that for you."},{"type":"tool_use","name":"Shell","input":{"command":"ls"}}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"Done."}]}}
+{"role":"user","message":{"content":[{"type":"text","text":"<command-message>status</command-message>"}]}}
+{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Monday, Apr 27, 2026, 4:20 PM (UTC-7)</timestamp>\n<user_query>\nsecond real question\n</user_query>"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"Got it."}]}}
+{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Monday, Apr 27, 2026, 4:22 PM (UTC-7)</timestamp>\n<user_query>\nthird real question\n</user_query>"}]}}

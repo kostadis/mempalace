@@ -42,6 +42,84 @@ Make them executable:
 chmod +x hooks/mempal_save_hook.sh hooks/mempal_precompact_hook.sh
 ```
 
+## Install — Cursor
+
+Cursor has its own hook contract that's similar to but not identical to Claude Code's
+(see [Cursor hooks docs](https://cursor.com/docs/agent/hooks.md)). Three differences
+matter for MemPalace:
+
+- Cursor's `stop` hook can't return `{"decision":"block","reason":...}` — its only
+  output channel is `{"followup_message":"..."}`, which Cursor auto-submits as the
+  next user message. Loop prevention comes from `loop_count` + `loop_limit` in
+  `hooks.json` (we set `loop_limit: 1` in the template), not Claude Code's
+  `stop_hook_active` flag.
+- Cursor's `preCompact` is **observational**: the hook runs and saves, but cannot
+  block compaction. The MemPalace harness still does a synchronous mine + diary
+  write before returning, and surfaces a short `user_message` confirming the
+  checkpoint.
+- Cursor's stop payload uses `conversation_id` instead of `session_id`. The
+  `cursor` harness in `mempalace.hooks_cli` handles that mapping.
+
+Behavior on Cursor matches Claude Code in the silent (default) path: the hook
+calls `mempalace_diary_write` and `mempalace mine` directly without re-engaging
+the agent. When `hook_silent_save = false` is set in
+`~/.mempalace/config.json`, the hook returns a `followup_message` asking the
+agent to save via MCP tools.
+
+### Project install (recommended)
+
+Copy the template and the wrappers into the project's `.cursor/` directory:
+
+```bash
+mkdir -p .cursor/hooks
+cp hooks/cursor.hooks.json .cursor/hooks.json
+cp hooks/mempal_cursor_*.sh .cursor/hooks/
+chmod +x .cursor/hooks/mempal_cursor_*.sh
+```
+
+Project hooks run from the project root, so the relative paths in the JSON
+template (`.cursor/hooks/...`) resolve correctly. Commit `.cursor/hooks.json` so
+your team gets the same auto-save behavior; add the `mempal_cursor_*.sh` wrappers
+too if you want them version-controlled, or keep them local.
+
+### User install (global)
+
+Drop everything under `~/.cursor/`:
+
+```bash
+mkdir -p ~/.cursor/hooks
+cp hooks/mempal_cursor_*.sh ~/.cursor/hooks/
+chmod +x ~/.cursor/hooks/mempal_cursor_*.sh
+```
+
+Then create or edit `~/.cursor/hooks.json` (user hooks run from `~/.cursor/`,
+so use `./hooks/...` paths):
+
+```json
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [{ "command": "./hooks/mempal_cursor_session_start.sh", "timeout": 5 }],
+    "stop":         [{ "command": "./hooks/mempal_cursor_stop.sh", "timeout": 30, "loop_limit": 1 }],
+    "preCompact":   [{ "command": "./hooks/mempal_cursor_precompact.sh", "timeout": 60 }]
+  }
+}
+```
+
+Cursor watches `hooks.json` and reloads on save, but you may need to restart
+Cursor if a session was already running when you installed.
+
+### Alternative: Cursor's third-party hooks mode
+
+If you'd rather not maintain a Cursor-native config, Cursor can load Claude Code
+hook configs directly. Enable **Settings → Features → Third-party skills** and
+your existing `.claude/settings.json` will be picked up. Note that the Stop hook
+won't actually trigger saves on Cursor in this mode — Cursor's stop payload
+shape doesn't match Claude Code's, so the legacy `mempal_save_hook.sh` parser
+will read `session_id="unknown"` and `exchange_count=0`. Use this mode only as
+a smoke test for hook plumbing; install the native Cursor wrappers above for
+real use.
+
 ## Install — Codex CLI (OpenAI)
 
 Add to `.codex/hooks.json`:

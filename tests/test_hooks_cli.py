@@ -803,3 +803,208 @@ def test_stop_hook_rejects_injected_stop_hook_active(tmp_path):
     # The injected value is not "true"/"1"/"yes", so the hook should NOT pass through.
     # Save must have been attempted.
     assert mock_save.called
+
+
+# --- Cursor harness ---------------------------------------------------------
+#
+# Cursor's hook contract differs from Claude Code's in three ways that matter
+# for these tests:
+#   1. The stop payload uses ``conversation_id`` (not ``session_id``) and lacks
+#      ``stop_hook_active`` entirely. Loop prevention is handled by Cursor via
+#      ``loop_count`` + ``loop_limit`` in hooks.json, not a per-fire flag.
+#   2. The stop output schema only honors ``followup_message``: there is no
+#      ``decision:block`` and no ``systemMessage``. The cursor harness must
+#      collapse silent saves to ``{}`` and verbose saves to a followup_message.
+#   3. preCompact is observational on Cursor — the hook still runs the save
+#      synchronously, then returns ``{user_message: ...}`` to surface a brief
+#      "checkpointed" notice.
+
+CURSOR_FIXTURE = Path(__file__).parent / "fixtures" / "cursor_transcript.jsonl"
+
+
+def test_parse_harness_input_cursor_uses_conversation_id():
+    """Cursor stop payload uses conversation_id; we must read it as session_id."""
+    parsed = _parse_harness_input(
+        {"conversation_id": "abc-123", "transcript_path": "/tmp/x.jsonl"},
+        "cursor",
+    )
+    assert parsed["session_id"] == "abc-123"
+    assert parsed["transcript_path"] == "/tmp/x.jsonl"
+    # Cursor does not surface stop_hook_active; harness coerces to False.
+    assert parsed["stop_hook_active"] is False
+
+
+def test_parse_harness_input_cursor_falls_back_to_env(monkeypatch):
+    """When transcript_path is absent, fall back to CURSOR_TRANSCRIPT_PATH env."""
+    monkeypatch.setenv("CURSOR_TRANSCRIPT_PATH", "/tmp/from-env.jsonl")
+    parsed = _parse_harness_input({"conversation_id": "abc"}, "cursor")
+    assert parsed["transcript_path"] == "/tmp/from-env.jsonl"
+
+
+def test_parse_harness_input_cursor_ignores_stop_hook_active():
+    """Even if a payload smuggles stop_hook_active=True, cursor harness coerces False.
+
+    This is load-bearing: Cursor never sends stop_hook_active, so the only way
+    the field would ever be truthy is via a malformed/spoofed payload — which
+    must not short-circuit the save path on cursor.
+    """
+    parsed = _parse_harness_input({"conversation_id": "abc", "stop_hook_active": True}, "cursor")
+    assert parsed["stop_hook_active"] is False
+
+
+def test_parse_harness_input_cursor_falls_back_to_session_id():
+    """If neither conversation_id nor session_id is present, parser yields 'unknown'."""
+    parsed = _parse_harness_input({}, "cursor")
+    assert parsed["session_id"] == "unknown"
+
+
+def test_count_human_messages_cursor_format():
+    """Cursor's transcript shape is the same role+content envelope mempalace
+    already keys off, so the existing reader counts it correctly. Lock the
+    contract with a fixture so a future refactor can't silently break it."""
+    assert CURSOR_FIXTURE.is_file(), "Cursor transcript fixture missing"
+    # 3 real user messages + 1 <command-message> that must be filtered out.
+    assert _count_human_messages(str(CURSOR_FIXTURE)) == 3
+
+
+def test_extract_recent_messages_cursor_format():
+    """Cursor user messages should round-trip as text strings, no tool_use blocks."""
+    msgs = _extract_recent_messages(str(CURSOR_FIXTURE), count=10)
+    # All 3 real user messages, none of the assistant or command-message lines.
+    assert len(msgs) == 3
+    joined = "\n".join(msgs)
+    assert "first real question" in joined
+    assert "second real question" in joined
+    assert "third real question" in joined
+    # Spot-check ordering: last message comes last
+    assert "third real question" in msgs[-1]
+    # No tool_use / no command-message bleed-through
+    assert all("tool_use" not in m for m in msgs)
+    assert all("<command-message>" not in m for m in msgs)
+
+
+def test_wing_from_transcript_path_cursor_layout():
+    """Cursor's path: ~/.cursor/projects/<encoded>/agent-transcripts/<uuid>/<uuid>.jsonl"""
+    path = "/Users/jp/.cursor/projects/Users-jp-src-mempalace/agent-transcripts/abc/abc.jsonl"
+    assert _wing_from_transcript_path(path) == "wing_mempalace"
+
+
+def test_wing_from_transcript_path_cursor_layout_windows():
+    """Same path with backslashes — _wing_from_transcript_path normalizes them."""
+    path = "C:\\Users\\jp\\.cursor\\projects\\Users-jp-src-myapp\\agent-transcripts\\abc\\abc.jsonl"
+    assert _wing_from_transcript_path(path) == "wing_myapp"
+
+
+def test_hook_stop_cursor_silent_outputs_empty_json(tmp_path):
+    """Silent path on cursor returns {} (no systemMessage, no followup_message)."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    save_result = {"count": 15, "themes": ["hooks"]}
+    with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result):
+        result = _capture_hook_output(
+            hook_stop,
+            {"conversation_id": "test-cur", "transcript_path": str(transcript)},
+            harness="cursor",
+            state_dir=tmp_path,
+        )
+    assert result == {}, "Cursor silent save must not emit systemMessage"
+
+
+def test_hook_stop_cursor_verbose_uses_followup_message(tmp_path):
+    """Verbose mode on cursor returns followup_message, not decision:block."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    # Build the patch stack directly because the shared helper hard-codes silent=True.
+    from unittest.mock import PropertyMock
+
+    buf = io.StringIO()
+    mock_config = MagicMock()
+    type(mock_config).hook_silent_save = PropertyMock(return_value=False)
+    type(mock_config).hook_desktop_toast = PropertyMock(return_value=False)
+    with (
+        patch("mempalace.hooks_cli._output", side_effect=lambda d: buf.write(json.dumps(d))),
+        patch("mempalace.hooks_cli.STATE_DIR", tmp_path),
+        patch("mempalace.config.MempalaceConfig", return_value=mock_config),
+        patch("mempalace.hooks_cli._ingest_transcript"),
+        patch("mempalace.hooks_cli._maybe_auto_ingest"),
+    ):
+        hook_stop(
+            {"conversation_id": "test-cur", "transcript_path": str(transcript)},
+            "cursor",
+        )
+    out = json.loads(buf.getvalue())
+    assert "followup_message" in out, f"expected followup_message in {out}"
+    assert "decision" not in out, "Cursor must not emit decision:block"
+    assert "MemPalace" in out["followup_message"] or "save" in out["followup_message"].lower()
+
+
+def test_hook_stop_cursor_no_short_circuit_on_truthy_stop_hook_active(tmp_path):
+    """A spoofed stop_hook_active=True must not bypass the save on cursor.
+
+    On claude-code, stop_hook_active=True is the legitimate "we're already in a
+    save cycle" signal. On cursor, that field is never set by the harness, so
+    the parser coerces it to False; if a malformed payload smuggles it in, the
+    hook must still run the count + save logic.
+    """
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    save_result = {"count": 15, "themes": []}
+    with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result) as mock_save:
+        _capture_hook_output(
+            hook_stop,
+            {
+                "conversation_id": "test-cur",
+                "stop_hook_active": True,
+                "transcript_path": str(transcript),
+            },
+            harness="cursor",
+            state_dir=tmp_path,
+        )
+    assert mock_save.called, "Save must run even when stop_hook_active is spoofed truthy"
+
+
+def test_hook_precompact_cursor_emits_user_message(tmp_path):
+    """Cursor preCompact returns {user_message:...} as a UI confirmation."""
+    result = _capture_hook_output(
+        hook_precompact,
+        {"conversation_id": "test-cur"},
+        harness="cursor",
+        state_dir=tmp_path,
+    )
+    assert result == {"user_message": "MemPalace checkpointed before compaction"}
+
+
+def test_hook_precompact_cursor_calls_mine_sync(tmp_path):
+    """Cursor preCompact still runs the synchronous mine before returning."""
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
+        with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
+            result = _capture_hook_output(
+                hook_precompact,
+                {"conversation_id": "test-cur"},
+                harness="cursor",
+                state_dir=tmp_path,
+            )
+    assert result == {"user_message": "MemPalace checkpointed before compaction"}
+    mock_run.assert_called_once()
+
+
+def test_hook_session_start_accepts_cursor_harness(tmp_path):
+    """sessionStart is currently a no-op pass-through; just confirm cursor is allowed."""
+    result = _capture_hook_output(
+        hook_session_start,
+        {"conversation_id": "test-cur"},
+        harness="cursor",
+        state_dir=tmp_path,
+    )
+    assert result == {}

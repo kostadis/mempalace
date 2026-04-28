@@ -90,10 +90,19 @@ mempalace/
 ├── split_mega_files.py  # Split concatenated transcript files
 └── version.py           # Single source of truth for version
 
-hooks/                   # Claude Code hook scripts
-├── mempal_save_hook.sh        # Stop: triggers diary save
-└── mempal_precompact_hook.sh  # PreCompact: saves state before compression
+hooks/                   # Hook scripts (Claude Code, Codex, Cursor)
+├── mempal_save_hook.sh             # Claude Code Stop: triggers diary save
+├── mempal_precompact_hook.sh       # Claude Code PreCompact: pre-compact save
+├── mempal_cursor_stop.sh           # Cursor stop: thin wrapper, harness=cursor
+├── mempal_cursor_precompact.sh     # Cursor preCompact: thin wrapper
+├── mempal_cursor_session_start.sh  # Cursor sessionStart: thin wrapper
+└── cursor.hooks.json               # Drop-in template for .cursor/hooks.json
 ```
+
+Hooks default to silent saves (no chat tokens, no AI re-prompt) on every
+supported harness. Cursor's `stop` payload uses `conversation_id` and lacks
+`stop_hook_active`; the `cursor` harness in `mempalace.hooks_cli` handles the
+mapping. See `hooks/README.md` for install instructions.
 
 ## Conventions
 

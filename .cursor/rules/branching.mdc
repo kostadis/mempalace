@@ -1,0 +1,43 @@
+---
+description: Branching policy for the mempalace repo — kostadis-dev only
+alwaysApply: true
+---
+
+# mempalace branching policy
+
+All changes in this repository — both local commits and any pushes to GitHub —
+land on the `kostadis-dev` branch. Nothing else.
+
+## Rules
+
+- **Commit only on `kostadis-dev`.** Before creating a commit, verify
+  `git rev-parse --abbrev-ref HEAD` is `kostadis-dev`. If it isn't, switch back
+  with `git switch kostadis-dev` rather than committing on the wrong branch.
+- **Push only `kostadis-dev` to GitHub.** Never push to `main` / `master` /
+  any release branch from this repo.
+- **Do not create new branches** for features, hotfixes, or experiments
+  unless the user explicitly requests one. Stack the work directly on
+  `kostadis-dev`.
+- **Do not open PRs** against `main` (or any other base) without explicit
+  instruction. If the user asks for a PR, default the base to `kostadis-dev`
+  and confirm before running `gh pr create`.
+- **Never force-push `main` / `master`.** Force-push is allowed on
+  `kostadis-dev` only when the user explicitly asks for it.
+
+## When `git status` shows you on the wrong branch
+
+```bash
+# ❌ BAD — committing on a feature branch
+git checkout -b cursor-harness
+git add .
+git commit -m "..."
+
+# ✅ GOOD — commit directly on kostadis-dev
+git switch kostadis-dev
+git add .
+git commit -m "..."
+```
+
+If you discover you've already committed to the wrong branch, ask the user
+how to proceed (cherry-pick, reset, etc.) rather than rewriting history
+unprompted.
