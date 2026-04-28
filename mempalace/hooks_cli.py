@@ -3,7 +3,7 @@ Hook logic for MemPalace — Python implementation of session-start, stop, and p
 
 Reads JSON from stdin, outputs JSON to stdout.
 Supported hooks: session-start, stop, precompact
-Supported harnesses: claude-code, codex (extensible to cursor, gemini, etc.)
+Supported harnesses: claude-code, codex, cursor
 """
 
 import json
@@ -95,7 +95,18 @@ def _validate_transcript_path(transcript_path: str) -> Path:
 
 
 def _count_human_messages(transcript_path: str) -> int:
-    """Count human messages in a JSONL transcript, skipping command-messages."""
+    """Count human messages in a JSONL transcript, skipping command-messages.
+
+    Recognizes three transcript shapes:
+
+    - Claude Code: ``{"message": {"role": "user", "content": "..."}}`` — the role
+      lives inside the ``message`` object.
+    - Cursor: ``{"role": "user", "message": {"content": [{"type": "text", ...}]}}``
+      — the role is at the top level. Detected when an entry has both a
+      top-level ``role`` and a ``message`` dict that does *not* itself contain a
+      ``role`` key (so we don't double-count Claude Code lines).
+    - Codex CLI: ``{"type": "event_msg", "payload": {"type": "user_message", ...}}``.
+    """
     path = _validate_transcript_path(transcript_path)
     if path is None:
         if transcript_path:
@@ -110,7 +121,19 @@ def _count_human_messages(transcript_path: str) -> int:
                 try:
                     entry = json.loads(line)
                     msg = entry.get("message", {})
-                    if isinstance(msg, dict) and msg.get("role") == "user":
+                    # Cursor: role at top-level, content list inside message.
+                    if isinstance(msg, dict) and "role" not in msg and entry.get("role") == "user":
+                        content = msg.get("content", "")
+                        if isinstance(content, list):
+                            text = " ".join(
+                                b.get("text", "") for b in content if isinstance(b, dict)
+                            )
+                            if "<command-message>" in text:
+                                continue
+                        elif isinstance(content, str) and "<command-message>" in content:
+                            continue
+                        count += 1
+                    elif isinstance(msg, dict) and msg.get("role") == "user":
                         content = msg.get("content", "")
                         if isinstance(content, str):
                             if "<command-message>" in content:
@@ -337,7 +360,12 @@ def _desktop_toast(body: str, title: str = "MemPalace"):
 
 
 def _extract_recent_messages(transcript_path: str, count: int = _RECENT_MSG_COUNT) -> list[str]:
-    """Extract the last N user messages from a JSONL transcript."""
+    """Extract the last N user messages from a JSONL transcript.
+
+    Handles the same three transcript shapes as :func:`_count_human_messages`:
+    Claude Code (role inside ``message``), Cursor (role at top-level), and
+    Codex CLI (``event_msg`` payloads).
+    """
     path = Path(transcript_path).expanduser()
     if not path.is_file():
         return []
@@ -347,9 +375,20 @@ def _extract_recent_messages(transcript_path: str, count: int = _RECENT_MSG_COUN
             for line in f:
                 try:
                     entry = json.loads(line)
-                    # Claude Code format
                     msg = entry.get("message") or entry.get("event_message") or {}
-                    if isinstance(msg, dict) and msg.get("role") == "user":
+                    # Cursor: role at top-level, content list inside message.
+                    if isinstance(msg, dict) and "role" not in msg and entry.get("role") == "user":
+                        content = msg.get("content", "")
+                        if isinstance(content, list):
+                            content = " ".join(
+                                b.get("text", "") for b in content if isinstance(b, dict)
+                            )
+                        if not isinstance(content, str) or not content.strip():
+                            continue
+                        if "<command-message>" in content or "<system-reminder>" in content:
+                            continue
+                        messages.append(content.strip()[:200])
+                    elif isinstance(msg, dict) and msg.get("role") == "user":
                         content = msg.get("content", "")
                         if isinstance(content, list):
                             content = " ".join(
@@ -500,14 +539,32 @@ def _ingest_transcript(transcript_path: str):
         pass
 
 
-SUPPORTED_HARNESSES = {"claude-code", "codex"}
+SUPPORTED_HARNESSES = {"claude-code", "codex", "cursor"}
 
 
 def _parse_harness_input(data: dict, harness: str) -> dict:
-    """Parse stdin JSON according to the harness type."""
+    """Parse stdin JSON according to the harness type.
+
+    Cursor's stop hook payload uses ``conversation_id`` (not ``session_id``)
+    and lacks ``stop_hook_active`` entirely — Cursor handles loop prevention
+    via ``loop_count`` + the ``loop_limit`` configured in ``hooks.json``.
+    The ``transcript_path`` field exists in Cursor's common envelope, but
+    we also fall back to ``CURSOR_TRANSCRIPT_PATH`` since Cursor exposes
+    the same path as an environment variable to every hook execution.
+    """
     if harness not in SUPPORTED_HARNESSES:
         print(f"Unknown harness: {harness}", file=sys.stderr)
         sys.exit(1)
+    if harness == "cursor":
+        raw_session_id = data.get("conversation_id", data.get("session_id", "unknown"))
+        transcript_path = str(
+            data.get("transcript_path") or os.environ.get("CURSOR_TRANSCRIPT_PATH", "")
+        )
+        return {
+            "session_id": _sanitize_session_id(str(raw_session_id)),
+            "stop_hook_active": False,
+            "transcript_path": transcript_path,
+        }
     return {
         "session_id": _sanitize_session_id(str(data.get("session_id", "unknown"))),
         "stop_hook_active": data.get("stop_hook_active", False),
@@ -516,7 +573,7 @@ def _parse_harness_input(data: dict, harness: str) -> dict:
 
 
 def _wing_from_transcript_path(transcript_path: str) -> str:
-    """Derive a project wing name from a Claude Code transcript path.
+    """Derive a project wing name from a transcript path.
 
     Claude Code encodes the project's source directory by replacing path
     separators with dashes, producing folders like:
@@ -524,15 +581,20 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
         ~/.claude/projects/-home-<user>-dev-<parent>-<project>/session.jsonl
         ~/.claude/projects/-Users-<user>-<folder>-<project>/session.jsonl
 
+    Cursor stores transcripts at:
+        ~/.cursor/projects/<encoded-project-path>/agent-transcripts/<uuid>/<uuid>.jsonl
+    where <encoded-project-path> is the absolute project path with
+    slashes replaced by dashes (e.g. ``Users-kostadis-roussos-src``).
+
     The project directory name is the final dash-separated token of the
     encoded folder. Returns ``wing_<project>`` (lowercased, spaces → ``_``).
-    Falls back to ``wing_sessions`` if the path does not match a Claude Code
+    Falls back to ``wing_sessions`` if the path does not match a known
     project-folder layout.
     """
     # Normalize path separators for cross-platform (Windows backslashes)
     normalized = transcript_path.replace("\\", "/")
-    # Primary: pull the encoded project folder out of ``.claude/projects/``
-    # and take its last dash-separated token.
+    # Primary Claude Code: pull the encoded project folder out of
+    # ``.claude/projects/`` and take its last dash-separated token.
     match = re.search(r"/\.claude/projects/-([^/]+)", normalized)
     if match:
         encoded = match.group(1)
@@ -545,6 +607,15 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
     if match:
         project = match.group(1).lower().replace(" ", "_")
         return f"wing_{project}"
+    # Cursor: ~/.cursor/projects/<encoded-project-path>/agent-transcripts/...
+    cursor_match = re.search(r"/\.cursor/projects/([^/]+)/agent-transcripts/", normalized)
+    if cursor_match:
+        encoded = cursor_match.group(1)
+        # The encoded path is dash-separated; the trailing segment is the
+        # actual project directory. Use it as the wing name.
+        project = encoded.rsplit("-", 1)[-1].lower().replace(" ", "_")
+        if project:
+            return f"wing_{project}"
     return "wing_sessions"
 
 
@@ -633,17 +704,28 @@ def hook_stop(data: dict, harness: str):
                     tag = " \u2014 " + ", ".join(themes)
                 else:
                     tag = ""
-                _output(
-                    {
-                        "systemMessage": f"\u2726 {count} memories woven into the palace{tag}",
-                    }
-                )
+                # Cursor's stop hook output schema only honors "followup_message"
+                # — it has no "systemMessage" channel. Silent saves stay silent
+                # on Cursor (return empty JSON); other harnesses keep the
+                # existing terminal notification behavior.
+                if harness == "cursor":
+                    _output({})
+                else:
+                    _output(
+                        {
+                            "systemMessage": f"\u2726 {count} memories woven into the palace{tag}",
+                        }
+                    )
             else:
                 _output({})
         else:
-            # Legacy: block and ask Claude to save via MCP tools.
-            # Marker advances before confirmed save — best-effort; if Claude
-            # fails to save, the checkpoint is lost but won't retry endlessly.
+            # Legacy verbose mode: ask the agent to save via MCP tools.
+            # Marker advances before confirmed save — best-effort; if the
+            # agent fails to save, the checkpoint is lost but won't retry
+            # endlessly. On Claude Code we use {decision:block, reason:...};
+            # Cursor's stop schema only supports {followup_message:...}, which
+            # auto-submits the message as the next user prompt. Loop safety
+            # comes from the Cursor hook config's loop_limit (recommended: 1).
             try:
                 last_save_file.write_text(str(exchange_count), encoding="utf-8")
             except OSError:
@@ -652,7 +734,10 @@ def hook_stop(data: dict, harness: str):
                 _ingest_transcript(transcript_path)
             _maybe_auto_ingest()
             reason = STOP_BLOCK_REASON + f" Write diary entry to wing={project_wing}."
-            _output({"decision": "block", "reason": reason})
+            if harness == "cursor":
+                _output({"followup_message": reason})
+            else:
+                _output({"decision": "block", "reason": reason})
     else:
         _output({})
 
@@ -672,7 +757,13 @@ def hook_session_start(data: dict, harness: str):
 
 
 def hook_precompact(data: dict, harness: str):
-    """Precompact hook: mine transcript synchronously, then allow compaction."""
+    """Precompact hook: mine transcript synchronously, then allow compaction.
+
+    On Cursor, ``preCompact`` is observational — the hook cannot block
+    compaction the way Claude Code's PreCompact can. The save still runs
+    synchronously here so memories land before context shrinks; we also
+    surface a short ``user_message`` so the UI confirms the checkpoint.
+    """
     parsed = _parse_harness_input(data, harness)
     session_id = parsed["session_id"]
     transcript_path = parsed["transcript_path"]
@@ -688,7 +779,10 @@ def hook_precompact(data: dict, harness: str):
     # above via _ingest_transcript.
     _mine_sync()
 
-    _output({})
+    if harness == "cursor":
+        _output({"user_message": "MemPalace checkpointed before compaction"})
+    else:
+        _output({})
 
 
 def run_hook(hook_name: str, harness: str):

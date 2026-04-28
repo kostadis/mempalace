@@ -117,6 +117,27 @@ def test_cmd_hook_calls_run_hook():
         mock_run.assert_called_once_with(hook_name="session-start", harness="claude-code")
 
 
+def test_cmd_hook_accepts_cursor_harness():
+    """`mempalace hook run --hook stop --harness cursor` must be a valid CLI invocation."""
+    args = argparse.Namespace(hook="stop", harness="cursor")
+    with patch("mempalace.hooks_cli.run_hook") as mock_run:
+        cmd_hook(args)
+        mock_run.assert_called_once_with(hook_name="stop", harness="cursor")
+
+
+def test_main_hook_run_accepts_cursor():
+    """argparse choices for --harness must include 'cursor'."""
+    with (
+        patch(
+            "sys.argv",
+            ["mempalace", "hook", "run", "--hook", "stop", "--harness", "cursor"],
+        ),
+        patch("mempalace.cli.cmd_hook") as mock_cmd,
+    ):
+        main()
+        mock_cmd.assert_called_once()
+
+
 # ── cmd_init ───────────────────────────────────────────────────────────
 
 
