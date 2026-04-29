@@ -10,13 +10,16 @@ import pytest
 
 from mempalace.hooks_cli import (
     SAVE_INTERVAL,
+    _chat_palace_path,
     _count_human_messages,
     _extract_recent_messages,
     _get_mine_dir,
+    _ingest_transcript,
     _log,
     _maybe_auto_ingest,
     _mempalace_python,
     _mine_already_running,
+    _mine_sync,
     _parse_harness_input,
     _sanitize_session_id,
     _validate_transcript_path,
@@ -460,6 +463,139 @@ def test_maybe_auto_ingest_skips_when_mine_running(tmp_path):
                 with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
                     _maybe_auto_ingest()
                     mock_popen.assert_not_called()
+
+
+# --- isolation invariant: hook writes are chat-palace-only ---
+#
+# Regression coverage for design-doc invariant #1
+# (docs/design/palace-isolation.md). These tests lock in that hook-fired
+# `mempalace mine` invocations always carry an explicit `--palace`
+# pointing at the chat palace, so that the standard precedence chain
+# (walk-up mempalace.yaml, default_palace, MEMPALACE_PALACE_PATH) cannot
+# cause uncurated transcripts to bleed into a curated palace. Without
+# this the Cursor harness silently regresses into using whatever palace
+# the precedence chain happens to resolve to.
+
+
+def test_chat_palace_path_default():
+    """Defaults to ~/.mempalace/palaces/chat when no override is set."""
+    with patch.dict("os.environ", {}, clear=False) as _:
+        os.environ.pop("MEMPAL_CHAT_PALACE", None)
+        assert _chat_palace_path() == str(Path.home() / ".mempalace" / "palaces" / "chat")
+
+
+def test_chat_palace_path_honors_override():
+    """MEMPAL_CHAT_PALACE env var overrides the default (matches legacy bash hooks)."""
+    with patch.dict("os.environ", {"MEMPAL_CHAT_PALACE": "/custom/chat"}):
+        assert _chat_palace_path() == "/custom/chat"
+
+
+def test_chat_palace_path_ignores_generic_palace_env():
+    """The generic MEMPALACE_PALACE_PATH must NOT influence hook palace resolution.
+
+    That env var is the top of the standard CLI precedence chain
+    (config.py:resolved_palace_path). Honoring it here would let a user
+    who set ``MEMPALACE_PALACE_PATH=~/.mempalace/palaces/curated`` for
+    convenience accidentally redirect hook-fired mines into the curated
+    palace, which is exactly what invariant #1 forbids.
+    """
+    env = {"MEMPALACE_PALACE_PATH": "/should/be/ignored"}
+    env.pop("MEMPAL_CHAT_PALACE", None)
+    with patch.dict("os.environ", env, clear=False):
+        os.environ.pop("MEMPAL_CHAT_PALACE", None)
+        assert _chat_palace_path() == str(Path.home() / ".mempalace" / "palaces" / "chat")
+
+
+def _palace_arg(cmd):
+    return cmd[cmd.index("--palace") + 1]
+
+
+def test_maybe_auto_ingest_pins_chat_palace_default(tmp_path):
+    """Spawned mine cmdline always includes --palace pointing at the chat palace."""
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    env = {"MEMPAL_DIR": str(mempal_dir)}
+    with patch.dict("os.environ", env, clear=False):
+        os.environ.pop("MEMPAL_CHAT_PALACE", None)
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._MINE_PID_FILE", tmp_path / "mine.pid"):
+                with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                    _maybe_auto_ingest()
+                    cmd = mock_popen.call_args.args[0]
+    assert "--palace" in cmd
+    assert _palace_arg(cmd) == str(Path.home() / ".mempalace" / "palaces" / "chat")
+
+
+def test_maybe_auto_ingest_honors_chat_palace_override(tmp_path):
+    """MEMPAL_CHAT_PALACE relocates the chat palace exactly as legacy hooks do."""
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    custom = str(tmp_path / "elsewhere_chat")
+    env = {"MEMPAL_DIR": str(mempal_dir), "MEMPAL_CHAT_PALACE": custom}
+    with patch.dict("os.environ", env):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._MINE_PID_FILE", tmp_path / "mine.pid"):
+                with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                    _maybe_auto_ingest()
+                    cmd = mock_popen.call_args.args[0]
+    assert _palace_arg(cmd) == custom
+
+
+def test_maybe_auto_ingest_ignores_generic_palace_env(tmp_path):
+    """MEMPALACE_PALACE_PATH does not redirect hook-fired mines (invariant #1)."""
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    env = {
+        "MEMPAL_DIR": str(mempal_dir),
+        "MEMPALACE_PALACE_PATH": str(tmp_path / "curated"),
+    }
+    with patch.dict("os.environ", env, clear=False):
+        os.environ.pop("MEMPAL_CHAT_PALACE", None)
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._MINE_PID_FILE", tmp_path / "mine.pid"):
+                with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                    _maybe_auto_ingest()
+                    cmd = mock_popen.call_args.args[0]
+    assert _palace_arg(cmd) == str(Path.home() / ".mempalace" / "palaces" / "chat")
+    assert _palace_arg(cmd) != str(tmp_path / "curated")
+
+
+def test_mine_sync_pins_chat_palace(tmp_path):
+    """The synchronous precompact path enforces the same isolation."""
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    env = {"MEMPAL_DIR": str(mempal_dir)}
+    with patch.dict("os.environ", env, clear=False):
+        os.environ.pop("MEMPAL_CHAT_PALACE", None)
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
+                _mine_sync()
+                cmd = mock_run.call_args.args[0]
+    assert "--palace" in cmd
+    assert _palace_arg(cmd) == str(Path.home() / ".mempalace" / "palaces" / "chat")
+
+
+def test_ingest_transcript_pins_chat_palace(tmp_path):
+    """The transcript-ingest path (called from every Stop/PreCompact flow) is pinned too.
+
+    This is the highest-volume hook-driven mine: every Stop event mines
+    the active session JSONL into the palace. If it didn't carry
+    --palace, every conversation would land wherever walk-up resolved to
+    relative to the JSONL's parent dir, which for Cursor is under
+    ~/.cursor/conversations and for Claude Code under ~/.claude/projects.
+    """
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("x" * 200)  # _ingest_transcript skips files < 100 bytes
+    env = {}
+    with patch.dict("os.environ", env, clear=False):
+        os.environ.pop("MEMPAL_CHAT_PALACE", None)
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                _ingest_transcript(str(transcript))
+                cmd = mock_popen.call_args.args[0]
+    assert "--palace" in cmd
+    assert _palace_arg(cmd) == str(Path.home() / ".mempalace" / "palaces" / "chat")
+    assert "convos" in cmd and "sessions" in cmd
 
 
 # --- _mine_already_running ---
