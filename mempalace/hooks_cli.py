@@ -293,6 +293,23 @@ def _spawn_mine(cmd: list) -> None:
     _MINE_PID_FILE.write_text(str(proc.pid))
 
 
+def _chat_palace_path() -> str:
+    """Resolve the chat palace path used by hook-driven writes.
+
+    Mirrors the legacy bash hooks (``mempal_save_hook.sh``,
+    ``mempal_precompact_hook.sh``): honor ``MEMPAL_CHAT_PALACE`` if the
+    user has relocated their chat palace, otherwise fall back to the
+    canonical ``~/.mempalace/palaces/chat``. Hardcoding this here rather
+    than relying on the standard precedence chain is the implementation
+    of design-doc invariant #1: hook writes are chat-palace-only and
+    must never touch a curated palace via walk-up of ``mempalace.yaml``
+    or via ``default_palace`` in ``config.json``.
+    """
+    return os.environ.get("MEMPAL_CHAT_PALACE") or str(
+        Path.home() / ".mempalace" / "palaces" / "chat"
+    )
+
+
 def _maybe_auto_ingest():
     """Background-mine MEMPAL_DIR (project files) if set.
 
@@ -309,7 +326,19 @@ def _maybe_auto_ingest():
         return
     for mine_dir, mode in targets:
         try:
-            _spawn_mine([_mempalace_python(), "-m", "mempalace", "mine", mine_dir, "--mode", mode])
+            _spawn_mine(
+                [
+                    _mempalace_python(),
+                    "-m",
+                    "mempalace",
+                    "--palace",
+                    _chat_palace_path(),
+                    "mine",
+                    mine_dir,
+                    "--mode",
+                    mode,
+                ]
+            )
         except OSError:
             pass
 
@@ -334,6 +363,8 @@ def _mine_sync():
                         _mempalace_python(),
                         "-m",
                         "mempalace",
+                        "--palace",
+                        _chat_palace_path(),
                         "mine",
                         mine_dir,
                         "--mode",
@@ -524,6 +555,8 @@ def _ingest_transcript(transcript_path: str):
                     _mempalace_python(),
                     "-m",
                     "mempalace",
+                    "--palace",
+                    _chat_palace_path(),
                     "mine",
                     str(path.parent),
                     "--mode",
