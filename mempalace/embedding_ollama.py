@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -37,7 +38,34 @@ class OllamaEmbeddingError(RuntimeError):
     a misconfigured endpoint does not silently produce empty vectors."""
 
 
-def _post_json(url: str, body: dict, timeout: int) -> dict:
+# ── HTTP transport ────────────────────────────────────────────────────────
+#
+# See ``mempalace.embedding_openai`` for the rationale on the dual transport
+# (urllib3.PoolManager keep-alive default, urlopen behind a temporary env
+# shim for test compatibility). Same shape, separate pool so callers can
+# patch one without touching the other.
+
+_HTTP_POOL = None  # urllib3.PoolManager — lazy-init, module-cached
+
+
+def _get_http_pool():
+    global _HTTP_POOL
+    if _HTTP_POOL is None:
+        import urllib3
+
+        try:
+            workers = max(1, int(os.environ.get("MEMPALACE_WORKERS", "8")))
+        except ValueError:
+            workers = 8
+        _HTTP_POOL = urllib3.PoolManager(
+            num_pools=4,
+            maxsize=max(32, workers * 2),
+            block=False,
+        )
+    return _HTTP_POOL
+
+
+def _post_json_via_urlopen(url: str, body: dict, timeout: int) -> dict:
     req = Request(
         url,
         data=json.dumps(body).encode("utf-8"),
@@ -57,6 +85,53 @@ def _post_json(url: str, body: dict, timeout: int) -> dict:
         raise OllamaEmbeddingError(f"Cannot reach {url}: {e}") from e
     except json.JSONDecodeError as e:
         raise OllamaEmbeddingError(f"Malformed response from {url}: {e}") from e
+
+
+def _post_json_via_pool(url: str, body: dict, timeout: int) -> dict:
+    import urllib3
+
+    pool = _get_http_pool()
+    encoded = json.dumps(body).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    try:
+        resp = pool.request(
+            "POST",
+            url,
+            body=encoded,
+            headers=headers,
+            timeout=timeout,
+            retries=False,
+        )
+    except urllib3.exceptions.MaxRetryError as e:
+        raise OllamaEmbeddingError(f"Cannot reach {url}: {e}") from e
+    except urllib3.exceptions.TimeoutError as e:
+        raise OllamaEmbeddingError(f"Timeout reaching {url}: {e}") from e
+    except urllib3.exceptions.HTTPError as e:
+        raise OllamaEmbeddingError(f"Cannot reach {url}: {e}") from e
+    except OSError as e:
+        raise OllamaEmbeddingError(f"Cannot reach {url}: {e}") from e
+
+    if resp.status >= 400:
+        detail = ""
+        try:
+            detail = resp.data.decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        raise OllamaEmbeddingError(
+            f"HTTP {resp.status} from {url}: {detail or resp.reason or 'no detail'}"
+        )
+
+    try:
+        return json.loads(resp.data)
+    except json.JSONDecodeError as e:
+        raise OllamaEmbeddingError(f"Malformed response from {url}: {e}") from e
+
+
+def _post_json(url: str, body: dict, timeout: int) -> dict:
+    """Dispatch keep-alive pool (default) or urlopen (MEMPALACE_HTTP_KEEPALIVE=0)."""
+    if os.environ.get("MEMPALACE_HTTP_KEEPALIVE", "1") == "0":
+        return _post_json_via_urlopen(url, body, timeout)
+    return _post_json_via_pool(url, body, timeout)
 
 
 def _build_base_class():

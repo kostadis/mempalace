@@ -12,11 +12,13 @@ import sys
 import shlex
 import hashlib
 import fnmatch
+from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 from typing import Optional
 
+from .config import MempalaceConfig
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
@@ -30,6 +32,7 @@ from .palace import (
     purge_file_closets,
     upsert_closet_lines,
 )
+from .parallel import ParallelPipeline, WorkerResult
 
 READABLE_EXTENSIONS = {
     ".txt",
@@ -798,40 +801,141 @@ def add_drawer(
 # =============================================================================
 # PROCESS ONE FILE
 # =============================================================================
+#
+# Split into three stages so the parallel miner (mempalace.parallel) can
+# fan out the embedding-bound middle stage across N producer threads while
+# keeping the ChromaDB-touching write stage on a single consumer thread:
+#
+#   _prepare_file()      — pure CPU + file IO; chunk + batch + build IDs
+#   _embed_prepared()    — call the embedding endpoint per batch
+#   _write_prepared()    — under mine_lock: upsert with pre-computed vectors
+#
+# The legacy ``process_file`` shim wires these three together for callers
+# that don't care about parallelism (tests, sweeper-adjacent code).
 
 
-def process_file(
+@dataclass
+class _BatchDocs:
+    """One sub-batch of a file's chunks, sized to ``DRAWER_UPSERT_BATCH_SIZE``."""
+
+    documents: list
+    ids: list
+    metadatas: list
+
+
+@dataclass
+class _PreparedFile:
+    """Output of ``_prepare_file``: everything needed to embed + write."""
+
+    source_file: str
+    room: str
+    content: str
+    chunks: list  # output of chunk_text; needed for closet drawer-id rebuild
+    batches: list  # list of _BatchDocs
+    source_mtime: Optional[float]
+
+
+def _prepare_file(
     filepath: Path,
     project_path: Path,
-    collection,
     wing: str,
     rooms: list,
     agent: str,
     dry_run: bool,
-    closets_col=None,
-) -> tuple:
-    """Read, chunk, route, and file one file. Returns (drawer_count, room_name)."""
+    collection,
+) -> Optional[_PreparedFile]:
+    """Read, chunk, and pre-build per-batch documents/ids/metadata.
 
-    # Skip if already filed
+    Returns ``None`` to mean "skip this file" (already mined, unreadable,
+    or below the minimum content size). The caller treats ``None`` as a
+    silent skip — same semantics as the original ``process_file`` early
+    returns.
+
+    Does NOT acquire ``mine_lock`` and does NOT touch the collection
+    writer; safe to call from a producer thread.
+    """
     source_file = str(filepath)
     if not dry_run and file_already_mined(collection, source_file, check_mtime=True):
-        return 0, "general"
+        return None
 
     try:
         content = filepath.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return 0, "general"
+        return None
 
     content = content.strip()
     if len(content) < MIN_CHUNK_SIZE:
-        return 0, "general"
+        return None
 
     room = detect_room(filepath, content, rooms, project_path)
     chunks = chunk_text(content, source_file)
 
-    if dry_run:
-        print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
-        return len(chunks), room
+    try:
+        source_mtime = os.path.getmtime(source_file)
+    except OSError:
+        source_mtime = None
+
+    batches: list = []
+    for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
+        batch_docs: list = []
+        batch_ids: list = []
+        batch_metas: list = []
+        for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
+            drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
+            batch_docs.append(chunk["content"])
+            batch_ids.append(drawer_id)
+            batch_metas.append(
+                _build_drawer_metadata(
+                    wing,
+                    room,
+                    source_file,
+                    chunk["chunk_index"],
+                    agent,
+                    chunk["content"],
+                    source_mtime,
+                )
+            )
+        batches.append(_BatchDocs(documents=batch_docs, ids=batch_ids, metadatas=batch_metas))
+
+    return _PreparedFile(
+        source_file=source_file,
+        room=room,
+        content=content,
+        chunks=chunks,
+        batches=batches,
+        source_mtime=source_mtime,
+    )
+
+
+def _embed_prepared(prepared: "_PreparedFile", ef) -> list:
+    """Call ``ef`` on each batch of documents.
+
+    ``ef`` is the embedding callable returned by
+    :func:`mempalace.embedding.get_embedding_function`. Returns a list with
+    one embeddings-list per batch, parallel to ``prepared.batches``.
+
+    Safe to call from a producer thread: ``ef`` is thread-safe by contract
+    (Ollama / OpenAI-compat are HTTP clients with no shared mutable state;
+    ONNX Runtime ``InferenceSession.run`` is documented thread-safe).
+    """
+    return [list(ef(batch.documents)) for batch in prepared.batches]
+
+
+def _write_prepared(
+    prepared: "_PreparedFile",
+    embeddings_batches: list,
+    collection,
+    closets_col,
+    wing: str,
+) -> int:
+    """Single-writer phase: under ``mine_lock``, upsert with pre-computed embeddings.
+
+    Returns the number of drawers added. Caller must guarantee this runs
+    on the consumer thread — concurrent upserts on the same collection
+    will corrupt HNSW (see ``mempalace.backends.chroma`` ``num_threads=1``).
+    """
+    source_file = prepared.source_file
+    room = prepared.room
 
     # Lock this file so concurrent agents don't interleave delete+insert.
     # Without the lock, two agents can both pass file_already_mined(),
@@ -839,7 +943,7 @@ def process_file(
     with mine_lock(source_file):
         # Re-check after acquiring lock — another agent may have just finished
         if file_already_mined(collection, source_file, check_mtime=True):
-            return 0, room
+            return 0
 
         # Purge stale drawers for this file before re-inserting the fresh chunks.
         # Converts modified-file re-mines from upsert-over-existing-IDs (which hits
@@ -851,41 +955,15 @@ def process_file(
         except Exception:
             pass
 
-        # Batch chunks into bounded upserts so the embedding model sees many
-        # chunks per forward pass without building one huge Chroma/SQLite
-        # request for pathological files. A bad chunk can fail its sub-batch;
-        # that is the deliberate trade-off for amortizing embedding overhead.
-        try:
-            source_mtime = os.path.getmtime(source_file)
-        except OSError:
-            source_mtime = None
-
         drawers_added = 0
-        for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
-            batch_docs: list = []
-            batch_ids: list = []
-            batch_metas: list = []
-            for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
-                drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
-                batch_docs.append(chunk["content"])
-                batch_ids.append(drawer_id)
-                batch_metas.append(
-                    _build_drawer_metadata(
-                        wing,
-                        room,
-                        source_file,
-                        chunk["chunk_index"],
-                        agent,
-                        chunk["content"],
-                        source_mtime,
-                    )
-                )
+        for batch, batch_embeddings in zip(prepared.batches, embeddings_batches):
             collection.upsert(
-                documents=batch_docs,
-                ids=batch_ids,
-                metadatas=batch_metas,
+                documents=batch.documents,
+                ids=batch.ids,
+                metadatas=batch.metadatas,
+                embeddings=batch_embeddings,
             )
-            drawers_added += len(batch_docs)
+            drawers_added += len(batch.documents)
 
         # Build closet — the searchable index pointing to these drawers.
         # Purge first: a re-mine (mtime change or normalize_version bump) must
@@ -893,13 +971,15 @@ def process_file(
         if closets_col and drawers_added > 0:
             drawer_ids = [
                 f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(c['chunk_index'])).encode()).hexdigest()[:24]}"
-                for c in chunks
+                for c in prepared.chunks
             ]
-            closet_lines = build_closet_lines(source_file, drawer_ids, content, wing, room)
+            closet_lines = build_closet_lines(
+                source_file, drawer_ids, prepared.content, wing, room
+            )
             closet_id_base = (
                 f"closet_{wing}_{room}_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
             )
-            entities = _extract_entities_for_metadata(content)
+            entities = _extract_entities_for_metadata(prepared.content)
             closet_meta = {
                 "wing": wing,
                 "room": room,
@@ -913,7 +993,44 @@ def process_file(
             purge_file_closets(closets_col, source_file)
             upsert_closet_lines(closets_col, closet_id_base, closet_lines, closet_meta)
 
-    return drawers_added, room
+    return drawers_added
+
+
+def process_file(
+    filepath: Path,
+    project_path: Path,
+    collection,
+    wing: str,
+    rooms: list,
+    agent: str,
+    dry_run: bool,
+    closets_col=None,
+) -> tuple:
+    """Read, chunk, route, and file one file. Returns (drawer_count, room_name).
+
+    Backward-compatible serial wrapper around the three-stage pipeline.
+    Callers that want parallelism should drive ``_prepare_file`` /
+    ``_embed_prepared`` / ``_write_prepared`` directly via
+    ``mempalace.parallel.ParallelPipeline``.
+    """
+    prepared = _prepare_file(filepath, project_path, wing, rooms, agent, dry_run, collection)
+    if prepared is None:
+        return 0, "general"
+
+    if dry_run:
+        print(
+            f"    [DRY RUN] {filepath.name} -> room:{prepared.room} ({len(prepared.chunks)} drawers)"
+        )
+        return len(prepared.chunks), prepared.room
+
+    # Lazy import — keeps import-time graph shallow and avoids touching the
+    # EF cache for callers that only use the static analysis paths.
+    from .embedding import get_embedding_function
+
+    ef = get_embedding_function()
+    embeddings_batches = _embed_prepared(prepared, ef)
+    drawers_added = _write_prepared(prepared, embeddings_batches, collection, closets_col, wing)
+    return drawers_added, prepared.room
 
 
 # =============================================================================
@@ -1004,6 +1121,7 @@ def mine(
     respect_ignore: bool = True,
     include_ignored: list = None,
     files: list = None,
+    workers: Optional[int] = None,
 ):
     """Mine a project directory into the palace.
 
@@ -1012,6 +1130,11 @@ def mine(
     caller (e.g. ``init`` showing a file-count estimate before the mine
     prompt) avoids walking the tree twice. When ``None`` (the default),
     ``mine`` walks the tree itself just like before.
+
+    ``workers`` controls producer-thread fan-out for the parallel embed
+    path. ``None`` (default) resolves to :attr:`MempalaceConfig.workers`
+    — 1 for onnx, 8 for remote providers. ``1`` reproduces the historic
+    fully-serial mine.
     """
 
     if dry_run:
@@ -1025,6 +1148,7 @@ def mine(
             respect_ignore=respect_ignore,
             include_ignored=include_ignored,
             files=files,
+            workers=workers,
         )
 
     try:
@@ -1039,6 +1163,7 @@ def mine(
                 respect_ignore=respect_ignore,
                 include_ignored=include_ignored,
                 files=files,
+                workers=workers,
             )
     except MineAlreadyRunning:
         print(
@@ -1059,6 +1184,7 @@ def _mine_impl(
     respect_ignore: bool = True,
     include_ignored: list = None,
     files: list = None,
+    workers: Optional[int] = None,
 ):
     project_path = Path(project_dir).expanduser().resolve()
     config = load_config(project_dir)
@@ -1075,7 +1201,13 @@ def _mine_impl(
     if limit > 0:
         files = files[:limit]
 
-    from .embedding import describe_device
+    from .embedding import describe_device, get_embedding_function
+
+    # Resolve workers from arg → config. CLI passes None when --workers is
+    # not specified so the config-driven asymmetric default (1 for onnx,
+    # 8 for remote) flows through.
+    if workers is None:
+        workers = MempalaceConfig().workers
 
     print(f"\n{'=' * 55}")
     print("  MemPalace Mine")
@@ -1085,6 +1217,8 @@ def _mine_impl(
     print(f"  Files:   {len(files)}")
     print(f"  Palace:  {palace_path}")
     print(f"  Device:  {describe_device()}")
+    if not dry_run:
+        print(f"  Workers: {workers}")
     if dry_run:
         print("  DRY RUN — nothing will be filed")
     if not respect_ignore:
@@ -1103,36 +1237,102 @@ def _mine_impl(
     total_drawers = 0
     files_skipped = 0
     files_processed = 0
+    files_failed = 0
     last_file = None
     room_counts = defaultdict(int)
 
     try:
-        for i, filepath in enumerate(files, 1):
-            try:
-                drawers, room = process_file(
-                    filepath=filepath,
-                    project_path=project_path,
-                    collection=collection,
-                    wing=wing,
-                    rooms=rooms,
-                    agent=agent,
-                    dry_run=dry_run,
-                    closets_col=closets_col,
-                )
-            except KeyboardInterrupt:
-                # Re-raise so the outer handler prints the summary; we
-                # capture the last-attempted file via last_file below.
+        if dry_run:
+            # Dry-run stays serial — no point parallelizing prints, and the
+            # producer/consumer split assumes a real collection writer.
+            for i, filepath in enumerate(files, 1):
+                try:
+                    drawers, room = process_file(
+                        filepath=filepath,
+                        project_path=project_path,
+                        collection=collection,
+                        wing=wing,
+                        rooms=rooms,
+                        agent=agent,
+                        dry_run=dry_run,
+                        closets_col=closets_col,
+                    )
+                except KeyboardInterrupt:
+                    last_file = filepath.name
+                    raise
+                files_processed = i
                 last_file = filepath.name
-                raise
-            files_processed = i
-            last_file = filepath.name
-            if drawers == 0 and not dry_run:
-                files_skipped += 1
-            else:
+                if drawers > 0:
+                    total_drawers += drawers
+                    room_counts[room] += 1
+        else:
+            # Bind the EF once so every producer thread shares the cached
+            # instance — keeps _EF_CACHE (embedding.py) untouched during
+            # the parallel section and amortizes provider construction.
+            ef = get_embedding_function()
+
+            # Producer: prepare file (chunk + build IDs/metadata), then call
+            # the EF to compute embeddings. Both stages are file-scoped and
+            # touch no shared mutable state.
+            def producer(item):
+                idx, filepath = item
+                prepared = _prepare_file(
+                    filepath, project_path, wing, rooms, agent, False, collection
+                )
+                if prepared is None:
+                    return WorkerResult(
+                        payload=None,
+                        item_id=filepath.name,
+                        extra={"skip": True, "index": idx, "total": len(files)},
+                    )
+                embeddings = _embed_prepared(prepared, ef)
+                return WorkerResult(
+                    payload=(prepared, embeddings),
+                    item_id=filepath.name,
+                    extra={"index": idx, "total": len(files), "filepath": filepath},
+                )
+
+            # Consumer: single-thread, owns all collection writes. Counters
+            # below are mutated only here — no lock needed.
+            def consumer(result):
+                nonlocal total_drawers, files_skipped, files_processed, last_file
+                files_processed += 1
+                last_file = result.item_id
+                if result.extra.get("skip"):
+                    files_skipped += 1
+                    return
+                prepared, embeddings = result.payload
+                drawers = _write_prepared(
+                    prepared, embeddings, collection, closets_col, wing
+                )
+                if drawers == 0:
+                    files_skipped += 1
+                    return
                 total_drawers += drawers
-                room_counts[room] += 1
-                if not dry_run:
-                    print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers}")
+                room_counts[prepared.room] += 1
+                idx = result.extra["index"]
+                total = result.extra["total"]
+                print(f"  + [{idx:4}/{total}] {result.item_id[:50]:50} +{drawers}")
+
+            def on_error(failed):
+                nonlocal files_failed, files_processed, last_file
+                files_processed += 1
+                files_failed += 1
+                last_file = failed.item_id
+                print(
+                    f"  ! [{failed.item_id[:50]:50}] FAILED: "
+                    f"{type(failed.exception).__name__}: {failed.exception}",
+                    file=sys.stderr,
+                )
+
+            pipeline = ParallelPipeline(
+                producer_fn=producer,
+                consumer_fn=consumer,
+                workers=workers,
+                queue_size=max(workers * 2, 4),
+                on_error=on_error,
+            )
+            pipeline.run(list(enumerate(files, 1)))
 
         if not dry_run:
             # Cross-wing topic tunnels: after every file in this wing has been
@@ -1152,8 +1352,10 @@ def _mine_impl(
 
         print(f"\n{'=' * 55}")
         print("  Done.")
-        print(f"  Files processed: {len(files) - files_skipped}")
+        print(f"  Files processed: {len(files) - files_skipped - files_failed}")
         print(f"  Files skipped (already filed): {files_skipped}")
+        if files_failed:
+            print(f"  Files failed: {files_failed}")
         print(f"  Drawers filed: {total_drawers}")
         print("\n  By room:")
         for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):

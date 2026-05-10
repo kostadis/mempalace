@@ -484,6 +484,7 @@ def test_cmd_mine_projects_mode(mock_config_cls):
             dry_run=False,
             respect_ignore=True,
             include_ignored=[],
+            workers=None,
         )
 
 

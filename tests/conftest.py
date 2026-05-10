@@ -44,6 +44,17 @@ with open(os.path.join(_session_config_dir, "config.json"), "w") as _cf:
         _cf,
     )
 
+# HTTP keep-alive: the production embedding clients default to
+# urllib3.PoolManager so a parallel mine can hold many connections to
+# vLLM / Ollama in flight at once. Existing tests in
+# ``test_embedding_openai.py`` / ``test_embedding_ollama.py`` predate that
+# work and patch ``mempalace.embedding_*.urlopen`` directly. Setting
+# ``MEMPALACE_HTTP_KEEPALIVE=0`` here keeps those tests working unchanged
+# by routing ``_post_json`` through the legacy urlopen path. The
+# follow-up parallelism work (docs/design/embrace-parallelism.md) ports
+# the tests to the pool path and retires this shim.
+os.environ.setdefault("MEMPALACE_HTTP_KEEPALIVE", "0")
+
 # Now it is safe to import mempalace modules that trigger initialisation.
 import chromadb  # noqa: E402
 import pytest  # noqa: E402
