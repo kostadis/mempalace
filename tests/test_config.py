@@ -615,3 +615,69 @@ def test_llm_api_key_does_not_read_from_file(tmp_path, monkeypatch):
 
     cfg = MempalaceConfig(config_dir=str(tmp_path))
     assert cfg.llm_api_key is None
+
+
+# --- workers (parallel miner) -------------------------------------------------
+#
+# Asymmetric default: 1 for ONNX (GIL-bound, in-process) and 8 for remote
+# providers. Env > file > default. Clamped to [1, 64].
+
+
+def test_workers_defaults_to_1_for_onnx(monkeypatch):
+    monkeypatch.delenv("MEMPALACE_WORKERS", raising=False)
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_PROVIDER", raising=False)
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    # default embedding_provider is onnx → workers defaults to 1
+    assert cfg.workers == 1
+
+
+def test_workers_defaults_to_8_for_ollama(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_WORKERS", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_provider": "ollama"}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.workers == 8
+
+
+def test_workers_defaults_to_8_for_openai_compat(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_WORKERS", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_provider": "openai-compat"}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.workers == 8
+
+
+def test_workers_from_config_overrides_provider_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_WORKERS", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_provider": "ollama", "workers": 16}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.workers == 16
+
+
+def test_workers_env_overrides_config(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_provider": "ollama", "workers": 4}, f)
+    monkeypatch.setenv("MEMPALACE_WORKERS", "12")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.workers == 12
+
+
+def test_workers_clamped_to_min_1(monkeypatch):
+    monkeypatch.setenv("MEMPALACE_WORKERS", "0")
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.workers == 1
+
+
+def test_workers_clamped_to_max_64(monkeypatch):
+    monkeypatch.setenv("MEMPALACE_WORKERS", "9999")
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.workers == 64
+
+
+def test_workers_falls_back_to_default_on_invalid_value(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_WORKERS", raising=False)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"embedding_provider": "ollama", "workers": "not-a-number"}, f)
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.workers == 8  # ollama default

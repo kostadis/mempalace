@@ -700,6 +700,36 @@ class MempalaceConfig:
         return env_val.strip() if env_val else None
 
     @property
+    def workers(self):
+        """Producer thread count for the parallel miner.
+
+        Asymmetric default:
+          * ``embedding_provider == "onnx"`` → ``1``. ONNX runs in-process
+            under the GIL; thread fan-out has no benefit and risks GIL
+            contention on the chunking/metadata work.
+          * Remote providers (``ollama`` / ``openai-compat``) → ``8``. The
+            EF call releases the GIL while waiting on the socket, so N
+            producers saturate the remote endpoint.
+
+        Override via ``MEMPALACE_WORKERS`` env var or the ``workers`` config
+        key. Clamped to ``[1, 64]``. ``workers=1`` reproduces the historic
+        serial mine.
+        """
+        env_val = os.environ.get("MEMPALACE_WORKERS")
+        if env_val:
+            try:
+                return max(1, min(64, int(env_val)))
+            except ValueError:
+                pass
+        cfg_val = self._file_config.get("workers")
+        if cfg_val is not None:
+            try:
+                return max(1, min(64, int(cfg_val)))
+            except (TypeError, ValueError):
+                pass
+        return 1 if self.embedding_provider == "onnx" else 8
+
+    @property
     def topic_tunnel_min_count(self):
         """Minimum number of overlapping confirmed topics required to create
         a cross-wing tunnel between two wings.
