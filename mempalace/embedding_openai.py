@@ -45,7 +45,41 @@ class OpenAIEmbeddingError(RuntimeError):
     endpoint does not silently produce empty vectors."""
 
 
-def _post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
+# ── HTTP transport ────────────────────────────────────────────────────────
+#
+# The default keep-alive path uses urllib3.PoolManager so N producer threads
+# (mempalace.parallel.ParallelPipeline) can saturate a remote endpoint
+# without serializing on TCP setup. The legacy urlopen path is preserved
+# behind ``MEMPALACE_HTTP_KEEPALIVE=0`` so existing tests that patch
+# ``mempalace.embedding_openai.urlopen`` keep working unchanged.
+#
+# The follow-up parallelism work (docs/design/embrace-parallelism.md)
+# ports those tests to the pool path and removes this env shim.
+
+_HTTP_POOL = None  # urllib3.PoolManager — lazy-init, module-cached
+
+
+def _get_http_pool():
+    global _HTTP_POOL
+    if _HTTP_POOL is None:
+        import urllib3
+
+        # maxsize must comfortably exceed worker count or producers stall
+        # waiting for a free connection. Read MEMPALACE_WORKERS directly
+        # (avoids importing MempalaceConfig which has its own lazy paths).
+        try:
+            workers = max(1, int(os.environ.get("MEMPALACE_WORKERS", "8")))
+        except ValueError:
+            workers = 8
+        _HTTP_POOL = urllib3.PoolManager(
+            num_pools=4,
+            maxsize=max(32, workers * 2),
+            block=False,
+        )
+    return _HTTP_POOL
+
+
+def _post_json_via_urlopen(url: str, body: dict, headers: dict, timeout: int) -> dict:
     req = Request(
         url,
         data=json.dumps(body).encode("utf-8"),
@@ -65,6 +99,60 @@ def _post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
         raise OpenAIEmbeddingError(f"Cannot reach {url}: {e}") from e
     except json.JSONDecodeError as e:
         raise OpenAIEmbeddingError(f"Malformed response from {url}: {e}") from e
+
+
+def _post_json_via_pool(url: str, body: dict, headers: dict, timeout: int) -> dict:
+    import urllib3
+
+    pool = _get_http_pool()
+    encoded = json.dumps(body).encode("utf-8")
+    merged_headers = {"Content-Type": "application/json", **headers}
+    try:
+        resp = pool.request(
+            "POST",
+            url,
+            body=encoded,
+            headers=merged_headers,
+            timeout=timeout,
+            retries=False,
+        )
+    except urllib3.exceptions.MaxRetryError as e:
+        raise OpenAIEmbeddingError(f"Cannot reach {url}: {e}") from e
+    except urllib3.exceptions.TimeoutError as e:
+        raise OpenAIEmbeddingError(f"Timeout reaching {url}: {e}") from e
+    except urllib3.exceptions.HTTPError as e:
+        raise OpenAIEmbeddingError(f"Cannot reach {url}: {e}") from e
+    except OSError as e:
+        raise OpenAIEmbeddingError(f"Cannot reach {url}: {e}") from e
+
+    if resp.status >= 400:
+        detail = ""
+        try:
+            detail = resp.data.decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        raise OpenAIEmbeddingError(
+            f"HTTP {resp.status} from {url}: {detail or resp.reason or 'no detail'}"
+        )
+
+    try:
+        return json.loads(resp.data)
+    except json.JSONDecodeError as e:
+        raise OpenAIEmbeddingError(f"Malformed response from {url}: {e}") from e
+
+
+def _post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
+    """Dispatch to the keep-alive pool by default, urlopen on opt-out.
+
+    ``MEMPALACE_HTTP_KEEPALIVE=0`` selects the legacy urlopen path. Tests
+    in this repo that pre-date the pool work patch
+    ``mempalace.embedding_openai.urlopen`` directly; setting this env var
+    in ``tests/conftest.py`` keeps those tests passing without rewriting
+    every patch.
+    """
+    if os.environ.get("MEMPALACE_HTTP_KEEPALIVE", "1") == "0":
+        return _post_json_via_urlopen(url, body, headers, timeout)
+    return _post_json_via_pool(url, body, headers, timeout)
 
 
 class OpenAICompatEmbeddingFunction:
