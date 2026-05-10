@@ -24,8 +24,11 @@ import json
 import re
 import sys
 from dataclasses import dataclass
+from typing import Optional
 
+from mempalace.config import MempalaceConfig
 from mempalace.llm_client import LLMError, LLMProvider
+from mempalace.parallel import ParallelPipeline, WorkerResult
 
 
 BATCH_SIZE = 25  # candidates per LLM call; tuned for 4B local models
@@ -339,6 +342,7 @@ def refine_entities(
     show_progress: bool = True,
     allow_project_promotions: bool = True,
     corpus_origin: dict | None = None,
+    workers: Optional[int] = None,
 ) -> RefineResult:
     """Reclassify detected entities using the LLM provider.
 
@@ -357,6 +361,15 @@ def refine_entities(
     ``allow_project_promotions=False`` keeps LLM-only project guesses in the
     uncertain bucket. This is useful when manifest/git signal already supplied
     canonical projects and regex/LLM hits are likely tools, vendors, or topics.
+
+    ``workers`` controls producer-thread fan-out for the LLM calls. ``None``
+    (default) resolves to :attr:`MempalaceConfig.workers` — 1 for onnx, 8
+    for remote providers. ``1`` reproduces the historic fully-serial path.
+    Each batch is independent (one ``provider.classify`` call), so N workers
+    let N batches stream against the LLM endpoint concurrently. Unlike
+    embedding (where the GPU saturates on a single client), LLM token
+    generation is request-latency-bound — concurrency typically translates
+    directly to speedup.
     """
     candidates: list[tuple[str, str]] = []
     current_type = {"people": "person", "projects": "project", "uncertain": "uncertain"}
@@ -398,31 +411,87 @@ def refine_entities(
 
     all_decisions: dict[str, tuple[str, str]] = {}
     errors: list[str] = []
-    completed = 0
     cancelled = False
 
     system_prompt = SYSTEM_PROMPT + _build_corpus_origin_preamble(corpus_origin)
 
-    for idx, batch in enumerate(batches, 1):
-        if show_progress and batch:
-            _print_progress(idx - 1, len(batches), batch[0][0])
+    # Resolve worker count: explicit arg → config → asymmetric default.
+    if workers is None:
+        workers = MempalaceConfig().workers
+
+    # Producer: call provider.classify for one batch, parse the response.
+    # Runs concurrently from N threads — LLMProvider holds no mutable state
+    # post-construction so this is safe.
+    #
+    # Payload shape: ("transport_error", msg)   provider raised LLMError
+    #                ("response", decisions, parse_error_msg|None)
+    #                                            provider succeeded; decisions
+    #                                            may be empty + parse_error_msg
+    #                                            set when the response was
+    #                                            present but unparseable.
+    #
+    # The "response" path is what the historic serial loop called "completed"
+    # — the LLM responded and we tried to parse, even if the parse yielded
+    # zero decisions. The parse error goes into the errors list alongside.
+    def producer(item):
+        idx, batch = item
         user_prompt = _build_user_prompt(batch)
         try:
             resp = provider.classify(system_prompt, user_prompt, json_mode=True)
         except KeyboardInterrupt:
-            cancelled = True
-            break
+            # ParallelPipeline propagates KI to the main thread so the
+            # caller's cancelled=True path fires.
+            raise
         except LLMError as e:
-            errors.append(f"batch {idx}: {e}")
-            continue
+            return WorkerResult(
+                payload=("transport_error", f"batch {idx}: {e}"),
+                item_id=f"batch{idx}",
+                extra={"idx": idx, "batch": batch},
+            )
         names_in_batch = [name for name, _, _ in batch]
         decisions = _parse_response(resp.text, names_in_batch)
+        parse_error = None
         if not decisions:
-            errors.append(f"batch {idx}: could not parse response")
-        all_decisions.update(decisions)
-        completed += 1
+            parse_error = f"batch {idx}: could not parse response"
+        return WorkerResult(
+            payload=("response", decisions, parse_error),
+            item_id=f"batch{idx}",
+            extra={"idx": idx, "batch": batch},
+        )
+
+    # Consumer: single-thread merge of decisions into all_decisions + error
+    # accumulation + progress print. Counter state mutated only here so
+    # no lock is needed.
+    completed = 0
+
+    def consumer(result):
+        nonlocal completed
+        payload = result.payload
+        if payload[0] == "transport_error":
+            errors.append(payload[1])
+        else:  # "response"
+            _, decisions, parse_error = payload
+            if parse_error is not None:
+                errors.append(parse_error)
+            all_decisions.update(decisions)
+            completed += 1
         if show_progress:
-            _print_progress(idx, len(batches), batch[-1][0])
+            batch = result.extra["batch"]
+            idx = result.extra["idx"]
+            _print_progress(idx, len(batches), batch[-1][0] if batch else "")
+
+    pipeline = ParallelPipeline(
+        producer_fn=producer,
+        consumer_fn=consumer,
+        workers=workers,
+        queue_size=max(workers * 2, 4),
+    )
+    try:
+        pipeline.run(list(enumerate(batches, 1)))
+    except KeyboardInterrupt:
+        # In-flight batches may have completed and updated all_decisions
+        # via the consumer before we got here — that's the design intent.
+        cancelled = True
 
     if show_progress:
         sys.stderr.write("\n")
