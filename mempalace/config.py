@@ -631,6 +631,75 @@ class MempalaceConfig:
         return ""
 
     @property
+    def llm_provider(self):
+        """Which LLM backend to use for refinement / classification / closet scoring.
+
+        Values:
+          * ``"ollama"`` (default) — Ollama ``/api/chat`` HTTP shape; model
+            chosen by :attr:`llm_model`.
+          * ``"openai-compat"`` — OpenAI ``/v1/chat/completions`` shape (vLLM,
+            LM Studio, Together, OpenAI itself, etc.).
+          * ``"anthropic"`` — direct Anthropic API; requires
+            ``ANTHROPIC_API_KEY`` env (or ``MEMPALACE_LLM_API_KEY``).
+
+        Mirrors :attr:`embedding_provider` so a user can persist a Spark / LAN
+        LLM endpoint in config rather than passing ``--llm-endpoint`` on every
+        invocation. Read priority: env ``MEMPALACE_LLM_PROVIDER`` first, then
+        the ``llm_provider`` key in ``config.json``, then ``"ollama"``.
+        """
+        env_val = os.environ.get("MEMPALACE_LLM_PROVIDER")
+        if env_val:
+            return env_val.strip().lower()
+        return str(self._file_config.get("llm_provider", "ollama")).strip().lower()
+
+    @property
+    def llm_model(self):
+        """Model name for the LLM provider.
+
+        Default ``"gemma4:e4b"`` matches the historical CLI default at
+        ``mempalace.cli`` so behavior is unchanged when the key is unset.
+        Read priority: env ``MEMPALACE_LLM_MODEL`` first, then the
+        ``llm_model`` key in ``config.json``, then ``"gemma4:e4b"``.
+        """
+        env_val = os.environ.get("MEMPALACE_LLM_MODEL")
+        if env_val:
+            return env_val.strip()
+        cfg_val = self._file_config.get("llm_model")
+        if cfg_val:
+            return str(cfg_val).strip()
+        return "gemma4:e4b"
+
+    @property
+    def llm_endpoint(self):
+        """Endpoint URL for the LLM provider, or ``None`` for provider default.
+
+        ``None`` lets each provider apply its own default
+        (Ollama → ``http://localhost:11434``; Anthropic → ``api.anthropic.com``).
+        Set to a Tailscale / LAN address (e.g. ``http://192.168.1.147:8001``)
+        to point LLM refinement at a Spark vLLM container while keeping the
+        rest of MemPalace local. Read priority: env ``MEMPALACE_LLM_ENDPOINT``
+        first, then the ``llm_endpoint`` key in ``config.json``, then ``None``.
+        """
+        env_val = os.environ.get("MEMPALACE_LLM_ENDPOINT")
+        if env_val:
+            return env_val.strip().rstrip("/")
+        cfg_val = self._file_config.get("llm_endpoint")
+        if cfg_val:
+            return str(cfg_val).strip().rstrip("/")
+        return None
+
+    @property
+    def llm_api_key(self):
+        """API key for the LLM provider, env-only (never persisted to file).
+
+        Mirrors how ``OPENAI_API_KEY`` / ``ANTHROPIC_API_KEY`` are consumed in
+        :mod:`mempalace.llm_client`. Read from ``MEMPALACE_LLM_API_KEY``; falls
+        back to ``None`` so each provider can pick up its native env var.
+        """
+        env_val = os.environ.get("MEMPALACE_LLM_API_KEY")
+        return env_val.strip() if env_val else None
+
+    @property
     def topic_tunnel_min_count(self):
         """Minimum number of overlapping confirmed topics required to create
         a cross-wing tunnel between two wings.

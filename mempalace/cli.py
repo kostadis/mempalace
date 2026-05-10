@@ -274,14 +274,16 @@ def cmd_init(args):
     # through to heuristics-only.
     llm_provider = None
     if not getattr(args, "no_llm", False):
-        provider_name = getattr(args, "llm_provider", "ollama") or "ollama"
-        provider_model = getattr(args, "llm_model", "gemma4:e4b") or "gemma4:e4b"
+        provider_name = getattr(args, "llm_provider", None) or cfg.llm_provider
+        provider_model = getattr(args, "llm_model", None) or cfg.llm_model
+        provider_endpoint = getattr(args, "llm_endpoint", None) or cfg.llm_endpoint
+        provider_api_key = getattr(args, "llm_api_key", None) or cfg.llm_api_key
         try:
             candidate = get_provider(
                 name=provider_name,
                 model=provider_model,
-                endpoint=getattr(args, "llm_endpoint", None),
-                api_key=getattr(args, "llm_api_key", None),
+                endpoint=provider_endpoint,
+                api_key=provider_api_key,
             )
             ok, msg = candidate.check_available()
             if ok:
@@ -1018,29 +1020,39 @@ def main():
     )
     p_init.add_argument(
         "--llm-provider",
-        default="ollama",
+        default=None,
         choices=["ollama", "openai-compat", "anthropic"],
-        help="LLM provider (default: ollama). Pass --no-llm to disable LLM-assisted refinement entirely.",
+        help=(
+            "LLM provider. Falls back to $MEMPALACE_LLM_PROVIDER, then the "
+            "`llm_provider` config key, then `ollama`. Pass --no-llm to disable "
+            "LLM-assisted refinement entirely."
+        ),
     )
     p_init.add_argument(
         "--llm-model",
-        default="gemma4:e4b",
-        help="Model name for the chosen provider (default: gemma4:e4b for Ollama).",
+        default=None,
+        help=(
+            "Model name for the chosen provider. Falls back to "
+            "$MEMPALACE_LLM_MODEL, then the `llm_model` config key, then "
+            "`gemma4:e4b`."
+        ),
     )
     p_init.add_argument(
         "--llm-endpoint",
         default=None,
         help=(
-            "Provider endpoint URL. Default for Ollama: http://localhost:11434. "
-            "Required for openai-compat."
+            "Provider endpoint URL. Falls back to $MEMPALACE_LLM_ENDPOINT, then "
+            "the `llm_endpoint` config key, then the provider's own default "
+            "(Ollama: http://localhost:11434)."
         ),
     )
     p_init.add_argument(
         "--llm-api-key",
         default=None,
         help=(
-            "API key for the provider. For anthropic, defaults to $ANTHROPIC_API_KEY; "
-            "for openai-compat, defaults to $OPENAI_API_KEY."
+            "API key for the provider. Falls back to $MEMPALACE_LLM_API_KEY, "
+            "then the provider's native env var ($ANTHROPIC_API_KEY for "
+            "anthropic, $OPENAI_API_KEY for openai-compat)."
         ),
     )
     p_init.add_argument(
