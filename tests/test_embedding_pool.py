@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from mempalace import embedding_ollama, embedding_openai
+from mempalace import embedding_ollama, embedding_openai, llm_client
 
 
 @pytest.fixture
@@ -186,3 +186,89 @@ def test_ollama_legacy_urlopen_path_when_keepalive_disabled(monkeypatch):
             "http://spark:11434/api/embed", {"input": "hi", "model": "x"}, timeout=30
         )
         assert "embeddings" in result
+
+
+# ── LLM client pool path ─────────────────────────────────────────────────
+
+
+def test_llm_client_pool_reuses_single_manager_across_calls(keepalive_on):
+    llm_client._HTTP_POOL = None
+    pool_a = llm_client._get_http_pool()
+    pool_b = llm_client._get_http_pool()
+    assert pool_a is pool_b
+
+
+def test_llm_client_pool_max_size_honors_workers_env(monkeypatch):
+    monkeypatch.setenv("MEMPALACE_WORKERS", "12")
+    monkeypatch.setattr(llm_client, "_HTTP_POOL", None)
+    pool = llm_client._get_http_pool()
+    assert pool.connection_pool_kw["maxsize"] >= 24  # workers*2
+
+
+def test_llm_client_post_via_pool_translates_max_retry_error(keepalive_on):
+    import urllib3
+
+    def boom(*args, **kwargs):
+        raise urllib3.exceptions.MaxRetryError(
+            None, "http://spark:11434/v1/chat/completions", "no host"
+        )
+
+    with patch.object(llm_client._get_http_pool(), "request", side_effect=boom):
+        with pytest.raises(llm_client.LLMError) as exc_info:
+            llm_client._http_post_json(
+                "http://spark:11434/v1/chat/completions",
+                {"model": "x", "messages": []},
+                headers={},
+                timeout=30,
+            )
+        assert "Cannot reach" in str(exc_info.value)
+
+
+def test_llm_client_post_via_pool_translates_4xx_with_body(keepalive_on):
+    def fake_request(*args, **kwargs):
+        return _fake_response(401, b"unauthorized", reason="Unauthorized")
+
+    with patch.object(llm_client._get_http_pool(), "request", side_effect=fake_request):
+        with pytest.raises(llm_client.LLMError) as exc_info:
+            llm_client._http_post_json(
+                "http://x/v1/chat/completions",
+                {"model": "x", "messages": []},
+                headers={"Authorization": "Bearer bad"},
+                timeout=30,
+            )
+        assert "HTTP 401" in str(exc_info.value)
+        assert "unauthorized" in str(exc_info.value)
+
+
+def test_llm_client_post_via_pool_returns_decoded_json(keepalive_on):
+    def fake_request(*args, **kwargs):
+        return _fake_response(
+            200,
+            {"choices": [{"message": {"content": '{"label": "PERSON"}'}}], "model": "x"},
+        )
+
+    with patch.object(llm_client._get_http_pool(), "request", side_effect=fake_request):
+        result = llm_client._http_post_json(
+            "http://x/v1/chat/completions",
+            {"model": "x", "messages": []},
+            headers={},
+            timeout=30,
+        )
+        assert result["model"] == "x"
+
+
+def test_llm_client_legacy_urlopen_when_keepalive_disabled(monkeypatch):
+    monkeypatch.setenv("MEMPALACE_HTTP_KEEPALIVE", "0")
+    fake_resp = MagicMock()
+    fake_resp.read.return_value = json.dumps({"ok": True}).encode("utf-8")
+    fake_resp.__enter__.return_value = fake_resp
+    fake_resp.__exit__.return_value = False
+
+    with patch("mempalace.llm_client.urlopen", return_value=fake_resp):
+        result = llm_client._http_post_json(
+            "http://x/v1/chat/completions",
+            {"model": "x"},
+            headers={},
+            timeout=30,
+        )
+        assert result == {"ok": True}
