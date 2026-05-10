@@ -162,8 +162,40 @@ class LLMProvider:
         return not _endpoint_is_local(self.endpoint)
 
 
-def _http_post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
-    """POST JSON and return the parsed response. Raises LLMError on any failure."""
+# ── HTTP transport ────────────────────────────────────────────────────────
+#
+# Same dual-transport shape as ``mempalace.embedding_openai``: a
+# urllib3.PoolManager keep-alive default so N concurrent producer threads
+# (mempalace.parallel.ParallelPipeline driving llm_refine / closet_llm)
+# can reuse TCP connections instead of paying handshake overhead per call.
+# LLM token generation is request-latency-bound — connection reuse is a
+# real win when 8 workers are streaming against qwen / llama / etc.
+#
+# Legacy urlopen path lives behind ``MEMPALACE_HTTP_KEEPALIVE=0`` so the
+# existing tests that patch ``mempalace.llm_client.urlopen`` keep working
+# (the autouse fixture in tests/conftest.py sets that env var).
+
+_HTTP_POOL = None
+
+
+def _get_http_pool():
+    global _HTTP_POOL
+    if _HTTP_POOL is None:
+        import urllib3
+
+        try:
+            workers = max(1, int(os.environ.get("MEMPALACE_WORKERS", "8")))
+        except ValueError:
+            workers = 8
+        _HTTP_POOL = urllib3.PoolManager(
+            num_pools=4,
+            maxsize=max(32, workers * 2),
+            block=False,
+        )
+    return _HTTP_POOL
+
+
+def _http_post_json_via_urlopen(url: str, body: dict, headers: dict, timeout: int) -> dict:
     req = Request(
         url,
         data=json.dumps(body).encode("utf-8"),
@@ -182,7 +214,59 @@ def _http_post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
     except (URLError, OSError) as e:
         raise LLMError(f"Cannot reach {url}: {e}") from e
     except json.JSONDecodeError as e:
-        raise LLMError(f"Malformed response from {url}: {e}") from e
+        raise LLMError(f"Malformed JSON from {url}: {e}") from e
+
+
+def _http_post_json_via_pool(url: str, body: dict, headers: dict, timeout: int) -> dict:
+    import urllib3
+
+    pool = _get_http_pool()
+    encoded = json.dumps(body).encode("utf-8")
+    merged_headers = {"Content-Type": "application/json", **headers}
+    try:
+        resp = pool.request(
+            "POST",
+            url,
+            body=encoded,
+            headers=merged_headers,
+            timeout=timeout,
+            retries=False,
+        )
+    except urllib3.exceptions.MaxRetryError as e:
+        raise LLMError(f"Cannot reach {url}: {e}") from e
+    except urllib3.exceptions.TimeoutError as e:
+        raise LLMError(f"Timeout reaching {url}: {e}") from e
+    except urllib3.exceptions.HTTPError as e:
+        raise LLMError(f"Cannot reach {url}: {e}") from e
+    except OSError as e:
+        raise LLMError(f"Cannot reach {url}: {e}") from e
+
+    if resp.status >= 400:
+        detail = ""
+        try:
+            detail = resp.data.decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        raise LLMError(
+            f"HTTP {resp.status} from {url}: {detail or resp.reason or 'no detail'}"
+        )
+
+    try:
+        return json.loads(resp.data)
+    except json.JSONDecodeError as e:
+        raise LLMError(f"Malformed JSON from {url}: {e}") from e
+
+
+def _http_post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
+    """POST JSON and return the parsed response. Raises LLMError on any failure.
+
+    Dispatches keep-alive pool (default) or urlopen
+    (``MEMPALACE_HTTP_KEEPALIVE=0``). Same legacy-test compatibility shim
+    as the embedding clients.
+    """
+    if os.environ.get("MEMPALACE_HTTP_KEEPALIVE", "1") == "0":
+        return _http_post_json_via_urlopen(url, body, headers, timeout)
+    return _http_post_json_via_pool(url, body, headers, timeout)
 
 
 # ==================== OLLAMA ====================

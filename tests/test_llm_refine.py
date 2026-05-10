@@ -657,3 +657,125 @@ def test_collect_corpus_text_caps_bytes_per_file(tmp_path):
     big.write_text("x" * 100_000)
     text = collect_corpus_text(str(tmp_path), max_files=1, max_bytes_per_file=500)
     assert len(text) <= 600  # 500 + newlines
+
+
+# ── parallel fan-out ──────────────────────────────────────────────────────
+
+
+def test_refine_entities_workers_argument_drives_concurrency():
+    """workers=N submits N batches concurrently to the provider.
+
+    With a slow provider (each classify sleeps), workers=8 must finish in
+    roughly the same time as workers=1 on a single batch — wall clock for
+    8 batches with 8 workers ≈ wall clock for 1 batch with 1 worker.
+    """
+    import threading
+    import time
+
+    # 8 batches worth of candidates so workers=8 has work to fan out.
+    detected = {
+        "people": [],
+        "projects": [],
+        "uncertain": [
+            {
+                "name": f"Cand{i}",
+                "type": "uncertain",
+                "confidence": 0.4,
+                "frequency": 3,
+                "signals": [],
+            }
+            for i in range(200)  # 200 / batch_size(25) = 8 batches
+        ],
+    }
+
+    in_flight = {"max": 0, "current": 0}
+    lock = threading.Lock()
+
+    class SlowConcurrentProvider:
+        def classify(self, system, user, json_mode=True):
+            with lock:
+                in_flight["current"] += 1
+                if in_flight["current"] > in_flight["max"]:
+                    in_flight["max"] = in_flight["current"]
+            time.sleep(0.1)
+            with lock:
+                in_flight["current"] -= 1
+            return LLMResponse(
+                text='{"classifications": []}', model="fake", provider="fake", raw={}
+            )
+
+        def check_available(self):
+            return True, "ok"
+
+    t0 = time.monotonic()
+    result = refine_entities(
+        detected,
+        "",
+        SlowConcurrentProvider(),
+        batch_size=25,
+        show_progress=False,
+        workers=8,
+    )
+    elapsed = time.monotonic() - t0
+
+    assert result.batches_total == 8
+    assert result.batches_completed == 8
+    # All 8 batches were in flight at the same time (or close to it).
+    assert in_flight["max"] >= 4, (
+        f"expected parallelism, max in-flight was {in_flight['max']}"
+    )
+    # 8 batches × 0.1s each = 0.8s serial. Parallel with 8 workers should
+    # be roughly 0.1-0.2s.
+    assert elapsed < 0.5, f"workers=8 should finish in well under 0.5s, took {elapsed:.3f}s"
+
+
+def test_refine_entities_workers_1_is_fully_serial():
+    """workers=1 reproduces the historic serial path — one in-flight at a time."""
+    import threading
+    import time
+
+    detected = {
+        "people": [],
+        "projects": [],
+        "uncertain": [
+            {
+                "name": f"Cand{i}",
+                "type": "uncertain",
+                "confidence": 0.4,
+                "frequency": 3,
+                "signals": [],
+            }
+            for i in range(50)  # 2 batches
+        ],
+    }
+
+    in_flight = {"max": 0, "current": 0}
+    lock = threading.Lock()
+
+    class TrackingProvider:
+        def classify(self, system, user, json_mode=True):
+            with lock:
+                in_flight["current"] += 1
+                if in_flight["current"] > in_flight["max"]:
+                    in_flight["max"] = in_flight["current"]
+            time.sleep(0.05)
+            with lock:
+                in_flight["current"] -= 1
+            return LLMResponse(
+                text='{"classifications": []}', model="fake", provider="fake", raw={}
+            )
+
+        def check_available(self):
+            return True, "ok"
+
+    result = refine_entities(
+        detected,
+        "",
+        TrackingProvider(),
+        batch_size=25,
+        show_progress=False,
+        workers=1,
+    )
+    assert result.batches_total == 2
+    assert result.batches_completed == 2
+    assert in_flight["max"] == 1, "workers=1 must never have 2 calls in flight"
