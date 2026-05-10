@@ -544,6 +544,7 @@ def cmd_mine(args):
             dry_run=args.dry_run,
             respect_ignore=not args.no_mempalaceignore,
             include_ignored=include_ignored,
+            workers=getattr(args, "workers", None),
         )
 
 
@@ -1094,6 +1095,17 @@ def main():
         help="Your name — recorded on every drawer (default: mempalace)",
     )
     p_mine.add_argument("--limit", type=int, default=0, help="Max files to process (0 = all)")
+    p_mine.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help=(
+            "Producer threads for the parallel embed path. Defaults to "
+            "$MEMPALACE_WORKERS / the `workers` config key / "
+            "1 (onnx) | 8 (remote embedding provider). Use 1 to force "
+            "the historic fully-serial mine."
+        ),
+    )
     p_mine.add_argument(
         "--redetect-origin",
         action="store_true",

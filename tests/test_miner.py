@@ -403,11 +403,12 @@ def test_status_handles_none_metadata_without_crash(tmp_path, capsys):
 
 
 def test_process_file_uses_bounded_upsert_batches(tmp_path, monkeypatch):
-    from mempalace import miner
+    from mempalace import miner, embedding
 
     class FakeCol:
         def __init__(self):
             self.batch_sizes = []
+            self.embedding_batch_sizes = []
 
         def get(self, *args, **kwargs):
             return {"ids": []}
@@ -415,8 +416,19 @@ def test_process_file_uses_bounded_upsert_batches(tmp_path, monkeypatch):
         def delete(self, *args, **kwargs):
             pass
 
-        def upsert(self, documents, ids, metadatas):
+        def upsert(self, documents, ids, metadatas, embeddings=None):
+            # Once the parallel embed/upsert split landed, process_file
+            # always passes pre-computed embeddings so chromadb bypasses
+            # its on-collection EF. Track both sizes to pin that contract.
             self.batch_sizes.append(len(documents))
+            self.embedding_batch_sizes.append(
+                len(embeddings) if embeddings is not None else None
+            )
+
+    def fake_ef(texts):
+        # Single fixed vector per text — value doesn't matter, dimensionality
+        # just needs to be a list-of-floats so chromadb wouldn't reject it.
+        return [[0.0, 0.0, 0.0] for _ in texts]
 
     source = tmp_path / "src.py"
     source.write_text("print('hello')\n" * 20, encoding="utf-8")
@@ -426,6 +438,7 @@ def test_process_file_uses_bounded_upsert_batches(tmp_path, monkeypatch):
     monkeypatch.setattr(miner, "chunk_text", lambda content, source_file: chunks)
     monkeypatch.setattr(miner, "detect_hall", lambda content: "code")
     monkeypatch.setattr(miner, "_extract_entities_for_metadata", lambda content: "")
+    monkeypatch.setattr(embedding, "get_embedding_function", lambda: fake_ef)
 
     drawers, room = miner.process_file(
         source,
@@ -440,6 +453,10 @@ def test_process_file_uses_bounded_upsert_batches(tmp_path, monkeypatch):
     assert drawers == 5
     assert room == "general"
     assert col.batch_sizes == [2, 2, 1]
+    # New contract: embeddings are always pre-computed by the producer
+    # stage and passed through to chromadb, so the per-batch embeddings
+    # list has the same length as the per-batch documents list.
+    assert col.embedding_batch_sizes == [2, 2, 1]
 
 
 # ── normalize_version schema gate ───────────────────────────────────────
@@ -642,7 +659,13 @@ def _make_minable_project(project_root: Path, n_files: int = 3) -> None:
 
 
 def test_mine_keyboard_interrupt_prints_summary_and_exits_130(tmp_path, capsys):
-    """A KeyboardInterrupt mid-loop produces the clean summary + exit 130."""
+    """A KeyboardInterrupt mid-loop produces the clean summary + exit 130.
+
+    _mine_impl drives the producer/consumer pipeline rather than calling
+    process_file in-loop, so we patch _prepare_file (the producer entry
+    point) to raise KI on the second call. workers defaults to 1 for the
+    onnx provider, so the calls are serialized.
+    """
     import pytest
     from unittest.mock import patch
 
@@ -653,13 +676,13 @@ def test_mine_keyboard_interrupt_prints_summary_and_exits_130(tmp_path, capsys):
 
     call_count = {"n": 0}
 
-    def fake_process_file(*args, **kwargs):
+    def fake_prepare(*args, **kwargs):
         call_count["n"] += 1
         if call_count["n"] == 2:
             raise KeyboardInterrupt
-        return (1, "general")
+        return None  # producer-side skip → consumer counts it as files_skipped
 
-    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+    with patch("mempalace.miner._prepare_file", side_effect=fake_prepare):
         with pytest.raises(SystemExit) as exc_info:
             mine(str(project_root), str(palace_path))
 
@@ -685,10 +708,10 @@ def test_mine_keyboard_interrupt_quotes_path_with_spaces_in_resume_hint(tmp_path
     _make_minable_project(project_root, n_files=2)
     palace_path = project_root / "palace"
 
-    def fake_process_file(*args, **kwargs):
+    def fake_prepare(*args, **kwargs):
         raise KeyboardInterrupt
 
-    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+    with patch("mempalace.miner._prepare_file", side_effect=fake_prepare):
         with pytest.raises(SystemExit):
             mine(str(project_root), str(palace_path))
 
@@ -712,12 +735,12 @@ def test_mine_cleans_up_pid_file_on_interrupt(tmp_path):
     pid_file = tmp_path / "mine.pid"
     pid_file.write_text(str(os.getpid()))
 
-    def fake_process_file(*args, **kwargs):
+    def fake_prepare(*args, **kwargs):
         raise KeyboardInterrupt
 
     with (
         patch("mempalace.hooks_cli._MINE_PID_FILE", pid_file),
-        patch("mempalace.miner.process_file", side_effect=fake_process_file),
+        patch("mempalace.miner._prepare_file", side_effect=fake_prepare),
     ):
         with pytest.raises(SystemExit):
             mine(str(project_root), str(palace_path))
