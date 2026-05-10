@@ -45,6 +45,8 @@ import urllib.error
 from datetime import datetime
 from typing import Optional
 
+from .config import MempalaceConfig
+from .parallel import ParallelPipeline, WorkerResult
 from .palace import (
     NORMALIZE_VERSION,
     get_closets_collection,
@@ -197,6 +199,7 @@ def regenerate_closets(
     sample=0,
     dry_run=False,
     cfg: Optional[LLMConfig] = None,
+    workers: Optional[int] = None,
 ):
     """Regenerate closets using a configured LLM for richer topic extraction.
 
@@ -248,7 +251,25 @@ def regenerate_closets(
     total_input = 0
     total_output = 0
 
-    for i, source in enumerate(sources, 1):
+    if dry_run:
+        # Dry-run keeps the serial path — no point parallelizing prints.
+        for i, source in enumerate(sources, 1):
+            data = by_source[source]
+            content = "\n\n".join(data["content"])
+            print(f"  [{i}/{len(sources)}] {os.path.basename(source)} ({len(content)} chars)")
+        print(f"\nDone. {processed} regenerated, {failed} failed.")
+        return {"processed": 0, "failed": 0, "input_tokens": 0, "output_tokens": 0}
+
+    # Resolve worker count: explicit arg → config → asymmetric default
+    # (1 for onnx, 8 for remote). LLM token generation is latency-bound
+    # per request so N concurrent calls translate directly to speedup.
+    if workers is None:
+        workers = MempalaceConfig().workers
+
+    # Producer: call _call_llm for one source. Independent across sources;
+    # LLMConfig is read-only after construction so it's safe to share.
+    def producer(item):
+        idx, source = item
         data = by_source[source]
         content = "\n\n".join(data["content"])
         meta = data["meta"]
@@ -256,42 +277,60 @@ def regenerate_closets(
         r = meta.get("room", "")
         entities = meta.get("entities", "")
 
-        if dry_run:
-            print(f"  [{i}/{len(sources)}] {os.path.basename(source)} ({len(content)} chars)")
-            continue
-
         parsed, usage = _call_llm(cfg, source, w, r, content)
-        if not parsed:
+        return WorkerResult(
+            payload={
+                "parsed": parsed,
+                "usage": usage,
+                "drawer_ids": data["drawer_ids"],
+                "wing": w,
+                "room": r,
+                "entities": entities,
+                "source": source,
+            },
+            item_id=os.path.basename(source),
+            extra={"idx": idx, "total": len(sources)},
+        )
+
+    # Consumer: single-thread. Holds the only references to closets_col
+    # — preserves the HNSW single-writer invariant via the existing
+    # mine_lock(source) plus serial dispatch from this thread.
+    def consumer(result):
+        nonlocal processed, failed, total_input, total_output
+        p = result.payload
+        idx = result.extra["idx"]
+        total = result.extra["total"]
+        if not p["parsed"]:
             failed += 1
-            print(f"  [{i}/{len(sources)}] ✗ {os.path.basename(source)} — LLM failed")
-            continue
+            print(f"  [{idx}/{total}] ✗ {result.item_id} — LLM failed")
+            return
 
-        if usage:
-            total_input += usage.get("prompt_tokens", 0)
-            total_output += usage.get("completion_tokens", 0)
+        if p["usage"]:
+            total_input += p["usage"].get("prompt_tokens", 0)
+            total_output += p["usage"].get("completion_tokens", 0)
 
-        lines = _parsed_to_closet_lines(parsed, data["drawer_ids"], entities)
+        lines = _parsed_to_closet_lines(p["parsed"], p["drawer_ids"], p["entities"])
         # Use os.path.basename so Windows-style paths survive unchanged;
         # the naive split('/') would leave a bare path component on Windows
         # and collide across different files under different drives.
-        closet_id_base = f"closet_{w}_{r}_{os.path.basename(source)[:30]}"
+        closet_id_base = f"closet_{p['wing']}_{p['room']}_{os.path.basename(p['source'])[:30]}"
 
         # Serialize with concurrent mine operations on the same source —
         # otherwise a regex closet rebuild mid-regenerate races with our
         # purge+upsert cycle and leaves mixed regex/LLM lines.
-        with mine_lock(source):
-            purge_file_closets(closets_col, source)
+        with mine_lock(p["source"]):
+            purge_file_closets(closets_col, p["source"])
             upsert_closet_lines(
                 closets_col,
                 closet_id_base,
                 lines,
                 {
-                    "wing": w,
-                    "room": r,
-                    "source_file": source,
+                    "wing": p["wing"],
+                    "room": p["room"],
+                    "source_file": p["source"],
                     "generated_by": f"llm:{cfg.model}",
                     "filed_at": datetime.now().isoformat(),
-                    "entities": entities,
+                    "entities": p["entities"],
                     # Stamp so the miner's stale-drawer gate doesn't treat
                     # LLM closets as leftovers and rebuild over them next run.
                     "normalize_version": NORMALIZE_VERSION,
@@ -299,8 +338,25 @@ def regenerate_closets(
             )
 
         processed += 1
-        n_topics = len(parsed.get("topics", []))
-        print(f"  [{i}/{len(sources)}] ✓ {os.path.basename(source)} — {n_topics} topics")
+        n_topics = len(p["parsed"].get("topics", []))
+        print(f"  [{idx}/{total}] ✓ {result.item_id} — {n_topics} topics")
+
+    def on_error(failed_result):
+        nonlocal failed
+        failed += 1
+        print(
+            f"  ✗ {failed_result.item_id} — {type(failed_result.exception).__name__}: "
+            f"{failed_result.exception}"
+        )
+
+    pipeline = ParallelPipeline(
+        producer_fn=producer,
+        consumer_fn=consumer,
+        workers=workers,
+        queue_size=max(workers * 2, 4),
+        on_error=on_error,
+    )
+    pipeline.run(list(enumerate(sources, 1)))
 
     print(f"\nDone. {processed} regenerated, {failed} failed.")
     if total_input or total_output:
