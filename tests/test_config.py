@@ -494,3 +494,124 @@ def test_kg_value_rejects_null_bytes():
 def test_kg_value_rejects_over_length():
     with pytest.raises(ValueError):
         sanitize_kg_value("a" * 129)
+
+
+# --- llm_provider / llm_model / llm_endpoint / llm_api_key --------------------
+#
+# Mirror the env > file > default pattern that embedding_provider ships with.
+# Defaults must match historical CLI behavior (ollama / gemma4:e4b / None)
+# so this layer is non-breaking.
+
+
+def _clear_llm_env(monkeypatch):
+    for var in (
+        "MEMPALACE_LLM_PROVIDER",
+        "MEMPALACE_LLM_MODEL",
+        "MEMPALACE_LLM_ENDPOINT",
+        "MEMPALACE_LLM_API_KEY",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_llm_provider_defaults_to_ollama(monkeypatch):
+    _clear_llm_env(monkeypatch)
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.llm_provider == "ollama"
+
+
+def test_llm_provider_from_config_is_normalized(tmp_path, monkeypatch):
+    _clear_llm_env(monkeypatch)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"llm_provider": "  Openai-Compat  "}, f)
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.llm_provider == "openai-compat"
+
+
+def test_llm_provider_env_overrides_config(tmp_path, monkeypatch):
+    _clear_llm_env(monkeypatch)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"llm_provider": "ollama"}, f)
+    monkeypatch.setenv("MEMPALACE_LLM_PROVIDER", "  Anthropic  ")
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.llm_provider == "anthropic"
+
+
+def test_llm_model_defaults_to_gemma4(monkeypatch):
+    _clear_llm_env(monkeypatch)
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.llm_model == "gemma4:e4b"
+
+
+def test_llm_model_from_config(tmp_path, monkeypatch):
+    _clear_llm_env(monkeypatch)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"llm_model": "  qwen2.5-coder:14b  "}, f)
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.llm_model == "qwen2.5-coder:14b"
+
+
+def test_llm_model_env_overrides_config(tmp_path, monkeypatch):
+    _clear_llm_env(monkeypatch)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"llm_model": "gemma4:e4b"}, f)
+    monkeypatch.setenv("MEMPALACE_LLM_MODEL", "qwen2.5:14b")
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.llm_model == "qwen2.5:14b"
+
+
+def test_llm_endpoint_defaults_to_none(monkeypatch):
+    _clear_llm_env(monkeypatch)
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.llm_endpoint is None
+
+
+def test_llm_endpoint_from_config_strips_trailing_slash(tmp_path, monkeypatch):
+    _clear_llm_env(monkeypatch)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"llm_endpoint": "http://192.168.1.147:8001/"}, f)
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.llm_endpoint == "http://192.168.1.147:8001"
+
+
+def test_llm_endpoint_env_overrides_config(tmp_path, monkeypatch):
+    _clear_llm_env(monkeypatch)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"llm_endpoint": "http://localhost:11434"}, f)
+    monkeypatch.setenv("MEMPALACE_LLM_ENDPOINT", "http://192.168.1.147:8001/")
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.llm_endpoint == "http://192.168.1.147:8001"
+
+
+def test_llm_api_key_defaults_to_none(monkeypatch):
+    _clear_llm_env(monkeypatch)
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.llm_api_key is None
+
+
+def test_llm_api_key_from_env(monkeypatch):
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setenv("MEMPALACE_LLM_API_KEY", "  sk-test-12345  ")
+
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.llm_api_key == "sk-test-12345"
+
+
+def test_llm_api_key_does_not_read_from_file(tmp_path, monkeypatch):
+    """API keys must NEVER be loaded from config.json — env-only.
+
+    Mirrors how ANTHROPIC_API_KEY / OPENAI_API_KEY are scoped in
+    mempalace.llm_client. Persisting keys in a world-readable config file
+    is a footgun we explicitly refuse.
+    """
+    _clear_llm_env(monkeypatch)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"llm_api_key": "sk-should-be-ignored"}, f)
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    assert cfg.llm_api_key is None
