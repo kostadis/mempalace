@@ -1,12 +1,22 @@
 """Embedding function factory with hardware acceleration.
 
-Returns a ChromaDB-compatible embedding function bound to a user-selected
-ONNX Runtime execution provider. The same ``all-MiniLM-L6-v2`` model and
-384-dim vectors ChromaDB ships by default are reused, so switching device
-does not invalidate existing palaces.
+Returns a ChromaDB-compatible embedding function. Two providers are
+supported, selected by ``MempalaceConfig.embedding_provider``:
 
-Supported devices (env ``MEMPALACE_EMBEDDING_DEVICE`` or ``embedding_device``
-in ``~/.mempalace/config.json``):
+* ``onnx`` (default) — local ``all-MiniLM-L6-v2`` via ONNX Runtime, 384-dim,
+  matches ChromaDB's library default so palaces created with the default EF
+  remain readable. Hardware device selected by
+  :attr:`MempalaceConfig.embedding_device` (auto/cpu/cuda/coreml/dml).
+* ``ollama`` — remote (or local) Ollama HTTP endpoint, model and dimension
+  chosen by :attr:`MempalaceConfig.embedding_model`. Useful for offloading
+  embedding work to a separate GPU box. See ``embedding_ollama.py``.
+
+Switching providers (or models within the Ollama provider) requires wiping
+and re-mining the palace: vectors at one dimension cannot be queried by an
+EF that produces a different dimension.
+
+Supported ``embedding_device`` values for the ONNX provider (env
+``MEMPALACE_EMBEDDING_DEVICE`` or config key):
 
 * ``auto`` — prefer CUDA ▸ CoreML ▸ DirectML, fall back to CPU
 * ``cpu`` — force CPU (the historical default)
@@ -116,20 +126,87 @@ def _build_ef_class():
     return _MempalaceONNX
 
 
+def _build_ollama_ef(model: str, endpoint: str):
+    """Construct an :class:`OllamaEmbeddingFunction`. Lazy import keeps
+    ``mempalace.embedding`` loadable on machines that do not have the
+    Ollama module installed (it is in-tree, but the import still pulls
+    chromadb which we want to keep optional at import time)."""
+    from .embedding_ollama import OllamaEmbeddingFunction
+
+    return OllamaEmbeddingFunction(model=model, endpoint=endpoint)
+
+
+def _build_openai_compat_ef(model: str, endpoint: str):
+    """Construct an :class:`OpenAICompatEmbeddingFunction`. Same lazy-import
+    pattern as the Ollama builder."""
+    from .embedding_openai import OpenAICompatEmbeddingFunction
+
+    return OpenAICompatEmbeddingFunction(model=model, endpoint=endpoint)
+
+
 def get_embedding_function(device: Optional[str] = None):
-    """Return a cached embedding function bound to the requested device.
+    """Return a cached embedding function for the configured provider.
 
-    ``device=None`` reads from :class:`MempalaceConfig.embedding_device`.
-    The returned function is shared across calls with the same resolved
-    provider list so we only pay model-load cost once per process.
+    Provider is read from :attr:`MempalaceConfig.embedding_provider`:
+
+    * ``onnx`` — local ONNX MiniLM EF on the requested ``device``
+      (``device=None`` falls back to ``MempalaceConfig.embedding_device``).
+    * ``ollama`` — :class:`OllamaEmbeddingFunction` (``/api/embed`` shape)
+      with model/endpoint from config; the ``device`` parameter is ignored.
+    * ``openai-compat`` — :class:`OpenAICompatEmbeddingFunction`
+      (``/v1/embeddings`` shape — vLLM, LM Studio, OpenAI, etc.) with
+      model/endpoint from config; ``device`` ignored.
+
+    The returned function is cached per (provider, key) so we only pay
+    model-load cost once per process.
     """
-    if device is None:
-        from .config import MempalaceConfig
+    from .config import MempalaceConfig
 
-        device = MempalaceConfig().embedding_device
+    config = MempalaceConfig()
+    provider = config.embedding_provider
+
+    if provider == "ollama":
+        model = config.embedding_model
+        endpoint = config.embedding_endpoint
+        cache_key = ("ollama", endpoint, model)
+        cached = _EF_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        ef = _build_ollama_ef(model=model, endpoint=endpoint)
+        _EF_CACHE[cache_key] = ef
+        logger.info(
+            "Embedding function initialized (provider=ollama model=%s endpoint=%s)",
+            model,
+            endpoint,
+        )
+        return ef
+
+    if provider == "openai-compat":
+        model = config.embedding_model
+        endpoint = config.embedding_endpoint
+        cache_key = ("openai-compat", endpoint, model)
+        cached = _EF_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        ef = _build_openai_compat_ef(model=model, endpoint=endpoint)
+        _EF_CACHE[cache_key] = ef
+        logger.info(
+            "Embedding function initialized (provider=openai-compat model=%s endpoint=%s)",
+            model,
+            endpoint,
+        )
+        return ef
+
+    if provider != "onnx":
+        if provider not in _WARNED:
+            logger.warning("Unknown embedding_provider %r — falling back to onnx", provider)
+            _WARNED.add(provider)
+
+    if device is None:
+        device = config.embedding_device
 
     providers, effective = _resolve_providers(device)
-    cache_key = tuple(providers)
+    cache_key = ("onnx", tuple(providers))
     cached = _EF_CACHE.get(cache_key)
     if cached is not None:
         return cached
@@ -142,14 +219,25 @@ def get_embedding_function(device: Optional[str] = None):
 
 
 def describe_device(device: Optional[str] = None) -> str:
-    """Return a short human-readable label for the resolved device.
+    """Return a short human-readable label for the active embedding setup.
 
-    Used by the miner CLI header so users can see at a glance whether GPU
-    acceleration actually engaged.
+    Used by the miner CLI header so users can see at a glance which
+    provider/device is doing the work.
+
+    Format:
+      * onnx provider          → ``"cpu"`` / ``"cuda"`` / ``"coreml"`` / ``"dml"``
+      * ollama provider        → ``"ollama:{model} @ {endpoint}"``
+      * openai-compat provider → ``"openai-compat:{model} @ {endpoint}"``
     """
-    if device is None:
-        from .config import MempalaceConfig
+    from .config import MempalaceConfig
 
-        device = MempalaceConfig().embedding_device
+    config = MempalaceConfig()
+    if config.embedding_provider == "ollama":
+        return f"ollama:{config.embedding_model} @ {config.embedding_endpoint}"
+    if config.embedding_provider == "openai-compat":
+        return f"openai-compat:{config.embedding_model} @ {config.embedding_endpoint}"
+
+    if device is None:
+        device = config.embedding_device
     _, effective = _resolve_providers(device)
     return effective
