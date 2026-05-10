@@ -554,6 +554,83 @@ class MempalaceConfig:
         return str(self._file_config.get("embedding_device", "auto")).strip().lower()
 
     @property
+    def embedding_provider(self):
+        """Which embedding backend to use.
+
+        Values:
+          * ``"onnx"`` (default) — local ONNX MiniLM, 384-dim.
+          * ``"ollama"`` — Ollama ``/api/embed`` HTTP shape; model and dim
+            chosen by :attr:`embedding_model`.
+          * ``"openai-compat"`` — OpenAI ``/v1/embeddings`` shape (vLLM,
+            LM Studio, Together, OpenAI itself, etc.); model and dim
+            chosen by :attr:`embedding_model`.
+
+        Switching providers is a destructive operation: existing palaces hold
+        vectors at the old provider's dimensionality, and the EF identity is
+        persisted on each collection. After flipping this setting, wipe the
+        palace and re-mine.
+
+        Read priority: env ``MEMPALACE_EMBEDDING_PROVIDER`` first, then the
+        ``embedding_provider`` key in ``config.json``, then ``"onnx"``.
+        """
+        env_val = os.environ.get("MEMPALACE_EMBEDDING_PROVIDER")
+        if env_val:
+            return env_val.strip().lower()
+        return str(self._file_config.get("embedding_provider", "onnx")).strip().lower()
+
+    @property
+    def embedding_model(self):
+        """Model name for remote embedding providers.
+
+        Ignored when :attr:`embedding_provider` is ``"onnx"`` (the ONNX path
+        is hardcoded to ``all-MiniLM-L6-v2`` for ChromaDB-default
+        compatibility — see ``mempalace.embedding._build_ef_class``).
+
+        Default for Ollama: ``"nomic-embed-text"`` (768-dim, strong general
+        retrieval). Read priority: env ``MEMPALACE_EMBEDDING_MODEL`` first,
+        then the ``embedding_model`` key in ``config.json``, then the
+        provider-specific default.
+        """
+        env_val = os.environ.get("MEMPALACE_EMBEDDING_MODEL")
+        if env_val:
+            return env_val.strip()
+        cfg_val = self._file_config.get("embedding_model")
+        if cfg_val:
+            return str(cfg_val).strip()
+        provider = self.embedding_provider
+        if provider == "ollama":
+            return "nomic-embed-text"
+        if provider == "openai-compat":
+            return "nomic-ai/nomic-embed-text-v1.5"
+        return ""
+
+    @property
+    def embedding_endpoint(self):
+        """Endpoint URL for remote embedding providers.
+
+        Ignored when :attr:`embedding_provider` is ``"onnx"``.
+
+        Default for Ollama: ``"http://localhost:11434"``. Set to a Tailscale
+        / LAN address (e.g. ``http://192.168.1.147:11434``) to offload
+        embedding to a GPU box like a DGX Spark while keeping the rest of
+        MemPalace local. Read priority: env ``MEMPALACE_EMBEDDING_ENDPOINT``
+        first, then the ``embedding_endpoint`` key in ``config.json``, then
+        the provider-specific default.
+        """
+        env_val = os.environ.get("MEMPALACE_EMBEDDING_ENDPOINT")
+        if env_val:
+            return env_val.strip().rstrip("/")
+        cfg_val = self._file_config.get("embedding_endpoint")
+        if cfg_val:
+            return str(cfg_val).strip().rstrip("/")
+        provider = self.embedding_provider
+        if provider == "ollama":
+            return "http://localhost:11434"
+        if provider == "openai-compat":
+            return "http://localhost:8000"
+        return ""
+
+    @property
     def topic_tunnel_min_count(self):
         """Minimum number of overlapping confirmed topics required to create
         a cross-wing tunnel between two wings.
