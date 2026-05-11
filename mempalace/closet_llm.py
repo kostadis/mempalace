@@ -224,17 +224,27 @@ def regenerate_closets(
         print("No drawers in palace.")
         return {"processed": 0}
 
-    all_data = drawers_col.get(limit=total, include=["documents", "metadatas"])
+    # Page through drawers — chromadb's SQLite backend errors with "too many
+    # SQL variables" when limit exceeds ~32K (the SQLITE_MAX_VARIABLE_NUMBER
+    # parameter limit), so we can't load everything in one call on large
+    # palaces. 10K per page keeps us well under the limit.
     by_source = {}
-    for doc_id, doc, meta in zip(all_data["ids"], all_data["documents"], all_data["metadatas"]):
-        source = meta.get("source_file", "unknown")
-        w = meta.get("wing", "")
-        if wing and w != wing:
-            continue
-        if source not in by_source:
-            by_source[source] = {"drawer_ids": [], "content": [], "meta": meta}
-        by_source[source]["drawer_ids"].append(doc_id)
-        by_source[source]["content"].append(doc)
+    PAGE = 10000
+    offset = 0
+    while offset < total:
+        page = drawers_col.get(
+            limit=PAGE, offset=offset, include=["documents", "metadatas"]
+        )
+        for doc_id, doc, meta in zip(page["ids"], page["documents"], page["metadatas"]):
+            source = meta.get("source_file", "unknown")
+            w = meta.get("wing", "")
+            if wing and w != wing:
+                continue
+            if source not in by_source:
+                by_source[source] = {"drawer_ids": [], "content": [], "meta": meta}
+            by_source[source]["drawer_ids"].append(doc_id)
+            by_source[source]["content"].append(doc)
+        offset += PAGE
 
     sources = list(by_source.keys())
     if sample > 0:
