@@ -3,7 +3,9 @@
 import contextlib
 
 from mempalace.convo_miner import (
-    _file_chunks_locked,
+    _ConvoBatch,
+    _PreparedConvo,
+    _write_prepared_convo,
     chunk_exchanges,
     detect_convo_room,
     scan_convos,
@@ -116,34 +118,146 @@ class TestScanConvos:
         assert files == []
 
 
-class TestFileChunksLocked:
+class TestWritePreparedConvo:
+    """The post-refactor equivalent of the old _file_chunks_locked test.
+
+    Convo mining is now split into _prepare_convo (file IO + chunk + build
+    IDs/metadata) and _write_prepared_convo (single-writer chromadb upsert
+    with pre-computed embeddings). This test pins the batching invariant
+    end-to-end on the write phase.
+    """
+
     def test_uses_bounded_upsert_batches(self, monkeypatch):
         import mempalace.convo_miner as convo_miner
 
         class FakeCol:
             def __init__(self):
                 self.batch_sizes = []
+                self.embedding_batch_sizes = []
 
             def delete(self, *args, **kwargs):
                 pass
 
-            def upsert(self, documents, ids, metadatas):
+            def upsert(self, documents, ids, metadatas, embeddings=None):
                 self.batch_sizes.append(len(documents))
+                self.embedding_batch_sizes.append(
+                    len(embeddings) if embeddings is not None else None
+                )
 
-        chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(5)]
-        col = FakeCol()
-        monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
         monkeypatch.setattr(
             convo_miner, "file_already_mined", lambda collection, source_file: False
         )
         monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
-        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
 
-        drawers, room_counts, skipped = _file_chunks_locked(
-            col, "chat.txt", chunks, "wing", "general", "agent", "exchange"
+        # Build a prepared convo by hand with 5 chunks split across 3
+        # batches of sizes [2, 2, 1]. Mirrors what _prepare_convo would
+        # have produced with DRAWER_UPSERT_BATCH_SIZE=2.
+        batches = [
+            _ConvoBatch(
+                documents=["chunk 0 " * 20, "chunk 1 " * 20],
+                ids=["d0", "d1"],
+                metadatas=[{"wing": "wing", "room": "general"}, {"wing": "wing", "room": "general"}],
+                rooms=["general", "general"],
+            ),
+            _ConvoBatch(
+                documents=["chunk 2 " * 20, "chunk 3 " * 20],
+                ids=["d2", "d3"],
+                metadatas=[{"wing": "wing", "room": "general"}, {"wing": "wing", "room": "general"}],
+                rooms=["general", "general"],
+            ),
+            _ConvoBatch(
+                documents=["chunk 4 " * 20],
+                ids=["d4"],
+                metadatas=[{"wing": "wing", "room": "general"}],
+                rooms=["general"],
+            ),
+        ]
+        prepared = _PreparedConvo(
+            source_file="chat.txt",
+            chunks=[{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(5)],
+            room="general",
+            extract_mode="exchange",
+            batches=batches,
+        )
+        # Pre-computed embeddings — one fixed vector per chunk; chromadb
+        # would skip its EF when these are passed.
+        embeddings_batches = [
+            [[0.0, 0.0, 0.0] for _ in batch.documents] for batch in batches
+        ]
+
+        col = FakeCol()
+        drawers, room_counts, skipped = _write_prepared_convo(
+            prepared, embeddings_batches, col, "wing"
         )
 
         assert drawers == 5
-        assert dict(room_counts) == {}
+        assert dict(room_counts) == {}  # exchange mode → no per-chunk room delta
         assert skipped is False
         assert col.batch_sizes == [2, 2, 1]
+        # New contract: pre-computed embeddings always flow through to chromadb.
+        assert col.embedding_batch_sizes == [2, 2, 1]
+
+
+class TestMineConvosWorkersPlumbing:
+    """Pin the --workers plumbing without spinning up chromadb.
+
+    Heavier integration (real palace, real drawer counts) lives in
+    test_convo_miner.py. This is just "the flag reaches the pipeline".
+    """
+
+    def test_workers_argument_reaches_pipeline(self, tmp_path, monkeypatch):
+        import mempalace.convo_miner as convo_miner
+        from mempalace.parallel import ParallelPipeline
+
+        # Make scan find one file with enough content to chunk.
+        (tmp_path / "chat.txt").write_text(
+            "> hi\n" + ("This is a long enough response. " * 20) + "\n", encoding="utf-8"
+        )
+
+        captured = {}
+
+        class SpyPipeline(ParallelPipeline):
+            def __init__(self, *args, **kwargs):
+                captured["workers"] = kwargs.get("workers")
+                super().__init__(*args, **kwargs)
+
+        monkeypatch.setattr(convo_miner, "ParallelPipeline", SpyPipeline)
+
+        # Patch out the real collection writer so we don't need chromadb.
+        class FakeCol:
+            def get(self, *args, **kwargs):
+                return {"ids": []}
+
+            def delete(self, *args, **kwargs):
+                pass
+
+            def upsert(self, **kwargs):
+                pass
+
+        monkeypatch.setattr(convo_miner, "get_collection", lambda palace_path: FakeCol())
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file: False
+        )
+
+        # Stub the embedding function — convo_miner imports it lazily
+        # inside mine_convos, so we patch the source module.
+        from mempalace import embedding
+
+        class StubEF:
+            @staticmethod
+            def name():
+                return "stub"
+
+            def __call__(self, texts):
+                return [[0.0, 0.0, 0.0] for _ in texts]
+
+        monkeypatch.setattr(embedding, "get_embedding_function", lambda: StubEF())
+
+        convo_miner.mine_convos(
+            convo_dir=str(tmp_path),
+            palace_path=str(tmp_path / "palace"),
+            wing="testwing",
+            workers=4,
+        )
+
+        assert captured["workers"] == 4
