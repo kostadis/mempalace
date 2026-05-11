@@ -87,6 +87,55 @@ class TestParsedToLines:
         lines = _parsed_to_closet_lines(parsed, ["d1"], "")
         assert len(lines) == 15
 
+    def test_index_sentences_become_pointers(self):
+        """The new prose format: sentences embed and BM25-tokenize naturally."""
+        parsed = {
+            "index_sentences": [
+                "The rpg_retriever module orchestrates a tiered retrieval pipeline.",
+                "It queries mem-palace, 5etools, and rpg-library as ranked sources.",
+            ],
+            "quotes": [],
+            "summary": "",
+        }
+        lines = _parsed_to_closet_lines(parsed, ["d1", "d2"], "Alice;Bob")
+        assert len(lines) == 2
+        assert any("tiered retrieval pipeline" in line for line in lines)
+        assert any("ranked sources" in line for line in lines)
+        # Line format preserved
+        assert all("|Alice;Bob|→d1,d2" in line for line in lines)
+
+    def test_index_sentences_take_precedence_over_topics(self):
+        """When both are present, prefer the prose format."""
+        parsed = {
+            "index_sentences": ["A prose sentence about the document."],
+            "topics": ["legacy-topic-tag"],
+            "quotes": [],
+            "summary": "",
+        }
+        lines = _parsed_to_closet_lines(parsed, ["d1"], "")
+        # Only the sentence; the legacy topic must NOT appear.
+        assert len(lines) == 1
+        assert "prose sentence" in lines[0]
+        assert "legacy-topic-tag" not in lines[0]
+
+    def test_caps_sentence_length_to_avoid_runaway(self):
+        """Very long sentences get truncated so one closet row stays bounded."""
+        long_sentence = "word " * 200  # 1000 chars
+        parsed = {"index_sentences": [long_sentence], "quotes": [], "summary": ""}
+        lines = _parsed_to_closet_lines(parsed, ["d1"], "")
+        # Cap is 280 chars for the sentence portion, plus the "|...|→d1" tail
+        first_pipe = lines[0].index("|")
+        assert first_pipe <= 280
+
+    def test_skips_empty_sentences(self):
+        parsed = {
+            "index_sentences": ["A real sentence.", "", "   ", "Another real one."],
+            "quotes": [],
+            "summary": "",
+        }
+        lines = _parsed_to_closet_lines(parsed, ["d1"], "")
+        assert len(lines) == 2
+
 
 # ── _call_llm (HTTP mocked) ──────────────────────────────────────────────
 
