@@ -58,7 +58,11 @@ from .palace import (
 
 MAX_CONTENT_CHARS = 30000
 MAX_OUTPUT_TOKENS = 1500
-HTTP_TIMEOUT_S = 60
+# Long enough to ride out vLLM/Ollama queue backlog under high concurrency.
+# At workers=8-16 and a real palace (~900 sources), the server queue can hold
+# 10+ items behind a big prefill; previous 60s gave up before vLLM got to the
+# request and recorded a false "LLM failed". Override via env if needed.
+HTTP_TIMEOUT_S = int(os.environ.get("MEMPALACE_LLM_HTTP_TIMEOUT_S", "600"))
 
 PROMPT_TEMPLATE = """You are reading content filed in a memory palace. Generate a
 topic-dense index that will be used to find this content later when someone searches.
