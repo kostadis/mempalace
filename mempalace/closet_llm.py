@@ -64,8 +64,11 @@ MAX_OUTPUT_TOKENS = 1500
 # request and recorded a false "LLM failed". Override via env if needed.
 HTTP_TIMEOUT_S = int(os.environ.get("MEMPALACE_LLM_HTTP_TIMEOUT_S", "600"))
 
-PROMPT_TEMPLATE = """You are reading content filed in a memory palace. Generate a
-topic-dense index that will be used to find this content later when someone searches.
+PROMPT_TEMPLATE = """You are reading content filed in a memory palace. Generate
+an index of natural-language sentences that someone searching for this content
+would naturally type. Each sentence will be independently embedded and
+keyword-indexed, so write them so a future query like "how does X work" or
+"what is Y" would lexically and semantically match one of them.
 
 Source: {source_file}
 Wing: {wing} | Room: {room}
@@ -78,15 +81,24 @@ CONTENT:
 Output a JSON object with EXACTLY these fields:
 
 {{
-  "topics": ["distinctive_word_or_phrase_1", "topic_2", ...],
+  "index_sentences": [
+    "A complete sentence about one searchable aspect of this content.",
+    "Another sentence about a different aspect — full sentence, with verbs.",
+    "Sentences stand alone. They will be searched independently."
+  ],
   "quotes": ["[Speaker] verbatim quote", ...],
   "summary": "2-3 sentences describing what this content is about."
 }}
 
 RULES:
-- Topics: 8-15 entries. Include proper nouns (names, places, projects),
-  distinctive technical terms, and key concepts. NOT generic words like
-  "conversation" or "discussion".
+- index_sentences: 8-15 entries. Each MUST be a complete sentence with a
+  subject and a verb, using natural spaces between words. NEVER produce
+  hyphen-glued compound tokens like "tiered-retrieval-pipeline" — write
+  "the tiered retrieval pipeline" with real spaces. Mention proper nouns
+  (names, places, projects) and distinctive technical concepts.
+- Bad (DO NOT DO THIS): "rpg-retriever|fivetools|tiered-retrieval"
+- Good: "The rpg_retriever module orchestrates a tiered retrieval pipeline
+  over mem-palace, 5etools, and rpg-library sources."
 - Quotes: 2-5 entries. EXACT verbatim from the content, not paraphrased.
   Attribute with [Speaker] prefix if speaker is identifiable.
 - Summary: mention WHO, WHAT, and WHY. No filler.
@@ -182,17 +194,36 @@ def _call_llm(cfg: LLMConfig, source_file: str, wing: str, room: str, content: s
 
 
 def _parsed_to_closet_lines(parsed, drawer_ids, entities_str):
-    """Convert LLM's JSON output to closet pointer lines."""
+    """Convert LLM's JSON output to closet pointer lines.
+
+    Each closet line is a single natural-language sentence in the first
+    column. The sentence is what gets embedded + BM25-indexed for search,
+    so it MUST read as prose, not as a tag chain. The LLM prompt asks for
+    ``index_sentences`` for this reason; we also accept a legacy ``topics``
+    field for backward compatibility with closets generated before the
+    prose-format change, treating each topic as a degenerate single-token
+    sentence (those will under-index but won't crash).
+    """
     lines = []
     drawer_ref = ",".join(drawer_ids[:3])
 
-    for topic in parsed.get("topics", [])[:15]:
-        lines.append(f"{topic}|{entities_str}|→{drawer_ref}")
+    sentences = parsed.get("index_sentences") or parsed.get("topics") or []
+    for sentence in sentences[:15]:
+        s = str(sentence).strip()
+        if not s:
+            continue
+        # Cap line length to keep one closet row reasonable for embed/BM25.
+        # Sentences are typically 80-160 chars; cap at 280 to keep room for
+        # a long descriptive sentence without runaway.
+        lines.append(f"{s[:280]}|{entities_str}|→{drawer_ref}")
     for quote in parsed.get("quotes", [])[:5]:
-        lines.append(f"{quote}|{entities_str}|→{drawer_ref}")
+        q = str(quote).strip()
+        if not q:
+            continue
+        lines.append(f"{q[:280]}|{entities_str}|→{drawer_ref}")
     summary = parsed.get("summary", "")
     if summary:
-        lines.append(f"{summary[:200]}|{entities_str}|→{drawer_ref}")
+        lines.append(f"{str(summary).strip()[:280]}|{entities_str}|→{drawer_ref}")
 
     return lines
 
