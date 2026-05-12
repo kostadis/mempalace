@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 from typing import Iterable, Iterator
 
@@ -65,6 +66,21 @@ AAAK_VERSION = 1
 # indices are slightly larger because they have to cover more territory.
 ROOM_INDEX_TOP_N = 100
 WING_INDEX_TOP_N = 200
+
+# Hard cap on the character length of the rendered index document body
+# before upsert into the *_indices collections. The embedding model
+# enforces its own token limit (nomic-embed-text-v1.5 = 2048 tokens).
+#
+# Why 3000 chars not 6000: closet lines have the shape
+#   "<prose>|<entities>|→<drawer_id>,<drawer_id>,..."
+# The drawer-ID tails tokenize *much* denser than prose (long
+# alphanumeric SHA prefixes split into many tokens each). Empirically a
+# 6000-char doc tokenizes to 2049+ tokens, blowing past nomic's 2K
+# limit. 3000 chars gives roughly 1.4× safety margin under the cap.
+#
+# Override via env for embedders with larger context (e.g., bge-m3 at
+# 8K supports ~24000 chars).
+INDEX_DOC_MAX_CHARS = int(os.environ.get("MEMPALACE_INDEX_DOC_MAX_CHARS", "3000"))
 
 # Paginate through the Chroma collection this many rows at a time. Keeps
 # the O(n) scan honest on large palaces; without explicit pagination
@@ -212,7 +228,18 @@ def build_room_index(
     entity_fields = [m.get("top_entities", "") if isinstance(m, dict) else "" for m in metas]
     top_entities = aggregate_entity_sets(entity_fields, n=_TOP_ENTITIES_PER_ROOM)
 
-    kept_lines = [line for line, _count in projected]
+    # Cap the rendered doc to INDEX_DOC_MAX_CHARS — the embedding model's
+    # token limit (default nomic 2K) is enforced server-side, so we drop
+    # the lowest-ranked lines if they'd push us over. project_closet_lines
+    # is rank-ordered so trailing lines are the ones to lose.
+    kept_lines = []
+    running_chars = 0
+    for line, _count in projected:
+        line_len = len(line) + 1  # +1 for the joining newline
+        if kept_lines and running_chars + line_len > INDEX_DOC_MAX_CHARS:
+            break
+        kept_lines.append(line)
+        running_chars += line_len
     doc_text = "\n".join(kept_lines) if kept_lines else ""
 
     drawer_ids: set = set()
@@ -328,7 +355,17 @@ def build_wing_index(
     entity_fields = [m.get("top_entities", "") if isinstance(m, dict) else "" for m in metas]
     top_entities = aggregate_entity_sets(entity_fields, n=_TOP_ENTITIES_PER_WING)
 
-    kept_lines = [line for line, _count in projected]
+    # See INDEX_DOC_MAX_CHARS comment above; same cap applies to wing
+    # indices, which can be even larger than room indices because they
+    # aggregate every room in the wing.
+    kept_lines = []
+    running_chars = 0
+    for line, _count in projected:
+        line_len = len(line) + 1
+        if kept_lines and running_chars + line_len > INDEX_DOC_MAX_CHARS:
+            break
+        kept_lines.append(line)
+        running_chars += line_len
     doc_text = "\n".join(kept_lines) if kept_lines else ""
     top_entity_str = ";".join(e for e, _c in top_entities)
 
