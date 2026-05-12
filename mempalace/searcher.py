@@ -673,8 +673,10 @@ def search_within(
     # closet distances cluster in 1.2-1.5 range regardless of match quality.
     CLOSET_RANK_BOOSTS = [0.40, 0.25, 0.15, 0.08, 0.04]
     CLOSET_DISTANCE_CAP = 1.5  # cosine dist > 1.5 = too weak to use as signal
+    SEED_DRAWERS_PER_SOURCE = 2  # seed at most N drawers from a closet-tagged file
 
     scored: list = []
+    sources_in_scored: set = set()
     for drawer_id, doc, meta, dist in zip(
         _first_or_empty(drawer_results, "ids"),
         _first_or_empty(drawer_results, "documents"),
@@ -726,6 +728,69 @@ def search_within(
         if closet_preview:
             entry["closet_preview"] = closet_preview
         scored.append(entry)
+        if source:
+            sources_in_scored.add(source)
+
+    # Closet-seeded candidates: when a closet ranks a file high but none of
+    # that file's drawers made the initial top-(n*3) drawer-vector cut, the
+    # rank boost has nothing to attach to and the file silently disappears.
+    # Pull those drawers in explicitly so the boost can apply.
+    #
+    # Bounded by:
+    #   - only closet hits at rank < len(CLOSET_RANK_BOOSTS) (top 5)
+    #   - only closet hits within the distance cap (1.5)
+    #   - only sources not already represented in scored
+    #   - at most SEED_DRAWERS_PER_SOURCE drawers per seeded source
+    for source, (c_rank, c_dist, c_preview) in closet_boost_by_source.items():
+        if not source or source in sources_in_scored:
+            continue
+        if c_dist > CLOSET_DISTANCE_CAP or c_rank >= len(CLOSET_RANK_BOOSTS):
+            continue
+        if where:
+            seed_where = {"$and": [where, {"source_file": source}]}
+        else:
+            seed_where = {"source_file": source}
+        try:
+            seed_results = drawers_col.query(
+                query_texts=[query],
+                n_results=SEED_DRAWERS_PER_SOURCE,
+                where=seed_where,
+                include=["documents", "metadatas", "distances"],
+            )
+        except Exception:
+            continue
+        boost = CLOSET_RANK_BOOSTS[c_rank]
+        for seed_id, seed_doc, seed_meta, seed_dist in zip(
+            _first_or_empty(seed_results, "ids"),
+            _first_or_empty(seed_results, "documents"),
+            _first_or_empty(seed_results, "metadatas"),
+            _first_or_empty(seed_results, "distances"),
+        ):
+            if max_distance > 0.0 and seed_dist > max_distance:
+                continue
+            if id_set is not None and seed_id not in id_set:
+                continue
+            seed_meta = seed_meta or {}
+            effective_dist = seed_dist - boost
+            scored.append(
+                {
+                    "drawer_id": seed_id,
+                    "text": seed_doc,
+                    "wing": seed_meta.get("wing", "unknown"),
+                    "room": seed_meta.get("room", "unknown"),
+                    "source_file": Path(source).name if source else "?",
+                    "created_at": seed_meta.get("filed_at", "unknown"),
+                    "similarity": round(max(0.0, 1 - effective_dist), 3),
+                    "distance": round(seed_dist, 4),
+                    "effective_distance": round(effective_dist, 4),
+                    "closet_boost": round(boost, 3),
+                    "matched_via": "closet_seed",
+                    "closet_preview": c_preview,
+                    "_sort_key": effective_dist,
+                    "_source_file_full": source,
+                    "_chunk_index": seed_meta.get("chunk_index"),
+                }
+            )
 
     scored.sort(key=lambda h: h["_sort_key"])
     hits = scored[:n_results]
