@@ -64,11 +64,13 @@ MAX_OUTPUT_TOKENS = 1500
 # request and recorded a false "LLM failed". Override via env if needed.
 HTTP_TIMEOUT_S = int(os.environ.get("MEMPALACE_LLM_HTTP_TIMEOUT_S", "600"))
 
-PROMPT_TEMPLATE = """You are reading content filed in a memory palace. Generate
-an index of natural-language sentences that someone searching for this content
-would naturally type. Each sentence will be independently embedded and
-keyword-indexed, so write them so a future query like "how does X work" or
-"what is Y" would lexically and semantically match one of them.
+PROMPT_TEMPLATE = """You are helping a user search their notes. For the
+SPECIFIC content shown below, write 8-15 SEARCH QUERIES — the kind of
+natural-language questions or statements a person would type into a
+search bar when looking for THIS content later.
+
+Each search query is a normal English sentence or phrase with WORDS
+SEPARATED BY SPACES. It is NOT a tag, NOT an identifier, NOT a slug.
 
 Source: {source_file}
 Wing: {wing} | Room: {room}
@@ -78,32 +80,115 @@ CONTENT:
 
 ---
 
-Output a JSON object with EXACTLY these fields:
+Output ONE JSON OBJECT (starts with `{{`, ends with `}}`). Not a list,
+not an array — a single object with EXACTLY these three top-level fields.
+
+The "index_sentences" array MUST contain EXACTLY 10 entries. Not 3, not
+5, not 8 — exactly 10. Count them as you write. If you have fewer than
+10, you haven't finished. If you have more than 10, drop the weakest ones.
 
 {{
   "index_sentences": [
-    "A complete sentence about one searchable aspect of this content.",
-    "Another sentence about a different aspect — full sentence, with verbs.",
-    "Sentences stand alone. They will be searched independently."
+    "<entry 1 — a sentence about something specific in the content above>",
+    "<entry 2 — about a different specific aspect>",
+    "<entry 3 — naming a function, concept, or named thing from the content>",
+    "<entry 4 — a question someone would search for about this file>",
+    "<entry 5 — about an input, output, or side effect>",
+    "<entry 6 — about an error case or edge case the content handles>",
+    "<entry 7 — about the file's relationship to other modules or files>",
+    "<entry 8 — about a config, constant, or default value>",
+    "<entry 9 — about who uses this, when, or why>",
+    "<entry 10 — a paraphrase of the file's main purpose in plain words>"
   ],
-  "quotes": ["[Speaker] verbatim quote", ...],
-  "summary": "2-3 sentences describing what this content is about."
+  "quotes": ["[Speaker] verbatim quote", "[Speaker] another quote"],
+  "summary": "<2-3 sentences describing what this specific content is about>"
 }}
 
-RULES:
-- index_sentences: 8-15 entries. Each MUST be a complete sentence with a
-  subject and a verb, using natural spaces between words. NEVER produce
-  hyphen-glued compound tokens like "tiered-retrieval-pipeline" — write
-  "the tiered retrieval pipeline" with real spaces. Mention proper nouns
-  (names, places, projects) and distinctive technical concepts.
-- Bad (DO NOT DO THIS): "rpg-retriever|fivetools|tiered-retrieval"
-- Good: "The rpg_retriever module orchestrates a tiered retrieval pipeline
-  over mem-palace, 5etools, and rpg-library sources."
-- Quotes: 2-5 entries. EXACT verbatim from the content, not paraphrased.
-  Attribute with [Speaker] prefix if speaker is identifiable.
-- Summary: mention WHO, WHAT, and WHY. No filler.
+RULE 1 — CONTENT MUST BE SPECIFIC TO THIS FILE
+Every index_sentences entry must reference something that actually
+appears in the CONTENT above. Names of functions, variables, sections,
+people, concepts that are PRESENT in the content. Do NOT write
+sentences that would apply equally to any random file.
+
+If the content is a Python file about, say, parsing YAML, your sentences
+should mention YAML, the function names, what they do. Not "this module
+does things in a pipeline."
+
+RULE 1B — ENTRY COUNT IS MANDATORY: EXACTLY 10
+Produce EXACTLY 10 entries in index_sentences. Not 4, not 6, not 8 —
+ten. A response with fewer than 10 is invalid and will be rejected.
+
+Strategies to reach 10 entries when the content seems thin (use them):
+  1. One entry per function, section, or class name in the content.
+  2. One entry per input type / output type / data shape.
+  3. One entry per error case, edge case, or failure mode handled.
+  4. One entry per config option, constant, or default value.
+  5. One entry per external dependency the content uses.
+  6. One entry per side effect (writes to disk, sends HTTP, etc.).
+  7. One entry per concept or idea in a doc.
+  8. One entry per named noun (NPC, command, file, person).
+  9. One entry per question a user could ask about it.
+ 10. A paraphrase of the file's main purpose.
+
+Even a 20-line shell script has 10 aspects to index — the shebang, the
+shell choice, the env vars, the commands, the order, the side effects,
+the inputs, the assumptions, the failure modes, the purpose. Find them.
+
+If you produced fewer than 10, you stopped too early. Keep going.
+
+RULE 2 — EVERY SENTENCE CONTAINS SPACES BETWEEN ITS WORDS
+This is the most important formatting rule. Each index_sentences entry
+must contain at least FIVE space-separated words. If you write a "tag"
+that has hyphens, underscores, dots, or no separator at all instead of
+spaces, you have violated this rule.
+
+Self-check for each entry before emitting it: does it contain 5 or more
+words separated by actual space characters? Count them. If fewer than 5,
+rewrite it as a real sentence.
+
+REAL FAILURES FROM PRIOR RUNS — DO NOT REPEAT:
+
+  ✗ "rpg-retriever-retrieves-campaign-prose-from-mem-palace"
+     (sentence with hyphens — 7 hyphens, 0 spaces — WRONG)
+  ✗ "client-sends-json-rpc-requests-to-mempalace-mcp-subprocess"
+     (same problem — WRONG)
+  ✗ "CampaignCatalogBuildsIndexFromJSONFiles"
+     (CamelCase sentence — no spaces — WRONG)
+  ✗ "reads_session_doc_scene_NN_slash_md_files"
+     (underscores instead of spaces — WRONG)
+  ✗ "python-enhance-recap-file-takes-recap-compare-campaign-documents"
+     (especially bad, long fake-tag — WRONG)
+
+WRITE THE SAME IDEAS AS SENTENCES:
+
+  ✓ "The rpg retriever retrieves campaign prose from mem palace."
+  ✓ "The client sends JSON RPC requests to the mempalace MCP subprocess."
+  ✓ "The campaign catalog builds an index from JSON files."
+  ✓ "Reads session document scene markdown files."
+  ✓ "The enhance recap script takes a recap and compares it with campaign documents."
+
+EXCEPTION: hyphens, dots, slashes, and underscores ARE allowed inside
+actual code identifiers and filenames that appear in the content (e.g.
+"rpg_retriever.py", "AWQ-quantised", "google/gemma-2-9b-it"). You may
+quote those verbatim. The rule is about JOINING regular English words,
+not about quoting identifiers that already exist in the code.
+
+RULE 3 — NO GENERIC SENTENCES
+The example placeholders above use angle brackets `<like this>` because
+those are PLACEHOLDERS, not actual sentences to copy. NEVER include
+literal angle-bracket text in your output. NEVER copy any of the
+"correct example" sentences verbatim if they don't describe THIS file's
+content.
+
+Self-check before emitting each entry: would this sentence make sense
+for a totally different file's content? If yes, it's too generic —
+rewrite it to be specific.
+
+- Quotes: 2-5 entries. EXACT verbatim from the content. Attribute with
+  [Speaker] prefix if identifiable.
+- Summary: 2-3 plain English sentences. WHO, WHAT, WHY — about THIS content.
 - Write in the same language as the content.
-- Output valid JSON only. No code fences. No commentary.
+- Output valid JSON only. No code fences, no commentary.
 """
 
 
@@ -201,29 +286,52 @@ def _parsed_to_closet_lines(parsed, drawer_ids, entities_str):
     so it MUST read as prose, not as a tag chain. The LLM prompt asks for
     ``index_sentences`` for this reason; we also accept a legacy ``topics``
     field for backward compatibility with closets generated before the
-    prose-format change, treating each topic as a degenerate single-token
-    sentence (those will under-index but won't crash).
+    prose-format change.
+
+    Small LLMs sometimes return a bare list instead of the expected JSON
+    object — be liberal about shapes:
+
+    * Object with ``index_sentences`` / ``topics`` → use that.
+    * Bare list of strings → treat as ``index_sentences`` directly.
+    * Bare list of objects each containing ``index_sentences`` → merge.
+
+    Any unrecognised shape falls through to an empty result rather than
+    crashing the producer thread.
     """
     lines = []
     drawer_ref = ",".join(drawer_ids[:3])
 
-    sentences = parsed.get("index_sentences") or parsed.get("topics") or []
+    sentences: list = []
+    quotes: list = []
+    summary: str = ""
+
+    if isinstance(parsed, dict):
+        sentences = list(parsed.get("index_sentences") or parsed.get("topics") or [])
+        quotes = list(parsed.get("quotes", []) or [])
+        summary = str(parsed.get("summary", "") or "")
+    elif isinstance(parsed, list):
+        # Two sub-cases: list of strings or list of objects.
+        if parsed and isinstance(parsed[0], str):
+            sentences = parsed
+        elif parsed and isinstance(parsed[0], dict):
+            for entry in parsed:
+                sentences.extend(entry.get("index_sentences") or entry.get("topics") or [])
+                quotes.extend(entry.get("quotes", []) or [])
+                if not summary:
+                    summary = str(entry.get("summary", "") or "")
     for sentence in sentences[:15]:
         s = str(sentence).strip()
         if not s:
             continue
         # Cap line length to keep one closet row reasonable for embed/BM25.
-        # Sentences are typically 80-160 chars; cap at 280 to keep room for
-        # a long descriptive sentence without runaway.
         lines.append(f"{s[:280]}|{entities_str}|→{drawer_ref}")
-    for quote in parsed.get("quotes", [])[:5]:
+    for quote in quotes[:5]:
         q = str(quote).strip()
         if not q:
             continue
         lines.append(f"{q[:280]}|{entities_str}|→{drawer_ref}")
-    summary = parsed.get("summary", "")
     if summary:
-        lines.append(f"{str(summary).strip()[:280]}|{entities_str}|→{drawer_ref}")
+        lines.append(f"{summary.strip()[:280]}|{entities_str}|→{drawer_ref}")
 
     return lines
 
