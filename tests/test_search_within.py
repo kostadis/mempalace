@@ -18,7 +18,7 @@ class TestMultiWingScope:
             wing_filters=["project"],
         )
         assert "error" not in result
-        assert all(h["wing"] == "project" for h in result["results"])
+        assert all(h["wing"] == "project" for h in result["primary"])
 
     def test_multi_wing_filter_includes_both(self, palace_path, seeded_collection):
         # The palace has two wings: "project" and "notes". A {a, b} scope
@@ -29,7 +29,7 @@ class TestMultiWingScope:
             wing_filters=["project", "notes"],
             n_results=10,
         )
-        wings_seen = {h["wing"] for h in result["results"]}
+        wings_seen = {h["wing"] for h in result["primary"]}
         assert "project" in wings_seen
         assert "notes" in wings_seen
 
@@ -37,7 +37,7 @@ class TestMultiWingScope:
         # Empty list ≡ no filter (normalized to None inside search_within).
         unfiltered = search_within("auth", palace_path)
         scoped = search_within("auth", palace_path, wing_filters=[])
-        assert len(unfiltered["results"]) == len(scoped["results"])
+        assert len(unfiltered["primary"]) == len(scoped["primary"])
 
     def test_unknown_wing_returns_empty(self, palace_path, seeded_collection):
         result = search_within(
@@ -45,7 +45,7 @@ class TestMultiWingScope:
             palace_path,
             wing_filters=["nonexistent-wing"],
         )
-        assert result["results"] == []
+        assert result["primary"] == []
 
 
 class TestMultiRoomScope:
@@ -55,7 +55,7 @@ class TestMultiRoomScope:
             palace_path,
             room_filters=["backend"],
         )
-        assert all(h["room"] == "backend" for h in result["results"])
+        assert all(h["room"] == "backend" for h in result["primary"])
 
     def test_multi_room_filter(self, palace_path, seeded_collection):
         result = search_within(
@@ -64,7 +64,7 @@ class TestMultiRoomScope:
             room_filters=["backend", "frontend"],
             n_results=10,
         )
-        rooms_seen = {h["room"] for h in result["results"]}
+        rooms_seen = {h["room"] for h in result["primary"]}
         assert rooms_seen.issubset({"backend", "frontend"})
         assert len(rooms_seen) >= 1
 
@@ -76,7 +76,7 @@ class TestMultiRoomScope:
             room_filters=["backend"],
             n_results=10,
         )
-        for h in result["results"]:
+        for h in result["primary"]:
             assert h["wing"] == "project"
             assert h["room"] == "backend"
 
@@ -91,14 +91,14 @@ class TestIdsPostFilter:
             ids=list(allowed),
             n_results=10,
         )
-        for h in result["results"]:
+        for h in result["primary"]:
             assert h["drawer_id"] in allowed
 
     def test_ids_empty_list_is_noop(self, palace_path, seeded_collection):
         # ids=[] (falsy) should behave like ids=None — no restriction.
         unfiltered = search_within("auth", palace_path, n_results=10)
         empty_ids = search_within("auth", palace_path, ids=[], n_results=10)
-        assert len(empty_ids["results"]) == len(unfiltered["results"])
+        assert len(empty_ids["primary"]) == len(unfiltered["primary"])
 
     def test_ids_matching_nothing_returns_empty(self, palace_path, seeded_collection):
         result = search_within(
@@ -107,14 +107,14 @@ class TestIdsPostFilter:
             ids=["nonexistent_drawer_xyz"],
             n_results=10,
         )
-        assert result["results"] == []
+        assert result["primary"] == []
 
 
 class TestResultShape:
     def test_hit_has_drawer_id(self, palace_path, seeded_collection):
         result = search_within("auth", palace_path)
-        assert result["results"]
-        for h in result["results"]:
+        assert result["primary"]
+        for h in result["primary"]:
             assert "drawer_id" in h
             assert h["drawer_id"].startswith("drawer_")
 
@@ -162,6 +162,6 @@ class TestBackwardsCompatibility:
             wing_filters=["project"],
             n_results=5,
         )
-        mem_ids = [h["drawer_id"] for h in via_memories["results"]]
-        within_ids = [h["drawer_id"] for h in via_within["results"]]
+        mem_ids = [h["drawer_id"] for h in via_memories["primary"]]
+        within_ids = [h["drawer_id"] for h in via_within["primary"]]
         assert mem_ids == within_ids

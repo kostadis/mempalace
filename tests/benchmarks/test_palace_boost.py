@@ -39,7 +39,7 @@ class TestFilteredVsUnfilteredRecall:
         for needle in needle_info[:n_queries]:
             # Unfiltered search
             result = search_memories(needle["query"], palace_path=palace_path, n_results=5)
-            texts = [h["text"] for h in result.get("results", [])]
+            texts = [h["text"] for h in result.get("primary", [])]
             if any("NEEDLE_" in t for t in texts[:5]):
                 unfiltered_hits += 1
 
@@ -47,7 +47,7 @@ class TestFilteredVsUnfilteredRecall:
             result = search_memories(
                 needle["query"], palace_path=palace_path, wing=needle["wing"], n_results=5
             )
-            texts = [h["text"] for h in result.get("results", [])]
+            texts = [h["text"] for h in result.get("primary", [])]
             if any("NEEDLE_" in t for t in texts[:5]):
                 wing_filtered_hits += 1
 
@@ -59,7 +59,7 @@ class TestFilteredVsUnfilteredRecall:
                 room=needle["room"],
                 n_results=5,
             )
-            texts = [h["text"] for h in result.get("results", [])]
+            texts = [h["text"] for h in result.get("primary", [])]
             if any("NEEDLE_" in t for t in texts[:5]):
                 room_filtered_hits += 1
 
@@ -155,13 +155,13 @@ class TestBoostAtIncreasingScale:
 
             for needle in needle_info[:n_queries]:
                 result = search_memories(needle["query"], palace_path=palace_path, n_results=5)
-                if any("NEEDLE_" in h["text"] for h in result.get("results", [])[:5]):
+                if any("NEEDLE_" in h["text"] for h in result.get("primary", [])[:5]):
                     unfiltered_hits += 1
 
                 result = search_memories(
                     needle["query"], palace_path=palace_path, wing=needle["wing"], n_results=5
                 )
-                if any("NEEDLE_" in h["text"] for h in result.get("results", [])[:5]):
+                if any("NEEDLE_" in h["text"] for h in result.get("primary", [])[:5]):
                     filtered_hits += 1
 
             recall_none = unfiltered_hits / max(n_queries, 1)

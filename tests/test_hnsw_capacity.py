@@ -400,21 +400,22 @@ def palace_with_drawers(tmp_path):
 def test_bm25_fallback_returns_matches(palace_with_drawers):
     out = _bm25_only_via_sqlite("segfault chromadb", str(palace_with_drawers), n_results=5)
     assert out["fallback"] == "bm25_only_via_sqlite"
-    assert len(out["results"]) >= 1
-    top = out["results"][0]
+    assert len(out["primary"]) >= 1
+    top = out["primary"][0]
     # The incident drawer is the closest BM25 match for these terms.
     assert "segfault" in top["text"].lower()
-    assert top["matched_via"] == "bm25_sqlite"
     # Vector fields are intentionally absent in fallback mode.
     assert top["similarity"] is None
     assert top["distance"] is None
+    # Two-tier shape: themes degrades to [] when the BM25 fallback is in use.
+    assert out["themes"] == []
 
 
 def test_bm25_fallback_filters_by_wing(palace_with_drawers):
     out = _bm25_only_via_sqlite(
         "memory palace recall", str(palace_with_drawers), wing="design", n_results=5
     )
-    assert all(r["wing"] == "design" for r in out["results"])
+    assert all(r["wing"] == "design" for r in out["primary"])
 
 
 def test_bm25_fallback_no_palace(tmp_path):
@@ -428,7 +429,7 @@ def test_bm25_fallback_handles_short_query(palace_with_drawers):
     out = _bm25_only_via_sqlite("a", str(palace_with_drawers), n_results=5)
     # Falls back to recency window; returns whatever it can rank.
     assert out["fallback"] == "bm25_only_via_sqlite"
-    assert isinstance(out["results"], list)
+    assert isinstance(out["primary"], list)
 
 
 # ── repair.status CLI command ─────────────────────────────────────────

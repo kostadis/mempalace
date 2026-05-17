@@ -204,6 +204,7 @@ def _get_kg(palace_path=None):
         _kg_cache[palace_path] = kg
     return kg
 
+
 # ── Vector-search disabled flag (#1222) ──────────────────────────────────
 # Set when ``hnsw_capacity_status`` reports a divergence between sqlite
 # and the HNSW segment large enough that chromadb would segfault on
@@ -843,9 +844,7 @@ def tool_search_hierarchical(
     except Exception:
         wing_count = 0
     if wing_count == 0:
-        return _shortcut_flat_search(
-            "wing indices empty — run recursive_indexer.rebuild_all"
-        )
+        return _shortcut_flat_search("wing indices empty — run recursive_indexer.rebuild_all")
 
     # Over-fetch so downstream budget/dedup has room to work.
     wing_fetch = max(4, limit * 2)
@@ -986,7 +985,8 @@ def tool_search_hierarchical(
         "query": clean_query,
         "max_depth": max_depth,
         "path": {"wings": wings_pruned, "rooms": rooms_pruned},
-        "results": leaf.get("results", []),
+        "primary": leaf.get("primary", []),
+        "themes": leaf.get("themes", []),
         "total_before_filter": leaf.get("total_before_filter", 0),
         "fallback": False,
     }
@@ -1991,8 +1991,7 @@ TOOLS = {
                 "wing_filter": {
                     "type": "string",
                     "description": (
-                        "Force the search to a specific wing (skips wing-level "
-                        "pruning)."
+                        "Force the search to a specific wing (skips wing-level pruning)."
                     ),
                 },
                 "room_filter": {
@@ -2010,9 +2009,7 @@ TOOLS = {
                 },
                 "budget": {
                     "type": "integer",
-                    "description": (
-                        "Optional hard cap on total drawer hits (trims `limit`)."
-                    ),
+                    "description": ("Optional hard cap on total drawer hits (trims `limit`)."),
                     "minimum": 1,
                 },
                 "max_distance": {

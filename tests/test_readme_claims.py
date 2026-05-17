@@ -162,15 +162,15 @@ class TestClosetsExist:
 
 
 class TestClosetFirstSearch:
-    """README implies search goes through closets, not just direct drawer query."""
+    """README implies search consults closets, not just direct drawer query."""
 
-    def test_closet_boost_search_exists(self):
-        """Claim: search uses closets as a boost signal.
-        searcher.py must have CLOSET_RANK_BOOSTS and query closets_col."""
+    def test_themes_layer_exists(self):
+        """Claim: search exposes closet rows as the LLM-tagged themes layer.
+        searcher.py must build a ``themes`` block alongside ``primary``."""
         src = _read(MEMPALACE_PKG / "searcher.py")
-        assert "CLOSET_RANK_BOOSTS" in src, (
-            "searcher.py has no closet boost logic. "
-            "README describes closet-based search but searcher.py has no closet ranking."
+        assert "themes" in src, (
+            "searcher.py has no themes block. README describes closet-driven "
+            "concept retrieval but the two-tier shape is missing."
         )
 
     def test_searcher_imports_closets(self):
@@ -178,7 +178,7 @@ class TestClosetFirstSearch:
         src = _read(MEMPALACE_PKG / "searcher.py")
         assert "get_closets_collection" in src, (
             "searcher.py does not reference get_closets_collection. "
-            "Closet-first search can't work without the closets collection."
+            "The themes layer can't be populated without the closets collection."
         )
 
 

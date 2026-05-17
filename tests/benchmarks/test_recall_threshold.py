@@ -133,7 +133,7 @@ class TestRecallThresholdSingleRoom:
             if "error" in result:
                 continue
 
-            texts = [h["text"] for h in result.get("results", [])]
+            texts = [h["text"] for h in result.get("primary", [])]
             needle_id = f"NEEDLE_{i:04d}"
 
             found_at_5 = any(needle_id in t for t in texts[:5])
@@ -167,7 +167,7 @@ class TestRecallThresholdSingleRoom:
             if "error" in result:
                 continue
 
-            texts = [h["text"] for h in result.get("results", [])]
+            texts = [h["text"] for h in result.get("primary", [])]
             needle_id = f"NEEDLE_{i:04d}"
 
             if any(needle_id in t for t in texts[:5]):

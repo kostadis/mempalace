@@ -18,25 +18,26 @@ from mempalace.searcher import SearchError, search, search_memories
 class TestSearchMemories:
     def test_basic_search(self, palace_path, seeded_collection):
         result = search_memories("JWT authentication", palace_path)
-        assert "results" in result
-        assert len(result["results"]) > 0
+        assert "primary" in result
+        assert "themes" in result
+        assert len(result["primary"]) > 0
         assert result["query"] == "JWT authentication"
 
     def test_wing_filter(self, palace_path, seeded_collection):
         result = search_memories("planning", palace_path, wing="notes")
-        assert all(r["wing"] == "notes" for r in result["results"])
+        assert all(r["wing"] == "notes" for r in result["primary"])
 
     def test_room_filter(self, palace_path, seeded_collection):
         result = search_memories("database", palace_path, room="backend")
-        assert all(r["room"] == "backend" for r in result["results"])
+        assert all(r["room"] == "backend" for r in result["primary"])
 
     def test_wing_and_room_filter(self, palace_path, seeded_collection):
         result = search_memories("code", palace_path, wing="project", room="frontend")
-        assert all(r["wing"] == "project" and r["room"] == "frontend" for r in result["results"])
+        assert all(r["wing"] == "project" and r["room"] == "frontend" for r in result["primary"])
 
     def test_n_results_limit(self, palace_path, seeded_collection):
         result = search_memories("code", palace_path, n_results=2)
-        assert len(result["results"]) <= 2
+        assert len(result["primary"]) <= 2
 
     def test_no_palace_returns_error(self, tmp_path):
         result = search_memories("anything", str(tmp_path / "missing"))
@@ -44,7 +45,7 @@ class TestSearchMemories:
 
     def test_result_fields(self, palace_path, seeded_collection):
         result = search_memories("authentication", palace_path)
-        hit = result["results"][0]
+        hit = result["primary"][0]
         assert "text" in hit
         assert "wing" in hit
         assert "room" in hit
@@ -56,7 +57,7 @@ class TestSearchMemories:
     def test_created_at_contains_filed_at(self, palace_path, seeded_collection):
         """created_at surfaces the filed_at metadata from the drawer."""
         result = search_memories("JWT authentication", palace_path)
-        hit = result["results"][0]
+        hit = result["primary"][0]
         assert hit["created_at"] == "2026-01-01T00:00:00"
 
     def test_created_at_fallback_when_filed_at_missing(self):
@@ -71,7 +72,7 @@ class TestSearchMemories:
 
         with patch("mempalace.searcher.get_collection", return_value=mock_col):
             result = search_memories("test", "/fake/path")
-        hit = result["results"][0]
+        hit = result["primary"][0]
         assert hit["created_at"] == "unknown"
 
     def test_search_memories_query_error(self):
@@ -112,10 +113,10 @@ class TestSearchMemories:
 
         with patch("mempalace.searcher.get_collection", side_effect=mock_get_collection):
             result = search_memories("anything", "/fake/path")
-        assert "results" in result
-        assert len(result["results"]) == 2
+        assert "primary" in result
+        assert len(result["primary"]) == 2
         # The None-metadata hit renders with sentinel values, not a crash.
-        none_hit = result["results"][1]
+        none_hit = result["primary"][1]
         assert none_hit["text"] == "second doc"
         assert none_hit["wing"] == "unknown"
         assert none_hit["room"] == "unknown"

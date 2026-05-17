@@ -58,8 +58,8 @@ CONVO_EXTENSIONS = {
 }
 
 MIN_CHUNK_SIZE = 30
-CHUNK_SIZE = 800  # chars per drawer — align with miner.py
-DRAWER_UPSERT_BATCH_SIZE = 1000
+CHUNK_SIZE = 2000  # chars per drawer — approx 500 tokens, safely under 2048 limit
+DRAWER_UPSERT_BATCH_SIZE = 10
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
 # Matches miner.py at 500 MB. Long Claude Code sessions, multi-year
 # ChatGPT exports, and lifetime Slack dumps routinely exceed 10 MB; the
@@ -105,18 +105,22 @@ def chunk_exchanges(content: str) -> list:
     Chunk by exchange pair: one > turn + AI response = one unit.
     Falls back to paragraph chunking if no > markers.
     """
+    if not content.strip():
+        return []
     lines = content.split("\n")
     quote_lines = sum(1 for line in lines if line.strip().startswith(">"))
 
-    if quote_lines >= 3:
+    if quote_lines >= 1:
         return _chunk_by_exchange(lines)
     else:
+        # If there are few quote lines, it's likely not a standard exchange-pair format.
+        # Use paragraph chunking as a fallback.
         return _chunk_by_paragraph(content)
 
 
 def _chunk_by_exchange(lines: list) -> list:
     """One user turn (>) + the AI response that follows = one or more chunks.
-
+    
     The full AI response is preserved verbatim.  When the combined
     user-turn + response exceeds CHUNK_SIZE the response is split across
     consecutive drawers so nothing is silently discarded.
@@ -146,30 +150,34 @@ def _chunk_by_exchange(lines: list) -> list:
             if len(content) > CHUNK_SIZE:
                 # First chunk: user turn + as much response as fits
                 first_part = content[:CHUNK_SIZE]
-                if len(first_part.strip()) > MIN_CHUNK_SIZE:
-                    chunks.append({"content": first_part, "chunk_index": len(chunks)})
+                chunks.append({"content": first_part, "chunk_index": len(chunks)})
+                
                 # Remaining response in CHUNK_SIZE-sized continuation drawers
                 remainder = content[CHUNK_SIZE:]
                 while remainder:
                     part = remainder[:CHUNK_SIZE]
                     remainder = remainder[CHUNK_SIZE:]
-                    if len(part.strip()) > MIN_CHUNK_SIZE:
-                        chunks.append({"content": part, "chunk_index": len(chunks)})
-            elif len(content.strip()) > MIN_CHUNK_SIZE:
+                    chunks.append({"content": part, "chunk_index": len(chunks)})
+            else:
                 chunks.append(
                     {
                         "content": content,
                         "chunk_index": len(chunks),
                     }
                 )
+            # Safety check: ensure no chunk somehow escaped the limit
+            assert len(chunks[-1]["content"]) <= CHUNK_SIZE, f"Chunk size {len(chunks[-1]['content'])} exceeds CHUNK_SIZE {CHUNK_SIZE}"
+
+
         else:
             i += 1
 
     return chunks
 
 
+
 def _chunk_by_paragraph(content: str) -> list:
-    """Fallback: chunk by paragraph breaks."""
+    """Fallback: chunk by paragraph breaks, with sub-chunking for large paragraphs."""
     chunks = []
     paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
 
@@ -179,12 +187,27 @@ def _chunk_by_paragraph(content: str) -> list:
         for i in range(0, len(lines), 25):
             group = "\n".join(lines[i : i + 25]).strip()
             if len(group) > MIN_CHUNK_SIZE:
-                chunks.append({"content": group, "chunk_index": len(chunks)})
+                # Sub-chunk the line group if it's still too big
+                remainder = group
+                while remainder:
+                    part = remainder[:CHUNK_SIZE]
+                    remainder = remainder[CHUNK_SIZE:]
+                    chunks.append({"content": part, "chunk_index": len(chunks)})
         return chunks
 
     for para in paragraphs:
-        if len(para) > MIN_CHUNK_SIZE:
+        if len(para) < MIN_CHUNK_SIZE:
+            continue
+
+        if len(para) <= CHUNK_SIZE:
             chunks.append({"content": para, "chunk_index": len(chunks)})
+        else:
+            # Sub-chunk the large paragraph
+            remainder = para
+            while remainder:
+                part = remainder[:CHUNK_SIZE]
+                remainder = remainder[CHUNK_SIZE:]
+                chunks.append({"content": part, "chunk_index": len(chunks)})
 
     return chunks
 

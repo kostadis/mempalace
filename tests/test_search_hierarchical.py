@@ -109,7 +109,7 @@ class TestMaxDepthZero:
         out = mcp_server.tool_search_hierarchical("authentication", max_depth=0)
         assert out["max_depth"] == 0
         assert out["fallback"] is False
-        assert "results" not in out  # no drawer sweep at depth 0
+        assert "primary" not in out  # no drawer sweep at depth 0
         assert out["path"]["wings"]
         for w in out["path"]["wings"]:
             assert "wing" in w
@@ -126,7 +126,7 @@ class TestMaxDepthOne:
     def test_returns_wings_and_rooms(self, indexed_palace):
         out = mcp_server.tool_search_hierarchical("authentication", max_depth=1)
         assert out["max_depth"] == 1
-        assert "results" not in out  # still no drawers
+        assert "primary" not in out  # still no drawers
         assert out["path"]["wings"]
         assert out["path"]["rooms"]
         for r in out["path"]["rooms"]:
@@ -144,15 +144,17 @@ class TestMaxDepthTwo:
         out = mcp_server.tool_search_hierarchical("jwt auth tokens", max_depth=2)
         assert out["max_depth"] == 2
         assert out["fallback"] is False
-        assert "results" in out
+        assert "primary" in out
+        assert "themes" in out
         # We seeded an auth drawer; the top-level result should surface it.
-        ids = [h["drawer_id"] for h in out["results"]]
+        ids = [h["drawer_id"] for h in out["primary"]]
         assert "d_auth" in ids
 
     def test_default_max_depth_is_two(self, indexed_palace):
         out = mcp_server.tool_search_hierarchical("jwt auth tokens")
         assert out["max_depth"] == 2
-        assert "results" in out
+        assert "primary" in out
+        assert "themes" in out
 
     def test_path_is_always_present(self, indexed_palace):
         out = mcp_server.tool_search_hierarchical("jwt auth tokens", max_depth=2)
@@ -168,7 +170,7 @@ class TestMaxDepthTwo:
             limit=10,
             budget=1,
         )
-        assert len(out["results"]) <= 1
+        assert len(out["primary"]) <= 1
 
 
 # ── Filters ─────────────────────────────────────────────────────────────
@@ -183,8 +185,8 @@ class TestExplicitFilter:
         )
         # An explicit scope always short-circuits the hierarchical pruning.
         assert out["fallback"] is True
-        assert "results" in out
-        for h in out["results"]:
+        assert "primary" in out
+        for h in out["primary"]:
             assert h["wing"] == "project"
 
     def test_room_filter_triggers_fallback(self, indexed_palace):
@@ -193,7 +195,7 @@ class TestExplicitFilter:
             room_filter="backend",
         )
         assert out["fallback"] is True
-        for h in out["results"]:
+        for h in out["primary"]:
             assert h["room"] == "backend"
 
     def test_unknown_wing_filter_returns_no_results(self, indexed_palace):
@@ -202,7 +204,7 @@ class TestExplicitFilter:
             wing_filter="does_not_exist",
         )
         assert out["fallback"] is True
-        assert out["results"] == []
+        assert out["primary"] == []
 
 
 # ── Fallback behaviour ──────────────────────────────────────────────────
@@ -218,8 +220,8 @@ class TestFallback:
         assert out["fallback"] is True
         assert "fallback_reason" in out
         # The flat search still hits the only drawer we seeded.
-        assert out["results"]
-        assert out["results"][0]["drawer_id"] == "d_only"
+        assert out["primary"]
+        assert out["primary"][0]["drawer_id"] == "d_only"
 
 
 # ── Sanity: registered tool dispatches correctly ─────────────────────────

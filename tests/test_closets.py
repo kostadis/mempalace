@@ -348,41 +348,44 @@ class TestExtractDrawerIds:
 # ── search_memories closet-first path ────────────────────────────────
 
 
-class TestSearchMemoriesHybrid:
+class TestSearchMemoriesTwoTier:
     def test_pure_drawer_when_no_closets(self, palace_path, seeded_collection):
-        """Palaces without closets return results via direct drawer search —
-        every hit must advertise that the closet signal was absent."""
+        """Palaces without closets still return primary drawer hits and an
+        empty themes list — themes never block the primary answer."""
         result = search_memories("JWT authentication", palace_path)
-        assert result["results"], "should still find drawer hits"
-        for hit in result["results"]:
-            assert hit.get("matched_via") == "drawer"
-            assert hit.get("closet_boost") == 0.0
+        assert result["primary"], "should still find drawer hits"
+        assert result["themes"] == []
+        for hit in result["primary"]:
+            assert "matched_via" not in hit
+            assert "closet_boost" not in hit
             assert "closet_preview" not in hit
 
-    def test_closet_boost_marks_hit_as_drawer_plus_closet(self, palace_path, seeded_collection):
-        """When a closet agrees with direct search on source_file, the
-        matching drawer's ``matched_via`` switches to ``drawer+closet`` and
-        ``closet_preview`` exposes the hydrated index line."""
+    def test_closet_surfaces_in_themes_not_primary(self, palace_path, seeded_collection):
+        """A closet matching the query appears in the themes block, not in
+        the primary block. Primary ranking is closet-immune."""
         closets = get_closets_collection(palace_path)
-        # Seed the closet against the same source_file the drawer uses so
-        # the boost lookup keys align.
         closets.upsert(
             ids=["closet_proj_backend_aaa_01"],
             documents=["JWT auth tokens|;|→drawer_proj_backend_aaa"],
-            metadatas=[{"wing": "project", "room": "backend", "source_file": "auth.py"}],
+            metadatas=[
+                {
+                    "wing": "project",
+                    "room": "backend",
+                    "source_file": "auth.py",
+                    "generated_by": "llm:test",
+                }
+            ],
         )
 
         result = search_memories("JWT authentication", palace_path)
-        assert result["results"], "hybrid search should still return results"
-        # The JWT-bearing drawer should surface with closet agreement.
-        boosted = [h for h in result["results"] if h["matched_via"] == "drawer+closet"]
-        assert boosted, "closet agreement should promote the matching source"
-        top = boosted[0]
-        assert "JWT" in top["text"]
-        assert top["closet_boost"] > 0
-        assert "→drawer_proj_backend_aaa" in top["closet_preview"]
+        assert result["primary"], "primary should still return drawer hits"
+        for hit in result["primary"]:
+            assert "matched_via" not in hit
+            assert "closet_boost" not in hit
+        # Themes carries the closet, not primary.
+        assert any(t["source_file"] == "auth.py" for t in result["themes"])
 
-    def test_max_distance_filters_hybrid_hits(self, palace_path, seeded_collection):
+    def test_max_distance_filters_primary_hits(self, palace_path, seeded_collection):
         closets = get_closets_collection(palace_path)
         closets.upsert(
             ids=["closet_proj_backend_aaa_01"],
@@ -394,7 +397,7 @@ class TestSearchMemoriesHybrid:
             palace_path,
             max_distance=0.001,
         )
-        for hit in result["results"]:
+        for hit in result["primary"]:
             assert hit["distance"] <= 0.001
 
 
@@ -931,44 +934,8 @@ class TestDrawerGrepExpansion:
         assert out["drawer_index"] is None
         assert out["total_drawers"] is None
 
-    def test_hybrid_search_enrichment_populates_drawer_index_and_total(self, palace_path):
-        """End-to-end: when a closet boosts a source with many drawers, the
-        enrichment step runs drawer-grep across all chunks of that source
-        and exposes drawer_index + total_drawers on the hit (so the client
-        knows which chunk was expanded around)."""
-        col = get_collection(palace_path)
-        source = "/proj/indexed.md"
-        # Seed 5 drawers for one source file.
-        for i in range(5):
-            col.upsert(
-                ids=[f"drawer_proj_backend_indexed_{i:03d}"],
-                documents=[f"chunk_{i} talks about JWT authentication flow"],
-                metadatas=[
-                    {
-                        "wing": "project",
-                        "room": "backend",
-                        "source_file": source,
-                        "chunk_index": i,
-                        "filed_at": "2026-04-13T00:00:00",
-                    }
-                ],
-            )
-        # Closet pointing at chunk_2 for this source.
-        closets = get_closets_collection(palace_path)
-        closets.upsert(
-            ids=["closet_proj_backend_indexed_01"],
-            documents=["JWT auth|;|→drawer_proj_backend_indexed_002"],
-            metadatas=[{"wing": "project", "room": "backend", "source_file": source}],
-        )
-
-        result = search_memories("JWT authentication", palace_path)
-        assert result["results"]
-        # The hybrid path promotes the closet-agreeing source to drawer+closet.
-        boosted = [h for h in result["results"] if h["matched_via"] == "drawer+closet"]
-        assert boosted, "hybrid search should mark the closet-agreeing source"
-        top = boosted[0]
-        assert top["total_drawers"] == 5
-        assert isinstance(top["drawer_index"], int)
-        # Enriched text must include the grep-best chunk plus one neighbor
-        # on each side (chunk boundary may clip).
-        assert "chunk_" in top["text"]
+    # NOTE: drawer-grep hydration for closet-boosted hits was removed
+    # when the two-tier shape (primary/themes) replaced the boost
+    # mechanism. The ``_expand_with_neighbors`` helper itself is still
+    # exercised by the tests above; reintroducing hydration on
+    # ``themes`` hits is a follow-up (see docs/design/two-tier-retrieval.md).

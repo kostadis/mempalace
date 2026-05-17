@@ -333,10 +333,10 @@ class TestSearchTool:
         from mempalace.mcp_server import tool_search
 
         result = tool_search(query="JWT authentication tokens")
-        assert "results" in result
-        assert len(result["results"]) > 0
+        assert "primary" in result
+        assert len(result["primary"]) > 0
         # Top result should be the auth drawer
-        top = result["results"][0]
+        top = result["primary"][0]
         assert "JWT" in top["text"] or "authentication" in top["text"].lower()
 
     def test_search_with_wing_filter(self, monkeypatch, config, palace_path, seeded_collection, kg):
@@ -344,14 +344,14 @@ class TestSearchTool:
         from mempalace.mcp_server import tool_search
 
         result = tool_search(query="planning", wing="notes")
-        assert all(r["wing"] == "notes" for r in result["results"])
+        assert all(r["wing"] == "notes" for r in result["primary"])
 
     def test_search_with_room_filter(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_search
 
         result = tool_search(query="database", room="backend")
-        assert all(r["room"] == "backend" for r in result["results"])
+        assert all(r["room"] == "backend" for r in result["primary"])
 
     def test_search_min_similarity_backwards_compat(
         self, monkeypatch, config, palace_path, seeded_collection, kg
@@ -362,12 +362,12 @@ class TestSearchTool:
 
         # Old name should work
         result = tool_search(query="JWT", min_similarity=1.5)
-        assert "results" in result
+        assert "primary" in result
 
         # Old name takes precedence when both provided
         result_strict = tool_search(query="JWT", max_distance=999.0, min_similarity=0.01)
         result_loose = tool_search(query="JWT", max_distance=0.01, min_similarity=999.0)
-        assert len(result_strict["results"]) <= len(result_loose["results"])
+        assert len(result_strict["primary"]) <= len(result_loose["primary"])
 
     def test_list_rooms_rejects_invalid_wing(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -1013,12 +1013,12 @@ class TestCrossPalaceArg:
 
         # Marker exists only in the alt palace.
         result = tool_search(query="unique-alt-marker-zebra-quokka", palace=alt_path)
-        assert "results" in result
-        assert any("zebra-quokka" in r["text"] for r in result["results"])
+        assert "primary" in result
+        assert any("zebra-quokka" in r["text"] for r in result["primary"])
 
         # Same marker in default palace returns nothing matching.
         default = tool_search(query="unique-alt-marker-zebra-quokka")
-        assert not any("zebra-quokka" in r["text"] for r in default.get("results", []))
+        assert not any("zebra-quokka" in r["text"] for r in default.get("primary", []))
 
     def test_palace_arg_unknown_alias_returns_error(
         self, monkeypatch, config, palace_path, seeded_collection, kg

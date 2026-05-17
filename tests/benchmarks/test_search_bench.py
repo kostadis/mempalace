@@ -81,7 +81,7 @@ class TestSearchRecallAtScale:
             if "error" in result:
                 continue
 
-            texts = [h["text"] for h in result.get("results", [])]
+            texts = [h["text"] for h in result.get("primary", [])]
 
             # Check if needle content appears in top 5
             found_at_5 = any("NEEDLE_" in t for t in texts[:5])
@@ -126,7 +126,7 @@ class TestSearchFilteredVsUnfiltered:
                 needle["query"], palace_path=palace_path, n_results=5
             )
             unfiltered_latencies.append((time.perf_counter() - start) * 1000)
-            if any("NEEDLE_" in h["text"] for h in result_unfiltered.get("results", [])[:5]):
+            if any("NEEDLE_" in h["text"] for h in result_unfiltered.get("primary", [])[:5]):
                 unfiltered_hits += 1
 
             # Filtered by wing
@@ -138,7 +138,7 @@ class TestSearchFilteredVsUnfiltered:
                 n_results=5,
             )
             filtered_latencies.append((time.perf_counter() - start) * 1000)
-            if any("NEEDLE_" in h["text"] for h in result_filtered.get("results", [])[:5]):
+            if any("NEEDLE_" in h["text"] for h in result_filtered.get("primary", [])[:5]):
                 filtered_hits += 1
 
         avg_unfiltered = sum(unfiltered_latencies) / max(len(unfiltered_latencies), 1)

@@ -248,7 +248,7 @@ def test_gate1_hierarchical_aaak(benchmark_palace, fixture):
 
         # Baseline: flat search scores every drawer in the palace (conceptually).
         base = search_memories(q["query"], palace_path=palace_path, n_results=10)
-        base_ids = [h["drawer_id"] for h in base.get("results", [])]
+        base_ids = [h["drawer_id"] for h in base.get("primary", [])]
         baseline_recalls.append(_recall_at_k(expected, base_ids))
         baseline_precisions.append(_precision_at_k(expected, base_ids))
 
@@ -256,7 +256,7 @@ def test_gate1_hierarchical_aaak(benchmark_palace, fixture):
         hier = mcp_server.tool_search_hierarchical(
             q["query"], palace=palace_path, limit=10, max_depth=2
         )
-        hier_ids = [h["drawer_id"] for h in hier.get("results", [])]
+        hier_ids = [h["drawer_id"] for h in hier.get("primary", [])]
         hier_recalls.append(_recall_at_k(expected, hier_ids))
         hier_precisions.append(_precision_at_k(expected, hier_ids))
 
