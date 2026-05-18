@@ -136,6 +136,11 @@ def _hybrid_rank(
       themselves. Since the absolute scale is unbounded, BM25 is min-max
       normalized within the candidate set so weights are commensurable.
 
+    Candidates with ``distance=None`` are treated as vector-unknown
+    (no vector signal available) and scored on BM25 contribution alone.
+    Used by candidate-union mode to merge BM25-only candidates that the
+    vector index didn't surface.
+
     Mutates each result dict to add ``bm25_score`` and reorders the list
     in place. Returns the same list for convenience.
     """
@@ -149,7 +154,11 @@ def _hybrid_rank(
 
     scored = []
     for r, raw, norm in zip(results, bm25_raw, bm25_norm):
-        vec_sim = max(0.0, 1.0 - r.get("distance", 1.0))
+        distance = r.get("distance")
+        if distance is None:
+            vec_sim = 0.0
+        else:
+            vec_sim = max(0.0, 1.0 - distance)
         r["bm25_score"] = round(raw, 3)
         scored.append((vector_weight * vec_sim + bm25_weight * norm, r))
 
@@ -268,7 +277,7 @@ def _expand_with_neighbors(drawers_col, matched_doc: str, matched_meta: dict, ra
         all_meta = drawers_col.get(where={"source_file": src}, include=["metadatas"])
         total_drawers = len(all_meta.ids) if all_meta.ids else None
     except Exception:
-        pass
+        logger.debug("total_drawers lookup failed for %s", src, exc_info=True)
 
     return {
         "text": combined_text,
@@ -320,10 +329,10 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     """
     try:
         col = get_collection(palace_path, create=False)
-    except Exception:
+    except Exception as e:
         print(f"\n  No palace found at {palace_path}")
         print("  Run: mempalace init <dir> then mempalace mine <dir>")
-        raise SearchError(f"No palace found at {palace_path}")
+        raise SearchError(f"No palace found at {palace_path}") from e
 
     # Alert the user if this palace predates hnsw:space=cosine being set on
     # creation — their similarity scores will be junk until they run repair.
@@ -482,6 +491,8 @@ def _bm25_only_via_sqlite(
     room: str = None,
     n_results: int = 5,
     max_candidates: int = 500,
+    _include_internal: bool = False,
+    collection_name: str = None,
 ) -> dict:
     """BM25-only search reading drawers directly from chroma.sqlite3.
 
@@ -505,6 +516,35 @@ def _bm25_only_via_sqlite(
             "error": "No palace found",
             "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
         }
+    if collection_name is None:
+        from .config import get_configured_collection_name
+
+        collection_name = get_configured_collection_name()
+
+    def _metadata_filter_sql(row_id_expr: str) -> tuple[str, list[str]]:
+        clauses = []
+        params = []
+        for key, value in (("wing", wing), ("room", room)):
+            if not value:
+                continue
+            clauses.append(
+                f"""
+                AND EXISTS (
+                    SELECT 1
+                    FROM embedding_metadata mf
+                    WHERE mf.id = {row_id_expr}
+                      AND mf.key = ?
+                      AND COALESCE(
+                        mf.string_value,
+                        CAST(mf.int_value AS TEXT),
+                        CAST(mf.float_value AS TEXT),
+                        CAST(mf.bool_value AS TEXT)
+                      ) = ?
+                )
+                """
+            )
+            params.extend([key, value])
+        return "".join(clauses), params
 
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -516,45 +556,57 @@ def _bm25_only_via_sqlite(
         # shorter than 3 chars (trigram tokenizer can't match them).
         tokens = [t for t in _tokenize(query) if len(t) >= 3]
         candidate_ids: list[int] = []
+        use_recency_fallback = not tokens
         if tokens:
             fts_query = " OR ".join(tokens)
+            filter_sql, filter_params = _metadata_filter_sql("embedding_fulltext_search.rowid")
             try:
                 rows = conn.execute(
-                    """
-                    SELECT rowid
+                    f"""
+                    SELECT embedding_fulltext_search.rowid
                     FROM embedding_fulltext_search
+                    JOIN embeddings e ON e.id = embedding_fulltext_search.rowid
+                    JOIN segments s ON e.segment_id = s.id
+                    JOIN collections c ON s.collection = c.id
                     WHERE embedding_fulltext_search MATCH ?
+                      AND c.name = ?
+                    {filter_sql}
                     LIMIT ?
                     """,
-                    (fts_query, max_candidates),
+                    (fts_query, collection_name, *filter_params, max_candidates),
                 ).fetchall()
                 candidate_ids = [r[0] for r in rows]
             except sqlite3.Error:
                 # FTS5 tokenizer mismatch or syntax error — fall through
                 # to the recency-window selector below.
                 logger.debug("FTS5 MATCH failed; using recency fallback", exc_info=True)
+                use_recency_fallback = True
 
-        if not candidate_ids:
-            # No FTS hits (or no usable tokens) — pull the most recent
-            # rows for the drawers segment so we can BM25-rank something
-            # rather than return empty-handed. Wrapped in try/except
-            # because the schema may differ on legacy palaces (older
-            # chromadb without ``created_at``, missing ``segments``
-            # rows after partial restore, etc.); on schema mismatch we
-            # fall back to ordering by primary-key id and finally to an
-            # empty result rather than letting search raise.
+        if not candidate_ids and use_recency_fallback:
+            # No usable FTS tokens, or FTS itself failed — pull the most
+            # recent rows for the drawers segment so we can BM25-rank
+            # something rather than return empty-handed. A clean FTS miss
+            # must stay empty, especially after wing/room filtering, because
+            # recency fallback would return unrelated scoped drawers.
+            # Wrapped in try/except because the schema may differ on legacy
+            # palaces (older chromadb without ``created_at``, missing
+            # ``segments`` rows after partial restore, etc.); on schema
+            # mismatch we fall back to ordering by primary-key id and finally
+            # to an empty result rather than letting search raise.
             try:
+                filter_sql, filter_params = _metadata_filter_sql("e.id")
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT e.id
                     FROM embeddings e
                     JOIN segments s ON e.segment_id = s.id
                     JOIN collections c ON s.collection = c.id
-                    WHERE c.name = 'mempalace_drawers'
+                    WHERE c.name = ?
+                    {filter_sql}
                     ORDER BY e.created_at DESC
                     LIMIT ?
                     """,
-                    (max_candidates,),
+                    (collection_name, *filter_params, max_candidates),
                 ).fetchall()
                 candidate_ids = [r[0] for r in rows]
             except sqlite3.Error:
@@ -563,17 +615,19 @@ def _bm25_only_via_sqlite(
                     exc_info=True,
                 )
                 try:
+                    filter_sql, filter_params = _metadata_filter_sql("e.id")
                     rows = conn.execute(
-                        """
+                        f"""
                         SELECT e.id
                         FROM embeddings e
                         JOIN segments s ON e.segment_id = s.id
                         JOIN collections c ON s.collection = c.id
-                        WHERE c.name = 'mempalace_drawers'
+                        WHERE c.name = ?
+                        {filter_sql}
                         ORDER BY e.id DESC
                         LIMIT ?
                         """,
-                        (max_candidates,),
+                        (collection_name, *filter_params, max_candidates),
                     ).fetchall()
                     candidate_ids = [r[0] for r in rows]
                 except sqlite3.Error:
@@ -586,6 +640,7 @@ def _bm25_only_via_sqlite(
                 "filters": {"wing": wing, "room": room},
                 "total_before_filter": 0,
                 "primary": [],
+                "results": [],
                 "themes": [],
                 "fallback": "bm25_only_via_sqlite",
             }
@@ -620,16 +675,25 @@ def _bm25_only_via_sqlite(
             continue
         if room and meta.get("room") != room:
             continue
+        full_source = meta.get("source_file", "") or ""
         candidates.append(
             {
                 "text": d["text"],
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
-                "source_file": Path(meta.get("source_file", "?") or "?").name,
+                "source_file": Path(full_source).name if full_source else "?",
                 "created_at": meta.get("filed_at", "unknown"),
                 # No vector distance available in BM25-only mode.
                 "similarity": None,
                 "distance": None,
+                "matched_via": "bm25_sqlite",
+                # Internal: full path + chunk_index let callers (notably
+                # candidate_strategy="union") dedupe at chunk granularity
+                # rather than basename — two files in different directories
+                # may share a basename, and one source_file is split across
+                # multiple chunks. Stripped before this helper returns.
+                "_source_file_full": full_source,
+                "_chunk_index": meta.get("chunk_index"),
             }
         )
 
@@ -644,12 +708,22 @@ def _bm25_only_via_sqlite(
     hits = candidates[:n_results]
     for h in hits:
         h.pop("_score", None)
+        # Strip internal fields by default so the public BM25-only fallback
+        # response stays clean. Callers that need chunk-precise dedup
+        # (notably the union-merge path) opt in via _include_internal.
+        if not _include_internal:
+            h.pop("_source_file_full", None)
+            h.pop("_chunk_index", None)
 
     return {
         "query": query,
         "filters": {"wing": wing, "room": room},
         "total_before_filter": len(candidates),
         "primary": hits,
+        # ``results`` is an alias for ``primary`` kept so v3.3.5 callers that
+        # consumed the BM25 fallback under the old key keep working without
+        # losing the palace-isolation-era ``primary`` consumers.
+        "results": hits,
         "themes": [],
         "fallback": "bm25_only_via_sqlite",
         "fallback_reason": "vector_search_disabled",
@@ -681,6 +755,7 @@ def search_within(
     n_results: int = 5,
     n_themes: int = None,
     max_distance: float = 0.0,
+    collection_name: str = None,
 ) -> dict:
     """Generic scoped search primitive — the leaf of hierarchical descent.
 
@@ -706,7 +781,10 @@ def search_within(
     ``primary`` (drawer hits), and ``themes`` (closet hits).
     """
     try:
-        drawers_col = get_collection(palace_path, create=False)
+        if collection_name is not None:
+            drawers_col = get_collection(palace_path, collection_name=collection_name, create=False)
+        else:
+            drawers_col = get_collection(palace_path, create=False)
     except Exception as e:
         logger.error("No palace found at %s: %s", palace_path, e)
         return {
@@ -823,6 +901,7 @@ def search_within(
             t.pop("_sort_key", None)
     except Exception:
         # No closets collection yet, or it errored — themes degrades to [].
+        logger.debug("Closet collection unavailable; using drawer-only search", exc_info=True)
         themes = []
 
     return {
@@ -834,6 +913,9 @@ def search_within(
         },
         "total_before_filter": len(_first_or_empty(drawer_results, "documents")),
         "primary": primary,
+        # ``results`` alias kept for v3.3.5-era consumers that read the
+        # hit list under the old key.
+        "results": primary,
         "themes": themes,
     }
 
@@ -846,6 +928,7 @@ def search_memories(
     n_results: int = 5,
     max_distance: float = 0.0,
     vector_disabled: bool = False,
+    collection_name: str = None,
 ) -> dict:
     """Programmatic search — single-wing, single-room convenience wrapper.
 
@@ -876,6 +959,7 @@ def search_memories(
         room_filters=[room] if room else None,
         n_results=n_results,
         max_distance=max_distance,
+        collection_name=collection_name,
     )
     # Preserve the pre-search_within return shape for existing consumers.
     if "filters" in result:

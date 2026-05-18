@@ -8,7 +8,9 @@ via monkeypatch to avoid touching real data.
 
 from datetime import datetime
 import json
+import os
 import sys
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -18,7 +20,7 @@ def _patch_mcp_server(monkeypatch, config, kg):
     from mempalace import mcp_server
 
     monkeypatch.setattr(mcp_server, "_config", config)
-    monkeypatch.setattr(mcp_server, "_kg", kg)
+    monkeypatch.setattr(mcp_server, "_get_kg", lambda *a, **kw: kg)
 
 
 def _get_collection(palace_path, create=False):
@@ -146,6 +148,20 @@ class TestHandleRequest:
         )
         assert resp["error"]["code"] == -32601
 
+    def test_tools_call_missing_params(self):
+        from mempalace.mcp_server import handle_request
+
+        for bad_params in [None, {}, {"arguments": {}}]:
+            resp = handle_request(
+                {
+                    "method": "tools/call",
+                    "id": 15,
+                    "params": bad_params,
+                }
+            )
+            assert resp["error"]["code"] == -32602
+            assert "Invalid params" in resp["error"]["message"]
+
     def test_unknown_method(self):
         from mempalace.mcp_server import handle_request
 
@@ -187,6 +203,17 @@ class TestHandleRequest:
         # method=None with id → should return error, not crash
         resp = handle_request({"method": None, "id": 99, "params": {}})
         assert resp["error"]["code"] == -32601
+
+    @pytest.mark.parametrize("payload", [None, [], "plain", 42, True])
+    def test_handle_request_invalid_payload_returns_jsonrpc_error(self, payload):
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request(payload)
+        assert resp == {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32600, "message": "Invalid Request"},
+        }
 
     def test_tools_call_dispatches(self, monkeypatch, config, palace_path, seeded_kg):
         _patch_mcp_server(monkeypatch, config, seeded_kg)
@@ -387,6 +414,76 @@ class TestSearchTool:
         result = mcp_server.tool_search(query="JWT", room="../backend")
         assert "error" in result
 
+    def test_search_retries_once_on_hnsw_flush_transient(self, monkeypatch, config, kg):
+        """Issue #1315: post-bulk-mine 'Error finding id' is retried once."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        calls = {"n": 0}
+        reset_calls = {"n": 0}
+
+        def fake_search(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {
+                    "error": "Search error: Error executing plan: Internal error: Error finding id"
+                }
+            return {"results": [{"text": "ok", "wing": "w", "room": "r"}]}
+
+        def fake_reset():
+            reset_calls["n"] += 1
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+        monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", fake_reset)
+        monkeypatch.setattr(mcp_server.time, "sleep", lambda _: None)
+
+        result = mcp_server.tool_search(query="anything")
+
+        assert calls["n"] == 2
+        assert reset_calls["n"] == 1
+        assert "results" in result
+        assert result.get("index_recovered") is True
+
+    def test_search_does_not_retry_on_non_transient_error(self, monkeypatch, config, kg):
+        """Validation / unrelated errors must not trigger the retry path."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        calls = {"n": 0}
+
+        def fake_search(*args, **kwargs):
+            calls["n"] += 1
+            return {"error": "Search error: invalid query syntax"}
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+
+        result = mcp_server.tool_search(query="anything")
+
+        assert calls["n"] == 1
+        assert "error" in result
+        assert "index_recovered" not in result
+
+    def test_search_returns_second_error_if_retry_also_fails(self, monkeypatch, config, kg):
+        """If the transient persists past the retry, surface the second error."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        calls = {"n": 0}
+
+        def fake_search(*args, **kwargs):
+            calls["n"] += 1
+            return {"error": "Search error: Error executing plan: Internal error: Error finding id"}
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+        monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", lambda: None)
+        monkeypatch.setattr(mcp_server.time, "sleep", lambda _: None)
+
+        result = mcp_server.tool_search(query="anything")
+
+        assert calls["n"] == 2
+        assert "error" in result
+        assert "index_recovered" not in result
+
     def test_list_drawers_rejects_invalid_wing(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server
@@ -457,6 +554,26 @@ class TestWriteTools:
         assert result2["success"] is True
         assert result2["reason"] == "already_exists"
 
+    def test_add_drawer_fails_when_readback_misses(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        class _FakeGetResult:
+            ids = []
+
+        class _FakeCol:
+            def get(self, **kwargs):
+                return _FakeGetResult()
+
+            def upsert(self, **kwargs):
+                return None
+
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: _FakeCol())
+
+        result = mcp_server.tool_add_drawer("w", "r", "content")
+        assert result["success"] is False
+        assert "not readable" in result["error"]
+
     def test_add_drawer_shared_header_no_collision(self, monkeypatch, config, palace_path, kg):
         """Documents sharing a >100-char header must get distinct IDs (full-content hash)."""
         _patch_mcp_server(monkeypatch, config, kg)
@@ -494,6 +611,41 @@ class TestWriteTools:
 
         result = tool_delete_drawer("nonexistent_drawer")
         assert result["success"] is False
+
+    def test_check_duplicate_handles_none_metadata(self, monkeypatch, config, kg):
+        """tool_check_duplicate must tolerate None entries in the result lists
+        that ChromaDB 1.5.x returns for partially-flushed rows.
+
+        Previously ``meta = results["metadatas"][0][i]`` was unguarded and
+        raised ``AttributeError: 'NoneType' object has no attribute 'get'``
+        the moment the first matching drawer came back with None metadata —
+        surfacing to the MCP client as the uninformative
+        ``"Duplicate check failed"`` because the broad ``except Exception``
+        wrapper swallows the real cause.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        mock_col = MagicMock()
+        mock_col.query.return_value = {
+            "ids": [["d1", "d2"]],
+            "distances": [[0.05, 0.05]],
+            "metadatas": [[{"wing": "w", "room": "r"}, None]],
+            "documents": [["first doc", None]],
+        }
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: mock_col)
+
+        result = mcp_server.tool_check_duplicate("any content", threshold=0.5)
+
+        # Both entries land in matches (above threshold), None ones rendered
+        # with sentinel values rather than crashing the whole response.
+        assert result.get("is_duplicate") is True
+        assert len(result["matches"]) == 2
+        # The None-metadata entry falls back to sentinels.
+        none_entry = result["matches"][1]
+        assert none_entry["wing"] == "?"
+        assert none_entry["room"] == "?"
+        assert none_entry["content"] == ""
 
     def test_check_duplicate(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -549,6 +701,45 @@ class TestWriteTools:
 
         result = tool_get_drawer("nonexistent_drawer")
         assert "error" in result
+
+    def test_get_drawer_does_not_leak_absolute_source_file_path(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        """tool_get_drawer must not expose the absolute filesystem path
+        that the miners write into ``source_file``. Same threat class as
+        the palace_path leak in mempalace_status: in nested-agent or
+        multi-server MCP topologies the client is a separate trust
+        domain, and the directory layout of the host has no documented
+        client-side use. Basename is enough for citation."""
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        secret_dir = "/private/home/alice/secret-research/2026"
+        absolute_source = f"{secret_dir}/notes.md"
+        collection.add(
+            ids=["drawer_leak_probe"],
+            documents=["verbatim drawer body for leak probe"],
+            metadatas=[
+                {
+                    "wing": "research",
+                    "room": "notes",
+                    "source_file": absolute_source,
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-05-03T00:00:00",
+                }
+            ],
+        )
+
+        from mempalace.mcp_server import tool_get_drawer
+
+        result = tool_get_drawer("drawer_leak_probe")
+        assert result["drawer_id"] == "drawer_leak_probe"
+        assert result["metadata"]["source_file"] == "notes.md"
+        # Defense-in-depth: no field anywhere in the response should
+        # contain the absolute path or its parent directory.
+        serialized = json.dumps(result)
+        assert absolute_source not in serialized
+        assert secret_dir not in serialized
 
     def test_list_drawers(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -669,6 +860,90 @@ class TestKGTools:
             ended="2026-03-01",
         )
         assert result["success"] is True
+        # Regression #1314: response must echo the actual ended date,
+        # not silently drop it and return the literal string "today".
+        assert result["ended"] == "2026-03-01"
+
+    def test_kg_add_forwards_valid_to(self, monkeypatch, config, palace_path, kg):
+        """Regression #1314 case 1: valid_to must round-trip through kg_add."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_add
+
+        result = tool_kg_add(
+            subject="_test_temporal",
+            predicate="had_value",
+            object="probe",
+            valid_from="2026-01-01",
+            valid_to="2026-04-28",
+        )
+        assert result["success"] is True
+
+        facts = kg.query_entity("_test_temporal")
+        assert len(facts) == 1
+        assert facts[0]["valid_from"] == "2026-01-01"
+        assert facts[0]["valid_to"] == "2026-04-28"
+        # An already-ended fact must not be reported as still current.
+        assert facts[0]["current"] is False
+
+    def test_kg_add_forwards_source_provenance(self, monkeypatch, config, palace_path, kg):
+        """Regression #1314 case 3: source_file / source_drawer_id reach storage."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_add
+
+        result = tool_kg_add(
+            subject="operating-verb",
+            predicate="candidate",
+            object="husbandry",
+            valid_from="2026-04-28",
+            source_closet="closet-42",
+            source_file="docs/decisions.md",
+            source_drawer_id="drawer_abc123",
+        )
+        assert result["success"] is True
+
+        triple_id = result["triple_id"]
+        # Read raw row to verify all provenance columns persisted.
+        with kg._lock:
+            row = (
+                kg._conn()
+                .execute(
+                    "SELECT source_closet, source_file, source_drawer_id FROM triples WHERE id = ?",
+                    (triple_id,),
+                )
+                .fetchone()
+            )
+        assert row is not None
+        assert row["source_closet"] == "closet-42"
+        assert row["source_file"] == "docs/decisions.md"
+        assert row["source_drawer_id"] == "drawer_abc123"
+
+    def test_kg_invalidate_returns_actual_ended_date(
+        self, monkeypatch, config, palace_path, seeded_kg
+    ):
+        """Regression #1314 case 2: response reports the resolved date, not 'today'."""
+        from datetime import date as _date
+
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_invalidate
+
+        # Caller-supplied date round-trips into the response.
+        explicit = tool_kg_invalidate(
+            subject="Max",
+            predicate="does",
+            object="swimming",
+            ended="2026-04-28",
+        )
+        assert explicit["ended"] == "2026-04-28"
+
+        # Caller-omitted date resolves to today's ISO date — never the
+        # literal string "today" the buggy implementation used to return.
+        implicit = tool_kg_invalidate(
+            subject="Max",
+            predicate="loves",
+            object="Chess",
+        )
+        assert implicit["ended"] != "today"
+        assert implicit["ended"] == _date.today().isoformat()
 
     def test_kg_timeline(self, monkeypatch, config, palace_path, seeded_kg):
         _patch_mcp_server(monkeypatch, config, seeded_kg)
@@ -683,6 +958,248 @@ class TestKGTools:
 
         result = tool_kg_stats()
         assert result["entities"] >= 4
+
+    # --- Date validation at the MCP boundary (issue #1164) ---
+
+    def test_kg_add_rejects_invalid_valid_from(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_add
+
+        result = tool_kg_add(
+            subject="Alice",
+            predicate="likes",
+            object="coffee",
+            valid_from="Jan 2025",
+        )
+        assert result["success"] is False
+        assert "valid_from" in result["error"]
+        assert "ISO-8601" in result["error"]
+
+    def test_kg_query_rejects_invalid_as_of(self, monkeypatch, config, palace_path, seeded_kg):
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_query
+
+        result = tool_kg_query(entity="Max", as_of="March 2026")
+        assert "error" in result
+        assert "as_of" in result["error"]
+
+    def test_kg_invalidate_rejects_invalid_ended(self, monkeypatch, config, palace_path, seeded_kg):
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_invalidate
+
+        result = tool_kg_invalidate(
+            subject="Max",
+            predicate="does",
+            object="chess",
+            ended="yesterday",
+        )
+        assert result["success"] is False
+        assert "ended" in result["error"]
+
+    def test_kg_query_rejects_partial_iso_dates(self, monkeypatch, config, palace_path, seeded_kg):
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_query
+
+        # Partial ISO dates are rejected: KG queries compare TEXT dates
+        # lexicographically, so "2026-01-01" <= "2026" is False, which
+        # silently excludes facts. Reject at the boundary — only YYYY-MM-DD
+        # produces correct results.
+        for value in ("2026", "2026-03"):
+            result = tool_kg_query(entity="Max", as_of=value)
+            assert "error" in result, f"accepted partial date {value!r}: {result}"
+
+        # Full ISO-8601 dates still pass.
+        result = tool_kg_query(entity="Max", as_of="2026-03-15")
+        assert "error" not in result, f"rejected valid date: {result}"
+
+    def test_kg_add_accepts_datetime_valid_from(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_kg_add(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-05-06T14:23:00Z",
+        )
+
+        assert result["success"] is True
+
+        facts = kg.query_entity("Alice", direction="outgoing")
+        fact = next(r for r in facts if r["predicate"] == "works_at" and r["object"] == "Acme")
+
+        assert fact["valid_from"] == "2026-05-06T14:23:00Z"
+
+    def test_kg_add_accepts_datetime_valid_to(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_kg_add(
+            "Alice",
+            "worked_at",
+            "OldCo",
+            valid_from="2026-05-06T14:00:00Z",
+            valid_to="2026-05-06T15:00:00Z",
+        )
+
+        assert result["success"] is True
+
+        facts = kg.query_entity("Alice", direction="outgoing")
+        fact = next(r for r in facts if r["predicate"] == "worked_at" and r["object"] == "OldCo")
+
+        assert fact["valid_from"] == "2026-05-06T14:00:00Z"
+        assert fact["valid_to"] == "2026-05-06T15:00:00Z"
+
+    def test_kg_query_accepts_datetime_as_of(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        kg.add_triple(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-05-06T14:00:00Z",
+        )
+
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_kg_query(
+            "Alice",
+            as_of="2026-05-06T14:23:00Z",
+            direction="outgoing",
+        )
+
+        assert "error" not in result
+        assert result["as_of"] == "2026-05-06T14:23:00Z"
+        assert result["count"] == 1
+        assert result["facts"][0]["object"] == "Acme"
+
+    def test_kg_invalidate_accepts_datetime_ended(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        kg.add_triple(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-05-06T14:00:00Z",
+        )
+
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_kg_invalidate(
+            "Alice",
+            "works_at",
+            "Acme",
+            ended="2026-05-06T14:23:00Z",
+        )
+
+        assert result["success"] is True
+        assert result["ended"] == "2026-05-06T14:23:00Z"
+
+        facts = kg.query_entity("Alice", direction="outgoing")
+        fact = next(r for r in facts if r["predicate"] == "works_at" and r["object"] == "Acme")
+
+        assert fact["valid_to"] == "2026-05-06T14:23:00Z"
+
+    def test_kg_add_rejects_non_canonical_datetimes(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        from mempalace import mcp_server
+
+        invalid_values = [
+            "2026-05-06T14:23:00+02:00",
+            "2026-05-06T14:23:00-05:30",
+            "2026-05-06T14:23:00.123Z",
+            "2026-05-06 14:23:00",
+            "2026-05-06T14:23:00",
+        ]
+
+        for value in invalid_values:
+            result = mcp_server.tool_kg_add(
+                "Alice",
+                "works_at",
+                "Acme",
+                valid_from=value,
+            )
+
+            assert result["success"] is False, value
+            assert "valid_from" in result["error"]
+            assert "YYYY-MM-DDTHH:MM:SSZ" in result["error"]
+
+    def test_kg_query_rejects_non_canonical_datetime_as_of(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        from mempalace import mcp_server
+
+        invalid_values = [
+            "2026-05-06T14:23:00+02:00",
+            "2026-05-06T14:23:00-05:30",
+            "2026-05-06T14:23:00.123Z",
+            "2026-05-06 14:23:00",
+            "2026-05-06T14:23:00",
+        ]
+
+        for value in invalid_values:
+            result = mcp_server.tool_kg_query(
+                "Alice",
+                as_of=value,
+                direction="outgoing",
+            )
+
+            assert "error" in result, value
+            assert "as_of" in result["error"]
+            assert "YYYY-MM-DDTHH:MM:SSZ" in result["error"]
+
+    def test_kg_invalidate_rejects_non_canonical_ended(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        kg.add_triple(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-05-06T14:00:00Z",
+        )
+
+        from mempalace import mcp_server
+
+        invalid_values = [
+            "2026-05-06T14:23:00+02:00",
+            "2026-05-06T14:23:00-05:30",
+            "2026-05-06T14:23:00.123Z",
+            "2026-05-06 14:23:00",
+            "2026-05-06T14:23:00",
+        ]
+
+        for value in invalid_values:
+            result = mcp_server.tool_kg_invalidate(
+                "Alice",
+                "works_at",
+                "Acme",
+                ended=value,
+            )
+
+            assert result["success"] is False, value
+            assert "ended" in result["error"]
+            assert "YYYY-MM-DDTHH:MM:SSZ" in result["error"]
+
+    def test_kg_add_rejects_timezone_offset_datetime(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        from mempalace import mcp_server
+
+        result = mcp_server.tool_kg_add(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-05-06T14:23:00+02:00",
+        )
+
+        assert result["success"] is False
+        assert "valid_from" in result["error"]
+        assert "YYYY-MM-DDTHH:MM:SSZ" in result["error"]
 
 
 # ── Diary Tools ─────────────────────────────────────────────────────────
@@ -701,7 +1218,8 @@ class TestDiaryTools:
             topic="architecture",
         )
         assert w["success"] is True
-        assert w["agent"] == "TestAgent"
+        # agent_name is normalized to lowercase on write (#1243).
+        assert w["agent"] == "testagent"
 
         r = tool_diary_read(agent_name="TestAgent")
         assert r["total"] == 1
@@ -792,6 +1310,50 @@ class TestDiaryTools:
         r_scoped = tool_diary_read(agent_name="TestAgent", wing="wing_someproject")
         assert r_scoped["total"] == 1
         assert r_scoped["entries"][0]["content"] == "project-wing entry"
+
+    def test_diary_read_case_insensitive_agent(self, monkeypatch, config, palace_path, kg):
+        """Regression for #1243: diary_read must be case-insensitive over
+        agent_name. Writing as "Claude" and reading as "claude" (or vice
+        versa) must surface the same entries — sanitize_name preserved
+        case, which silently dropped reads when the agent name's casing
+        differed from the write."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_diary_read, tool_diary_write
+
+        # Write as "Claude" → read as "claude" should match.
+        w1 = tool_diary_write(
+            agent_name="Claude",
+            entry="entry written as Claude",
+            topic="general",
+        )
+        assert w1["success"]
+
+        r1 = tool_diary_read(agent_name="claude")
+        assert "entries" in r1, r1
+        contents1 = {e["content"] for e in r1["entries"]}
+        assert "entry written as Claude" in contents1
+
+        # Write as "CLAUDE" → read as "Claude" should also match the
+        # same agent. After normalization both writes target the same
+        # lowercase agent identity, so both entries are returned.
+        w2 = tool_diary_write(
+            agent_name="CLAUDE",
+            entry="entry written as CLAUDE",
+            topic="general",
+        )
+        assert w2["success"]
+
+        r2 = tool_diary_read(agent_name="Claude")
+        contents2 = {e["content"] for e in r2["entries"]}
+        assert "entry written as Claude" in contents2
+        assert "entry written as CLAUDE" in contents2
+
+        # The stored agent metadata is the lowercase form, and the
+        # default wing is derived from that lowercase form too.
+        assert w1["agent"] == "claude"
+        assert w2["agent"] == "claude"
 
 
 # ── Cache Invalidation (inode/mtime) ──────────────────────────────────
@@ -900,6 +1462,25 @@ class TestCacheInvalidation:
         assert "Reconnected" in result["message"]
         assert isinstance(result["drawers"], int)
 
+    def test_reconnect_closes_shared_backend(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from unittest.mock import MagicMock
+
+        from mempalace import mcp_server, palace
+
+        close_palace = MagicMock()
+        monkeypatch.setattr(palace._DEFAULT_BACKEND, "close_palace", close_palace)
+
+        class _FakeCol:
+            def count(self):
+                return 7
+
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: _FakeCol())
+
+        result = mcp_server.tool_reconnect()
+        assert result["success"] is True
+        close_palace.assert_called_once_with(config.palace_path)
+
     def test_get_collection_create_true_avoids_get_or_create_on_reopen(
         self, monkeypatch, config, palace_path, kg
     ):
@@ -945,7 +1526,6 @@ class TestCacheInvalidation:
         col2 = mcp_server._get_collection(create=True)
         assert col2 is not None
         assert calls == [], f"get_or_create_collection was called: {calls}"
-
 
 # ── Cross-Palace Tools (palace= arg) ───────────────────────────────────
 

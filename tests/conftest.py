@@ -65,16 +65,33 @@ from mempalace.knowledge_graph import KnowledgeGraph  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _reset_mcp_cache():
-    """Reset the MCP server's per-palace ChromaDB + KG caches between tests."""
+    """Reset the MCP server's per-palace ChromaDB + KG caches between tests.
+
+    If mempalace.mcp_server is already imported, drop both per-palace caches
+    and close any cached KG connections. Skip if it hasn't been imported so
+    fork/spawn-based tests don't inherit extra Chroma/SQLite state.
+    """
 
     def _clear_cache():
         try:
-            from mempalace import mcp_server
+            import sys
 
-            mcp_server._palace_caches.clear()
-            mcp_server._kg_cache.clear()
-        except (ImportError, AttributeError):
+            mcp_server = sys.modules.get("mempalace.mcp_server")
+            if mcp_server is not None:
+                for kg in list(getattr(mcp_server, "_kg_cache", {}).values()):
+                    close = getattr(kg, "close", None)
+                    if close is not None:
+                        try:
+                            close()
+                        except Exception:
+                            pass
+                if hasattr(mcp_server, "_kg_cache"):
+                    mcp_server._kg_cache.clear()
+                if hasattr(mcp_server, "_palace_caches"):
+                    mcp_server._palace_caches.clear()
+        except AttributeError:
             pass
+
         try:
             # Reset the per-process quarantine gate so tests don't leak
             # state through ChromaBackend._quarantined_paths.

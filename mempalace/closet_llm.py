@@ -40,6 +40,7 @@ import json
 import os
 import re
 import time
+import urllib.parse
 import urllib.request
 import urllib.error
 from datetime import datetime
@@ -204,6 +205,14 @@ class LLMConfig:
         self.endpoint = (endpoint or os.environ.get("LLM_ENDPOINT", "")).rstrip("/")
         self.key = key or os.environ.get("LLM_KEY", "")
         self.model = model or os.environ.get("LLM_MODEL", "")
+        if self.endpoint:
+            # Privacy-by-architecture: reject file:// and other non-HTTP schemes
+            # so a misconfigured endpoint cannot exfiltrate local files.
+            scheme = urllib.parse.urlparse(self.endpoint).scheme.lower()
+            if scheme not in ("http", "https"):
+                raise ValueError(
+                    f"LLM_ENDPOINT must use http:// or https:// (got scheme {scheme!r})"
+                )
 
     def missing(self) -> list:
         missing = []
@@ -263,6 +272,9 @@ def _call_llm(cfg: LLMConfig, source_file: str, wing: str, room: str, content: s
             parsed = json.loads(text)
             return parsed, payload.get("usage")
         except json.JSONDecodeError:
+            if attempt < 2:
+                time.sleep(2**attempt)
+                continue
             return None, None
         except urllib.error.HTTPError as e:
             # 429 / 503 = retry with backoff
@@ -371,14 +383,16 @@ def regenerate_closets(
     # SQL variables" when limit exceeds ~32K (the SQLITE_MAX_VARIABLE_NUMBER
     # parameter limit), so we can't load everything in one call on large
     # palaces. 10K per page keeps us well under the limit.
-    by_source = {}
+    by_source: dict = {}
     PAGE = 10000
     offset = 0
     while offset < total:
-        page = drawers_col.get(
-            limit=PAGE, offset=offset, include=["documents", "metadatas"]
-        )
-        for doc_id, doc, meta in zip(page["ids"], page["documents"], page["metadatas"]):
+        page = drawers_col.get(limit=PAGE, offset=offset, include=["documents", "metadatas"])
+        ids = page["ids"]
+        if not ids:
+            break
+        for doc_id, doc, meta in zip(ids, page["documents"], page["metadatas"]):
+            meta = meta or {}
             source = meta.get("source_file", "unknown")
             w = meta.get("wing", "")
             if wing and w != wing:
@@ -387,7 +401,7 @@ def regenerate_closets(
                 by_source[source] = {"drawer_ids": [], "content": [], "meta": meta}
             by_source[source]["drawer_ids"].append(doc_id)
             by_source[source]["content"].append(doc)
-        offset += PAGE
+        offset += len(ids)
 
     sources = list(by_source.keys())
     if sample > 0:

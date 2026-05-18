@@ -11,6 +11,7 @@ Same palace as project mining. Different ingest strategy.
 import os
 import sys
 import hashlib
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
@@ -27,6 +28,8 @@ from .palace import (
     mine_lock,
 )
 from .parallel import ParallelPipeline, WorkerResult
+
+logger = logging.getLogger("mempalace_mcp")
 
 
 # Cached hall keywords — avoids re-reading config per drawer
@@ -481,7 +484,7 @@ def _write_prepared_convo(
         try:
             collection.delete(where={"source_file": source_file})
         except Exception:
-            pass
+            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
 
         for batch, batch_embeddings in zip(prepared.batches, embeddings_batches):
             try:

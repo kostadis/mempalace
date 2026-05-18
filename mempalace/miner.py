@@ -8,10 +8,12 @@ Stores verbatim chunks as drawers. No summaries. Ever.
 """
 
 import os
+import re
 import sys
 import shlex
 import hashlib
 import fnmatch
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
@@ -22,7 +24,6 @@ from .config import MempalaceConfig
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
-    MineAlreadyRunning,
     build_closet_lines,
     file_already_mined,
     get_closets_collection,
@@ -33,6 +34,8 @@ from .palace import (
     upsert_closet_lines,
 )
 from .parallel import ParallelPipeline, WorkerResult
+
+logger = logging.getLogger("mempalace_mcp")
 
 READABLE_EXTENSIONS = {
     ".txt",
@@ -67,6 +70,8 @@ SKIP_FILENAMES = {
     ".gitignore",
     ".mempalaceignore",
     "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
 }
 
 CHUNK_SIZE = 800  # chars per drawer
@@ -74,6 +79,13 @@ CHUNK_OVERLAP = 100  # overlap between chunks
 MIN_CHUNK_SIZE = 50  # skip tiny chunks
 DRAWER_UPSERT_BATCH_SIZE = 1000
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
+# A single file producing more chunks than this is almost always a generated
+# artifact (CSV/JSON dump, lockfile not in SKIP_FILENAMES, etc.). Embedding
+# thousands of chunks from one file in one batch has triggered ONNX runtime
+# `bad allocation` errors on Windows (#1296). The cap is conservative: a
+# 500-chunk file at CHUNK_SIZE=800 is ~400 KB of source, which covers most
+# legitimate hand-written content while bounding the worst-case batch.
+MAX_CHUNKS_PER_FILE = 500
 # Long Claude Code sessions and large transcript exports routinely exceed
 # 10 MB. The cap exists as a defensive rail against pathological binary
 # files, not as a limit on legitimate text. Per-drawer size is bounded
@@ -330,6 +342,28 @@ def load_config(project_dir: str) -> dict:
 # FILE ROUTING — which room does this file belong to?
 # =============================================================================
 
+_TOKEN_SPLIT = re.compile(r"[-_./]+")
+
+
+def _tokens(value: str) -> set:
+    """Split ``value`` into lowercased tokens bounded by ``-``, ``_``, ``.`` or ``/``."""
+    return {t for t in _TOKEN_SPLIT.split(value.lower()) if t}
+
+
+def _name_matches(a: str, b: str) -> bool:
+    """Return True when ``a`` and ``b`` match as equal strings or as
+    separator-bounded tokens of each other.
+
+    Prevents incidental substring collisions (e.g., ``"views" in "interviews"``)
+    that a raw ``in`` check would produce, while preserving the intended
+    match for real tokens (e.g., ``"frontend"`` in ``"frontend-app"``).
+    """
+    a = a.lower()
+    b = b.lower()
+    if a == b:
+        return True
+    return b in _tokens(a) or a in _tokens(b)
+
 
 def detect_room(filepath: Path, content: str, rooms: list, project_path: Path) -> str:
     """
@@ -349,12 +383,12 @@ def detect_room(filepath: Path, content: str, rooms: list, project_path: Path) -
     for part in path_parts[:-1]:  # skip filename itself
         for room in rooms:
             candidates = [room["name"].lower()] + [k.lower() for k in room.get("keywords", [])]
-            if any(part == c or c in part or part in c for c in candidates):
+            if any(_name_matches(part, c) for c in candidates):
                 return room["name"]
 
     # Priority 2: filename matches room name
     for room in rooms:
-        if room["name"].lower() in filename or filename in room["name"].lower():
+        if _name_matches(filename, room["name"]):
             return room["name"]
 
     # Priority 3: keyword scoring from room keywords + name
@@ -870,6 +904,13 @@ def _prepare_file(
     room = detect_room(filepath, content, rooms, project_path)
     chunks = chunk_text(content, source_file)
 
+    if len(chunks) > MAX_CHUNKS_PER_FILE:
+        print(
+            f"  ! [skip] {filepath.name[:50]:50} produced {len(chunks)} chunks "
+            f"(> {MAX_CHUNKS_PER_FILE}); add to SKIP_FILENAMES or .gitignore"
+        )
+        return None
+
     try:
         source_mtime = os.path.getmtime(source_file)
     except OSError:
@@ -953,7 +994,7 @@ def _write_prepared(
         try:
             collection.delete(where={"source_file": source_file})
         except Exception:
-            pass
+            logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
 
         drawers_added = 0
         for batch, batch_embeddings in zip(prepared.batches, embeddings_batches):
@@ -1151,27 +1192,22 @@ def mine(
             workers=workers,
         )
 
-    try:
-        with mine_palace_lock(palace_path):
-            return _mine_impl(
-                project_dir,
-                palace_path,
-                wing_override=wing_override,
-                agent=agent,
-                limit=limit,
-                dry_run=dry_run,
-                respect_ignore=respect_ignore,
-                include_ignored=include_ignored,
-                files=files,
-                workers=workers,
-            )
-    except MineAlreadyRunning:
-        print(
-            f"mempalace: another `mine` is already running against "
-            f"{palace_path} — exiting cleanly.",
-            file=sys.stderr,
+    # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
+    # message and exit non-zero. In-process callers (tests, library users) that
+    # expect to coexist with another writer should handle the exception.
+    with mine_palace_lock(palace_path):
+        return _mine_impl(
+            project_dir,
+            palace_path,
+            wing_override=wing_override,
+            agent=agent,
+            limit=limit,
+            dry_run=dry_run,
+            respect_ignore=respect_ignore,
+            include_ignored=include_ignored,
+            files=files,
+            workers=workers,
         )
-        return
 
 
 def _mine_impl(
@@ -1377,6 +1413,24 @@ def _mine_impl(
             "already-filed drawers are\n  upserted idempotently and will not duplicate.\n"
         )
         sys.exit(130)
+    except Exception as exc:
+        # Without this, an arbitrary exception (ONNX bad_alloc, chromadb HNSW
+        # error, OS fault) propagates and the process exits with no completion
+        # banner — the operator sees only the final progress line and assumes
+        # the mine succeeded (#1296). Print the partial-progress summary the
+        # way we do for KeyboardInterrupt, then re-raise so the original
+        # traceback still surfaces and the exit code is non-zero.
+        print("\n\n  Mine aborted by exception.")
+        print(f"    files_processed: {files_processed}/{len(files)}")
+        print(f"    drawers_filed:   {total_drawers}")
+        print(f"    last_file:       {last_file or '<none>'}")
+        print(f"    error:           {type(exc).__name__}: {exc}")
+        print(
+            f"\n  Re-run `mempalace mine {shlex.quote(project_dir)}` after addressing "
+            "the cause — already-filed\n  drawers are upserted idempotently and will "
+            "not duplicate.\n"
+        )
+        raise
     finally:
         # Clean up the hooks-side PID lock if it points at us. Stale
         # entries already pass _pid_alive() == False on POSIX, but
@@ -1388,30 +1442,29 @@ def _mine_impl(
 
 
 def _cleanup_mine_pid_file() -> None:
-    """Remove the global mine PID file if it currently points at us.
+    """Remove this process's per-target PID slot on exit.
 
-    The PID file (``~/.mempalace/hook_state/mine.pid``, written by the
-    hook in :func:`mempalace.hooks_cli._spawn_mine`) tracks the PID of
-    the most recently spawned mine subprocess so the hook can dedup
-    concurrent auto-ingest fires. When that subprocess exits — cleanly,
-    on error, or via Ctrl-C — it should remove its own entry so the
-    next hook fire isn't briefly fooled by a stale PID before
-    ``_pid_alive`` returns False.
+    Hook-spawned mines receive ``MEMPALACE_MINE_PID_FILE`` in their env
+    pointing at the slot the hook claimed for them
+    (``~/.mempalace/hook_state/mine_pids/mine_<sha>.pid``). When the
+    subprocess exits — cleanly, on error, or via Ctrl-C — it removes its
+    own slot so the next hook fire isn't briefly fooled by a stale PID
+    before ``_pid_alive`` returns False.
 
-    We only delete the file if it claims our own PID; any other PID is
-    left alone (could be an unrelated mine running concurrently from
-    a different worktree / session).
+    Only delete the slot if it claims our own PID; any other PID is left
+    alone (it could belong to an unrelated mine that just claimed the
+    same slot via a stale-reclaim race).
     """
-    try:
-        from .hooks_cli import _MINE_PID_FILE
-    except Exception:
+    pid_file_env = os.environ.get("MEMPALACE_MINE_PID_FILE", "")
+    if not pid_file_env:
         return
     try:
-        if not _MINE_PID_FILE.exists():
+        pid_file = Path(pid_file_env)
+        if not pid_file.exists():
             return
-        recorded = _MINE_PID_FILE.read_text().strip()
+        recorded = pid_file.read_text().strip()
         if recorded and recorded.isdigit() and int(recorded) == os.getpid():
-            _MINE_PID_FILE.unlink()
+            pid_file.unlink()
     except OSError:
         # Best-effort cleanup; never fail the mine over PID bookkeeping.
         pass
