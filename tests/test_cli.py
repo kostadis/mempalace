@@ -1209,6 +1209,44 @@ def test_cmd_repair_trailing_slash_does_not_recurse():
     assert not backup_path.startswith(palace_path + os.sep)
 
 
+def test_cmd_repair_status_resolves_named_palace_alias(monkeypatch, tmp_path, capsys):
+    """Bug: ``mempalace repair-status --palace <alias>`` reported "No palace
+    found" because cmd_repair_status read --palace as a raw filesystem path.
+    Mirrors the same fix sync got — route through ``_resolve_cli_palace``.
+    """
+    import json as _json
+    from mempalace import cli
+
+    # Materialise a minimal palace dir so repair-status has something to read.
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    (palace_dir / "chroma.sqlite3").write_bytes(b"")
+
+    cfg_path = os.path.join(os.environ["HOME"], ".mempalace", "config.json")
+    with open(cfg_path) as f:
+        cfg = _json.load(f)
+    original = _json.dumps(cfg)
+    cfg.setdefault("palaces", {})["repair_status_test_alias"] = str(palace_dir)
+    with open(cfg_path, "w") as f:
+        _json.dump(cfg, f)
+    try:
+        argv = [
+            "mempalace",
+            "--palace",
+            "repair_status_test_alias",
+            "repair-status",
+        ]
+        monkeypatch.setattr("sys.argv", argv)
+        cli.main()
+        captured = capsys.readouterr().out
+        assert "No palace found" not in captured, captured
+        # The repair-status banner uses the resolved palace path.
+        assert str(palace_dir) in captured, captured
+    finally:
+        with open(cfg_path, "w") as f:
+            f.write(original)
+
+
 # ── stdio reconfigure on Windows ─────────────────────────────────────
 
 

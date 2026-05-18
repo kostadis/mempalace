@@ -761,7 +761,7 @@ def cmd_repair_status(args):
     """Read-only HNSW capacity health check (#1222)."""
     from .repair import status as repair_status
 
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    palace_path = _resolve_cli_palace(args)
     repair_status(palace_path=palace_path)
 
 

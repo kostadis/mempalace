@@ -102,13 +102,6 @@ _HNSW_BLOAT_GUARD = {
     "hnsw:sync_threshold": 50_000,
 }
 
-# Missing index_metadata.pickle is normal only while a segment is still fresh
-# or effectively empty. Once data_level0.bin has non-trivial payload, a
-# missing metadata pickle means the segment was interrupted after writing HNSW
-# data but before writing its metadata. Letting Chroma open that shape can
-# segfault or hang in native HNSW code.
-_HNSW_MISSING_METADATA_DATA_FLOOR = 1024
-
 
 def _validate_where(where: Optional[dict]) -> None:
     """Scan a where-clause for unknown operators and raise ``UnsupportedFilterError``.
@@ -134,46 +127,43 @@ def _validate_where(where: Optional[dict]) -> None:
 def _segment_appears_healthy(seg_dir: str) -> bool:
     """Return True if a chromadb HNSW segment dir looks intact.
 
-    Sniff-tests the chromadb-written segment metadata file
-    (``index_metadata.pickle``) for its expected format bytes without
-    parsing it. ChromaDB writes that file after a successful HNSW flush;
-    a complete write starts with byte ``0x80`` and ends with byte
-    ``0x2e`` (the protocol/terminator byte sequence chromadb serializes
-    with).
+    Health is decided in two layers:
 
-    Missing metadata is healthy only while the segment still looks fresh or
-    empty. If ``data_level0.bin`` already has non-trivial payload but
-    ``index_metadata.pickle`` is missing, the segment is partially flushed:
-    Chroma wrote vector data without the metadata it needs to reopen the
-    HNSW reader safely.
+    1. **Payload structure** (:func:`_hnsw_payload_appears_sane`): when
+       both ``data_level0.bin`` and ``link_lists.bin`` are present, the
+       link/data size ratio must be within bounds. A wildly-disproportionate
+       ratio is the structurally-impossible-HNSW signature from #1218.
+    2. **Metadata pickle** (``index_metadata.pickle``): if present, must
+       look like a complete pickle (PROTO marker, STOP terminator). If
+       absent, the segment is in the routine "metadata not yet flushed"
+       state that chromadb operates in continuously — :func:`hnsw_capacity_status`
+       reports this case as ``"HNSW capacity unavailable: metadata has
+       not been flushed; leaving vector search enabled"``, and search /
+       status / mine / sync all read these palaces without issue. The
+       quarantine pre-check must match that tolerance or it produces
+       false positives on every mempalace operation that triggers the
+       cold-start gate (#1532).
 
-    Deliberately format-sniffs only; never deserializes. Deserialization
-    can execute arbitrary code, and the byte-sniff is sufficient to
-    distinguish a complete write from truncation, zero-fill, or
-    partial-flush corruption.
+    The earlier heuristic treated missing-metadata with data size
+    > 1 KiB as partial-flush corruption. That assumption was wrong:
+    chromadb routinely accumulates many KiB of vector payload before its
+    first metadata flush (especially with the bloat-guard sync threshold
+    set to 50 000 rows), so every healthy palace below that flush
+    boundary triggered the quarantine.
 
-    Assumes pickle protocol >= 2 (``0x80`` PROTO marker). Matches what
-    chromadb writes today; if a future chromadb version emits protocol
-    0/1 segments, this check would start returning False on healthy
-    files and quarantine_stale_hnsw would conservatively rename them
-    out of the way.
+    Deliberately format-sniffs the pickle only; never deserializes.
+    Deserialization can execute arbitrary code, and the byte-sniff is
+    sufficient to distinguish a complete write from truncation,
+    zero-fill, or partial-flush corruption. Assumes pickle protocol
+    >= 2 (``0x80`` PROTO marker).
     """
     if not _hnsw_payload_appears_sane(seg_dir):
         return False
 
     meta_path = os.path.join(seg_dir, "index_metadata.pickle")
     if not os.path.isfile(meta_path):
-        data_path = os.path.join(seg_dir, "data_level0.bin")
-        try:
-            if (
-                os.path.isfile(data_path)
-                and os.path.getsize(data_path) > _HNSW_MISSING_METADATA_DATA_FLOOR
-            ):
-                return False
-        except OSError:
-            return False
-
-        # No metadata and no meaningful vector payload yet: fresh/empty segment.
+        # Pickle not yet flushed. Payload sanity already passed; chromadb
+        # tolerates this state, so we do too.
         return True
 
     try:

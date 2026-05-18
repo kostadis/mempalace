@@ -19,7 +19,6 @@ from mempalace.backends import (
 from mempalace.backends.chroma import (
     ChromaBackend,
     ChromaCollection,
-    _HNSW_MISSING_METADATA_DATA_FLOOR,
     _fix_blob_seq_ids,
     _pin_hnsw_threads,
     _segment_appears_healthy,
@@ -695,48 +694,82 @@ def test_quarantine_stale_hnsw_leaves_empty_segment_without_metadata_alone(tmp_p
     assert seg.exists()
 
 
-def test_segment_without_metadata_but_with_nontrivial_data_is_unhealthy(tmp_path):
-    """Data without index_metadata.pickle is a partial flush, not a fresh segment."""
+def test_segment_without_metadata_but_with_sane_payload_is_healthy(tmp_path):
+    """Missing ``index_metadata.pickle`` alongside a structurally sane HNSW
+    payload is the routine "not yet flushed" state, not corruption.
 
+    Reproduces the Phandalin overstrict-integrity-check bug: every fresh
+    palace below chromadb's sync threshold has data files but no metadata
+    pickle, and the old heuristic flagged that as partial-flush corruption.
+    ``hnsw_capacity_status`` reports this case as ``"leaving vector
+    search enabled"``; ``_segment_appears_healthy`` must agree, or the
+    cold-start quarantine produces ``.drift-*`` archives on healthy
+    palaces every time sync (or any other operation that triggers the
+    gate) runs after a state advance.
+    """
     seg = tmp_path / "abcd-1234-5678"
     seg.mkdir()
-    (seg / "data_level0.bin").write_bytes(b"\0" * (_HNSW_MISSING_METADATA_DATA_FLOOR + 1))
-
-    assert not _segment_appears_healthy(str(seg))
-
-
-def test_segment_without_metadata_and_tiny_data_is_still_treated_as_fresh(tmp_path):
-    """Tiny data payloads can occur before metadata has flushed; leave them alone."""
-
-    seg = tmp_path / "abcd-1234-5678"
-    seg.mkdir()
-    (seg / "data_level0.bin").write_bytes(b"\0" * _HNSW_MISSING_METADATA_DATA_FLOOR)
+    # Non-trivial payload, link/data ratio under the 10x ceiling.
+    (seg / "data_level0.bin").write_bytes(b"\0" * 8192)
+    (seg / "link_lists.bin").write_bytes(b"\0" * 1024)
 
     assert _segment_appears_healthy(str(seg))
 
 
-def test_quarantine_stale_hnsw_renames_missing_metadata_with_nontrivial_data(tmp_path):
-    """Regression for #1274: missing pickle + non-trivial data must quarantine."""
+def test_segment_without_metadata_and_no_payload_is_still_treated_as_fresh(tmp_path):
+    """A genuinely empty segment dir has no payload at all — also healthy."""
 
+    seg = tmp_path / "abcd-1234-5678"
+    seg.mkdir()
+    (seg / "data_level0.bin").write_bytes(b"")
+
+    assert _segment_appears_healthy(str(seg))
+
+
+def test_segment_without_metadata_but_with_corrupt_link_ratio_is_unhealthy(tmp_path):
+    """Structural sanity still rules: a missing pickle does not excuse a
+    300x link/data ratio. The payload sanity check is the corruption
+    signal the missing-pickle path used to be — keep it, even when
+    metadata is unflushed."""
+
+    seg = tmp_path / "abcd-1234-5678"
+    seg.mkdir()
+    (seg / "data_level0.bin").write_bytes(b"\0" * 1024)
+    # 300x ratio is the #1218 corruption signature.
+    (seg / "link_lists.bin").write_bytes(b"\0" * (1024 * 300))
+
+    assert not _segment_appears_healthy(str(seg))
+
+
+def test_quarantine_stale_hnsw_leaves_unflushed_metadata_with_sane_payload_alone(tmp_path):
+    """Regression for the Phandalin overstrict-integrity-check bug.
+
+    Setup mirrors a healthy chromadb palace whose first metadata flush
+    hasn't happened yet: vector data and link structure both exist, the
+    metadata pickle does not, and sqlite is newer than the HNSW files
+    (because writes keep coming in while the metadata flush is deferred
+    by chromadb's sync threshold). Quarantine must leave the segment
+    alone — chromadb reads it fine, and renaming it forces an expensive
+    recreate and accumulates ``.drift-*`` archives over time.
+    """
     now = 1_700_000_000.0
-    palace, seg = _make_palace_with_segment(
-        tmp_path,
-        hnsw_mtime=now - 7200,
-        sqlite_mtime=now,
-        meta_bytes=None,
-    )
-    (seg / "data_level0.bin").write_bytes(b"\0" * (_HNSW_MISSING_METADATA_DATA_FLOOR + 1))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_text("")
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    (seg / "data_level0.bin").write_bytes(b"\0" * 8192)
+    (seg / "link_lists.bin").write_bytes(b"\0" * 1024)
+    # No index_metadata.pickle — that's the bug condition.
     os.utime(seg / "data_level0.bin", (now - 7200, now - 7200))
+    os.utime(palace / "chroma.sqlite3", (now, now))
 
     moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
 
-    assert len(moved) == 1
-    assert ".drift-" in moved[0]
-    assert not seg.exists()
-
+    assert moved == []
+    assert seg.exists()
     drift_dirs = [p for p in palace.iterdir() if ".drift-" in p.name]
-    assert len(drift_dirs) == 1
-    assert (drift_dirs[0] / "data_level0.bin").exists()
+    assert drift_dirs == []
 
 
 def test_quarantine_stale_hnsw_renames_truncated_metadata(tmp_path):
@@ -821,9 +854,9 @@ def test_make_client_quarantines_only_on_first_call_per_palace(tmp_path, monkeyp
     ChromaBackend.make_client(palace_path)
     ChromaBackend.make_client(palace_path)
 
-    assert calls == [
-        palace_path
-    ], "quarantine_stale_hnsw should fire once per palace per process, not on every reconnect"
+    assert calls == [palace_path], (
+        "quarantine_stale_hnsw should fire once per palace per process, not on every reconnect"
+    )
 
 
 def test_make_client_gates_invalid_metadata_on_first_call(tmp_path, monkeypatch):
@@ -939,9 +972,9 @@ def test_client_quarantines_only_on_first_call_per_palace(tmp_path, monkeypatch)
     finally:
         backend.close()
 
-    assert (
-        calls == [palace_path]
-    ), "quarantine_stale_hnsw should fire once per palace per process from _client(), not on every call"
+    assert calls == [palace_path], (
+        "quarantine_stale_hnsw should fire once per palace per process from _client(), not on every call"
+    )
 
 
 # ── _pin_hnsw_threads (per-process retrofit, separate from this PR's gate) ──
