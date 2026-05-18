@@ -537,6 +537,225 @@ class TestSyncPalace:
         assert report["kept"] == 1
         assert report["gitignored"] == 1
 
+    def test_auto_detected_wing_not_flagged_by_root_ignore(self, tmp_dir, palace_path):
+        """Follow-up bug: sub-wings configured by basename (no
+        ``mempalace.yaml`` of their own) were still being flagged as
+        gitignored when the root ``.mempalaceignore`` listed their source
+        dir. The yaml-only carve-out shipped earlier missed them.
+
+        The mine root for an auto-detected wing is identifiable from the
+        drawer metadata: the wing's name is ``normalize_wing_name(dir.name)``
+        of the dir originally passed to ``mempalace mine``. Walking up
+        source_file's parents looking for an ancestor whose normalized
+        basename equals the drawer's wing finds that mine root.
+        """
+        from mempalace.sync import sync_palace
+
+        repo_path = Path(tmp_dir) / "repo"
+        extracts = repo_path / "docs" / "distill_extractions"
+        extracts.mkdir(parents=True)
+        # Root .mempalaceignore lists the sub-wing dir — the standard pattern
+        # so the ROOT wing's mine doesn't double-ingest sub-wing content.
+        (repo_path / ".mempalaceignore").write_text("docs/distill_extractions/\n")
+        # NO mempalace.yaml in the sub-wing — wing name was auto-derived
+        # from the dir basename when `mempalace mine docs/distill_extractions/`
+        # ran. Mirrors the Phandalin distill_extractions wing exactly.
+        (extracts / "extract_001.md").write_text("# extract 1\n")
+        (extracts / "extract_002.md").write_text("# extract 2\n")
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
+        )
+        col.add(
+            ids=["d_ext01", "d_ext02"],
+            documents=["e1", "e2"],
+            embeddings=[[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            metadatas=[
+                {
+                    "wing": "distill_extractions",
+                    "room": "general",
+                    "source_file": str(extracts / "extract_001.md"),
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-05-09T00:00:00",
+                },
+                {
+                    "wing": "distill_extractions",
+                    "room": "general",
+                    "source_file": str(extracts / "extract_002.md"),
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-05-09T00:00:00",
+                },
+            ],
+        )
+        del client
+
+        report = sync_palace(
+            palace_path=palace_path,
+            project_dirs=[str(repo_path)],
+            wing="distill_extractions",
+            dry_run=True,
+        )
+        assert report["scanned"] == 2
+        assert report["kept"] == 2
+        assert report["gitignored"] == 0
+        assert report["missing"] == 0
+
+    def test_auto_detected_wing_name_with_separators(self, tmp_dir, palace_path):
+        """Wing names normalize ``-`` and spaces to ``_``; the basename
+        match must apply the same normalization on both sides so a wing
+        ``my_notes`` mined from a dir named ``my-notes`` (or ``my notes``)
+        is still recognised."""
+        from mempalace.sync import sync_palace
+
+        repo_path = Path(tmp_dir) / "repo"
+        notes = repo_path / "docs" / "my-notes"
+        notes.mkdir(parents=True)
+        (repo_path / ".mempalaceignore").write_text("docs/my-notes/\n")
+        (notes / "note_01.md").write_text("# n1\n")
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
+        )
+        col.add(
+            ids=["d_n01"],
+            documents=["n1"],
+            embeddings=[[1.0, 0.0, 0.0]],
+            metadatas=[
+                {
+                    "wing": "my_notes",
+                    "room": "general",
+                    "source_file": str(notes / "note_01.md"),
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-05-09T00:00:00",
+                },
+            ],
+        )
+        del client
+
+        report = sync_palace(
+            palace_path=palace_path,
+            project_dirs=[str(repo_path)],
+            wing="my_notes",
+            dry_run=True,
+        )
+        assert report["kept"] == 1
+        assert report["gitignored"] == 0
+
+    def test_project_mode_gitignore_only(self, tmp_dir, palace_path):
+        """In a project with no ``.mempalaceignore`` at the root, sync
+        reads ``.gitignore`` files throughout — and only ``.gitignore``.
+        A stray ``.mempalaceignore`` deep in the tree is not consulted."""
+        from mempalace.sync import sync_palace
+
+        repo_path = Path(tmp_dir) / "repo"
+        sub = repo_path / "sub"
+        sub.mkdir(parents=True)
+        # No .mempalaceignore at root → project is gitignore-mode.
+        (repo_path / ".gitignore").write_text("build/\n")
+        (repo_path / "build").mkdir()
+        (repo_path / "build" / "drop.py").write_text("# drop\n")
+        # A misplaced .mempalaceignore deeper in the tree must NOT take
+        # effect — the project chose gitignore-mode at the root.
+        (sub / ".mempalaceignore").write_text("*.md\n")
+        (sub / "keep.md").write_text("# keep\n")
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
+        )
+        col.add(
+            ids=["d_drop", "d_keep"],
+            documents=["x", "y"],
+            embeddings=[[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            metadatas=[
+                {
+                    "wing": "demo",
+                    "room": "general",
+                    "source_file": str(repo_path / "build" / "drop.py"),
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-05-09T00:00:00",
+                },
+                {
+                    "wing": "demo",
+                    "room": "general",
+                    "source_file": str(sub / "keep.md"),
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-05-09T00:00:00",
+                },
+            ],
+        )
+        del client
+
+        report = sync_palace(
+            palace_path=palace_path,
+            project_dirs=[str(repo_path)],
+            wing="demo",
+            dry_run=True,
+        )
+        assert report["gitignored"] == 1  # build/drop.py via root .gitignore
+        assert report["kept"] == 1  # sub/keep.md — the misplaced .mempalaceignore was ignored
+
+    def test_project_mode_mempalaceignore_only(self, tmp_dir, palace_path):
+        """In a project with ``.mempalaceignore`` at the root, ``.gitignore``
+        files are not consulted — the project is mempalace-mode throughout."""
+        from mempalace.sync import sync_palace
+
+        repo_path = Path(tmp_dir) / "repo"
+        (repo_path / "build").mkdir(parents=True)
+        # .mempalaceignore at root → project is mempalace-mode.
+        (repo_path / ".mempalaceignore").write_text("build/\n")
+        # A .gitignore listing the same dir must NOT also take effect —
+        # but more importantly, a .gitignore listing something ELSE must
+        # not flag those files either.
+        (repo_path / ".gitignore").write_text("*.md\n")
+        (repo_path / "build" / "drop.py").write_text("# drop\n")
+        (repo_path / "keep.md").write_text("# keep\n")
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
+        )
+        col.add(
+            ids=["d_drop", "d_keep"],
+            documents=["x", "y"],
+            embeddings=[[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            metadatas=[
+                {
+                    "wing": "demo",
+                    "room": "general",
+                    "source_file": str(repo_path / "build" / "drop.py"),
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-05-09T00:00:00",
+                },
+                {
+                    "wing": "demo",
+                    "room": "general",
+                    "source_file": str(repo_path / "keep.md"),
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-05-09T00:00:00",
+                },
+            ],
+        )
+        del client
+
+        report = sync_palace(
+            palace_path=palace_path,
+            project_dirs=[str(repo_path)],
+            wing="demo",
+            dry_run=True,
+        )
+        assert report["gitignored"] == 1  # build/drop.py via .mempalaceignore
+        assert report["kept"] == 1  # keep.md — .gitignore's `*.md` is not consulted
+
     def test_closet_purge_runs_on_apply(self, synced_world):
         """Closets pointing at removed sources must also disappear."""
         from mempalace.sync import sync_palace

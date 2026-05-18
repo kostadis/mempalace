@@ -16,7 +16,12 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Optional, TypedDict
 
-from .miner import is_ignored as is_gitignored, load_ignore_matcher as load_gitignore_matcher
+from .config import normalize_wing_name
+from .miner import (
+    detect_ignore_filename,
+    is_ignored as apply_ignore_matchers,
+    load_ignore_matcher,
+)
 from .palace import (
     MineAlreadyRunning,
     get_closets_collection,
@@ -60,47 +65,83 @@ def _resolve_project_root(source_file: Path, project_roots: list) -> Optional[Pa
     return None
 
 
-def _find_wing_source_root(source_file: Path, project_root: Path, wing_root_cache: dict) -> Path:
-    """Return the nearest ``mempalace.yaml``-rooted ancestor of ``source_file``
-    (within ``project_root``). Falls back to ``project_root`` when no per-wing
-    config marker is found.
+def _find_wing_source_root(
+    source_file: Path,
+    project_root: Path,
+    wing_name: Optional[str],
+    cache: dict,
+) -> Path:
+    """Find the wing's mine root — the dir originally passed to ``mempalace mine``.
 
-    The miner walks each wing's tree from its own ``mempalace.yaml`` dir, so
-    that directory — not a higher ancestor — is the matcher scope for the
-    wing's drawers. A root-level ``.mempalaceignore`` typically lists each
-    sub-wing's source dir so the ROOT wing's mine skips them; those patterns
-    are not in scope for sub-wing drawers, which were deliberately mined
-    from inside the listed dirs. Without this check, sync flags every sub-
-    wing drawer as gitignored and would delete them on ``--apply``.
+    The miner's ignore walk starts at the mine root and goes downward, so
+    every ignore file the miner saw lives at-or-below it. Mirroring that
+    scope at sync time keeps a drawer from being flagged by ancestor
+    ignore files the miner never consulted (the original Phandalin bug:
+    a root ``.mempalaceignore`` listing sub-wing dirs flagged every
+    sub-wing drawer).
 
-    Walks are cached per directory: once we decide a wing root for ``a/b/c``,
-    every chunk of every file under that subtree reuses the answer.
+    Walks ``source_file``'s parents up to ``project_root`` (inclusive):
+
+    - **Basename match wins immediately.** If ``normalize_wing_name(dir.name)``
+      equals the drawer's wing, this is the wing's mine root. Auto-detected
+      wings inherit their name from the source-dir basename via the same
+      normalization, so this match identifies the original mine dir
+      directly.
+    - **Otherwise, the innermost ``mempalace.yaml`` ancestor wins.** Yaml-
+      configured wings whose ``wing:`` field differs from the dir basename
+      (e.g. dir ``chapters/`` with ``wing: narrative``) get found here.
+    - **Otherwise, fall back to ``project_root``.** Preserves the historical
+      single-wing behaviour when neither signal pins down a wing-specific
+      mine root.
+
+    A yaml encountered higher up than a basename match is *not* preferred:
+    the miner reads the yaml at the dir it was invoked on, not at ancestors.
+    A misleading ancestor yaml (e.g. ``/repo/mempalace.yaml`` while the
+    user mined ``/repo/sub/``) must not override the basename signal.
+
+    Cache key is ``(dir, wing_name)``: the basename comparison is wing-
+    specific so two wings sharing a path subtree need separate entries.
     """
-    visited: list = []
+    cache_key = (source_file.parent, wing_name)
+    if cache_key in cache:
+        return cache[cache_key]
+
+    normalized_wing = normalize_wing_name(wing_name) if wing_name else None
     candidate = source_file.parent
+    first_yaml: Optional[Path] = None
+    answer: Path = project_root
+
     while True:
-        if candidate in wing_root_cache:
-            answer = wing_root_cache[candidate]
-            break
-        visited.append(candidate)
-        if any((candidate / name).is_file() for name in _WING_CONFIG_NAMES):
+        if normalized_wing and normalize_wing_name(candidate.name) == normalized_wing:
             answer = candidate
             break
+        if first_yaml is None and any((candidate / name).is_file() for name in _WING_CONFIG_NAMES):
+            first_yaml = candidate
         if candidate == project_root or candidate.parent == candidate:
-            answer = project_root
+            answer = first_yaml if first_yaml is not None else project_root
             break
         candidate = candidate.parent
-    for d in visited:
-        wing_root_cache[d] = answer
+
+    cache[cache_key] = answer
     return answer
 
 
-def _ancestor_matchers(source_file: Path, root: Path, matcher_cache: dict) -> list:
+def _ancestor_matchers(
+    source_file: Path,
+    root: Path,
+    matcher_cache: dict,
+    filename: str,
+) -> list:
     """Build the ancestor-chain matcher list, root → file's parent.
 
     Callers are expected to invoke this only after `_resolve_project_root`
     confirms `source_file` lives under `root`. The defensive try/except
     keeps the function safe if a future caller skips that check.
+
+    ``filename`` selects which ignore file to read at each level (the
+    project-scoped choice from :func:`detect_ignore_filename`). The
+    historical per-dir fallback between ``.mempalaceignore`` and
+    ``.gitignore`` is gone — projects pick one mode.
     """
     matchers: list = []
     try:
@@ -108,12 +149,12 @@ def _ancestor_matchers(source_file: Path, root: Path, matcher_cache: dict) -> li
     except ValueError:
         return matchers
     cursor = root
-    matcher = load_gitignore_matcher(cursor, matcher_cache)
+    matcher = load_ignore_matcher(cursor, matcher_cache, filename=filename)
     if matcher is not None:
         matchers.append(matcher)
     for part in parts[:-1]:
         cursor = cursor / part
-        matcher = load_gitignore_matcher(cursor, matcher_cache)
+        matcher = load_ignore_matcher(cursor, matcher_cache, filename=filename)
         if matcher is not None:
             matchers.append(matcher)
     return matchers
@@ -138,6 +179,7 @@ def _classify_drawer(
     meta: dict,
     matcher_cache: dict,
     project_roots: list,
+    project_mode_map: dict,
     drawer_id: str = "",
     wing_root_cache: Optional[dict] = None,
 ) -> str:
@@ -145,20 +187,25 @@ def _classify_drawer(
 
     Returns one of: kept, gitignored, missing, no_source, out_of_scope.
 
+    ``project_mode_map`` maps each project_root to the ignore filename
+    that applies (``.mempalaceignore`` or ``.gitignore``). Decided once
+    per project_root by :func:`detect_ignore_filename` so the per-dir
+    fallback between the two file types is gone — pick one per project.
+
     ``wing_root_cache`` (optional, recommended for production callers)
-    narrows the matcher scope to the drawer's per-wing source root — the
-    nearest ``mempalace.yaml`` ancestor — so a root-level ``.mempalaceignore``
-    that excludes sub-wing source dirs from the ROOT wing's mine does not
-    flag legitimate sub-wing drawers as gitignored. Without it the function
-    falls back to the user-supplied project_root, which is the historical
-    (buggy-for-multi-wing-palaces) behaviour and only safe for single-wing
-    palaces.
+    narrows the matcher walk to the drawer's per-wing source root via
+    :func:`_find_wing_source_root` so ancestor ignore files the wing's
+    miner never saw don't flag legitimate sub-wing drawers as gitignored.
+    Without it the function falls back to the user-supplied project_root,
+    which is the historical (buggy-for-multi-wing-palaces) behaviour and
+    only safe for single-wing palaces.
     """
     # Defensive: main loop filters registry rows; this guards direct callers.
     if _is_registry_row(meta, drawer_id):
         return "kept"
 
-    source_file = (meta or {}).get("source_file")
+    meta = meta or {}
+    source_file = meta.get("source_file")
     if not source_file:
         return "no_source"
 
@@ -175,11 +222,12 @@ def _classify_drawer(
         return "missing"
 
     if wing_root_cache is not None:
-        matcher_root = _find_wing_source_root(src, root, wing_root_cache)
+        matcher_root = _find_wing_source_root(src, root, meta.get("wing"), wing_root_cache)
     else:
         matcher_root = root
-    matchers = _ancestor_matchers(src, matcher_root, matcher_cache)
-    if matchers and is_gitignored(src, matchers, is_dir=False):
+    ignore_filename = project_mode_map[root]
+    matchers = _ancestor_matchers(src, matcher_root, matcher_cache, ignore_filename)
+    if matchers and apply_ignore_matchers(src, matchers, is_dir=False):
         return "gitignored"
 
     return "kept"
@@ -308,10 +356,15 @@ def sync_palace(
         else:
             roots = _auto_detect_project_roots(col, wing)
 
+        # Each project_root picks its ignore-file mode independently — a
+        # palace can sync against several project_dirs with different
+        # conventions, but within one project_root the choice is fixed.
+        project_mode_map: dict = {root: detect_ignore_filename(root) for root in roots}
+
         matcher_cache: dict = {}
-        # Wing-root lookups (nearest mempalace.yaml ancestor) are cached
-        # per-directory so every drawer under one wing reuses the answer
-        # instead of re-walking the tree.
+        # Wing source-root lookups (yaml + basename heuristic) are cached
+        # by (dir, wing_name) so every drawer under one wing reuses the
+        # walk result.
         wing_root_cache: dict = {}
         # Same source_file → same verdict holds because mine_palace_lock
         # blocks concurrent writers and the loop is synchronous.
@@ -327,7 +380,14 @@ def sync_palace(
             elif source_file and source_file in classification_cache:
                 bucket = classification_cache[source_file]
             else:
-                bucket = _classify_drawer(meta, matcher_cache, roots, drawer_id, wing_root_cache)
+                bucket = _classify_drawer(
+                    meta,
+                    matcher_cache,
+                    roots,
+                    project_mode_map,
+                    drawer_id,
+                    wing_root_cache,
+                )
                 if source_file:
                     classification_cache[source_file] = bucket
 

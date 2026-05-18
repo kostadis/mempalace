@@ -100,11 +100,41 @@ MAX_CHUNKS_PER_FILE = 500
 # =============================================================================
 
 
-class IgnoreMatcher:
-    """Lightweight matcher for one directory's .mempalaceignore patterns.
+MEMPALACEIGNORE = ".mempalaceignore"
+GITIGNORE = ".gitignore"
 
-    Falls back to .gitignore when no .mempalaceignore exists so that
-    projects without a dedicated ignore file still get sensible defaults.
+
+def detect_ignore_filename(project_root: Path) -> str:
+    """Return the ignore-file basename that applies to this project.
+
+    Project-scoped, decided once at the project root:
+
+    - If ``.mempalaceignore`` exists at the project root, the project is in
+      mempalace-mode: only ``.mempalaceignore`` files are read anywhere in
+      the tree, ``.gitignore`` is never consulted.
+    - Otherwise the project is in git-mode and only ``.gitignore`` files
+      are consulted.
+
+    The historical behaviour was a per-directory fallback (try
+    ``.mempalaceignore`` then fall through to ``.gitignore``), which let
+    a single project mix the two files in confusing ways: a root
+    ``.mempalaceignore`` would mask same-dir ``.gitignore`` but not
+    sibling-dir ``.gitignore``, and at sync time the conflation
+    interacted badly with multi-wing layouts. Project-scoping makes the
+    contract obvious: pick one ignore-file convention per project.
+    """
+    if (project_root / MEMPALACEIGNORE).is_file():
+        return MEMPALACEIGNORE
+    return GITIGNORE
+
+
+class IgnoreMatcher:
+    """Lightweight matcher for one directory's ignore patterns.
+
+    Reads a single named ignore file per directory — never falls back
+    between ``.mempalaceignore`` and ``.gitignore``. The caller decides
+    which filename to load (typically via :func:`detect_ignore_filename`
+    on the project root).
     """
 
     def __init__(self, base_dir: Path, rules: list):
@@ -112,10 +142,8 @@ class IgnoreMatcher:
         self.rules = rules
 
     @classmethod
-    def from_dir(cls, dir_path: Path):
-        ignore_path = dir_path / ".mempalaceignore"
-        if not ignore_path.is_file():
-            ignore_path = dir_path / ".gitignore"
+    def from_dir(cls, dir_path: Path, filename: str = MEMPALACEIGNORE):
+        ignore_path = dir_path / filename
         if not ignore_path.is_file():
             return None
 
@@ -222,11 +250,12 @@ class IgnoreMatcher:
         return matches(0, 0)
 
 
-def load_ignore_matcher(dir_path: Path, cache: dict):
-    """Load and cache one directory's .mempalaceignore (or .gitignore) matcher."""
-    if dir_path not in cache:
-        cache[dir_path] = IgnoreMatcher.from_dir(dir_path)
-    return cache[dir_path]
+def load_ignore_matcher(dir_path: Path, cache: dict, filename: str = MEMPALACEIGNORE):
+    """Load and cache one directory's ignore matcher for the given filename."""
+    key = (dir_path, filename)
+    if key not in cache:
+        cache[key] = IgnoreMatcher.from_dir(dir_path, filename=filename)
+    return cache[key]
 
 
 def is_ignored(path: Path, matchers: list, is_dir: bool = False) -> bool:
@@ -1014,9 +1043,7 @@ def _write_prepared(
                 f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(c['chunk_index'])).encode()).hexdigest()[:24]}"
                 for c in prepared.chunks
             ]
-            closet_lines = build_closet_lines(
-                source_file, drawer_ids, prepared.content, wing, room
-            )
+            closet_lines = build_closet_lines(source_file, drawer_ids, prepared.content, wing, room)
             closet_id_base = (
                 f"closet_{wing}_{room}_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
             )
@@ -1090,6 +1117,7 @@ def scan_project(
     decide which paths to skip during mining.
     """
     project_path = Path(project_dir).expanduser().resolve()
+    ignore_filename = detect_ignore_filename(project_path)
     files = []
     active_matchers = []
     matcher_cache = {}
@@ -1104,7 +1132,9 @@ def scan_project(
                 for matcher in active_matchers
                 if root_path == matcher.base_dir or matcher.base_dir in root_path.parents
             ]
-            current_matcher = load_ignore_matcher(root_path, matcher_cache)
+            current_matcher = load_ignore_matcher(
+                root_path, matcher_cache, filename=ignore_filename
+            )
             if current_matcher is not None:
                 active_matchers.append(current_matcher)
 
@@ -1338,9 +1368,7 @@ def _mine_impl(
                     files_skipped += 1
                     return
                 prepared, embeddings = result.payload
-                drawers = _write_prepared(
-                    prepared, embeddings, collection, closets_col, wing
-                )
+                drawers = _write_prepared(prepared, embeddings, collection, closets_col, wing)
                 if drawers == 0:
                     files_skipped += 1
                     return
