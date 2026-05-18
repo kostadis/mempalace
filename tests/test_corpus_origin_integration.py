@@ -251,6 +251,8 @@ def _stub_cfg(palace_dir: Path):
     """
     cfg = MagicMock()
     cfg.palace_path = str(palace_dir)
+    cfg.resolved_palace_path.return_value = str(palace_dir)
+    cfg.resolve_palace.side_effect = lambda v: str(Path(v).expanduser().resolve())
     cfg.entity_languages = ["en"]
     return cfg
 

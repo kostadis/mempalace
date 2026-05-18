@@ -36,6 +36,7 @@ venv/
 
 # ChromaDB local data
 *.sqlite3-journal
+.envrc
 
 # MemPalace per-project files (issue #185)
 mempalace.yaml
