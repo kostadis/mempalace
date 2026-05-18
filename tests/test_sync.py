@@ -428,6 +428,115 @@ class TestSyncPalace:
         assert report["gitignored"] == 0
         assert report["missing"] == 0
 
+    def test_root_mempalaceignore_does_not_flag_auto_detected_sub_wing(
+        self, tmp_dir, palace_path
+    ):
+        """Auto-detected wings (no per-dir mempalace.yaml) must not inherit the
+        root wing's .mempalaceignore boundary markers — mirrors Phandalin
+        distill_extractions.
+        """
+        from mempalace.sync import sync_palace
+
+        repo_path = Path(tmp_dir) / "repo"
+        distill = repo_path / "docs" / "distill_extractions"
+        distill.mkdir(parents=True)
+        (repo_path / ".mempalaceignore").write_text("docs/distill_extractions/\n")
+        (distill / "extract_01.md").write_text("# one\n")
+        (distill / "extract_02.md").write_text("# two\n")
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
+        )
+        col.add(
+            ids=["d_ex01", "d_ex02"],
+            documents=["e1", "e2"],
+            embeddings=[[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            metadatas=[
+                {
+                    "wing": "distill_extractions",
+                    "room": "general",
+                    "source_file": str(distill / "extract_01.md"),
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-05-09T00:00:00",
+                },
+                {
+                    "wing": "distill_extractions",
+                    "room": "general",
+                    "source_file": str(distill / "extract_02.md"),
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-05-09T00:00:00",
+                },
+            ],
+        )
+        del client
+
+        report = sync_palace(
+            palace_path=palace_path,
+            project_dirs=[str(repo_path)],
+            wing="distill_extractions",
+            dry_run=True,
+        )
+        assert report["scanned"] == 2
+        assert report["kept"] == 2
+        assert report["gitignored"] == 0
+        assert report["missing"] == 0
+
+    def test_auto_detected_sub_wing_local_mempalaceignore_still_honored(
+        self, tmp_dir, palace_path
+    ):
+        """Auto-detected wing roots must still honor their own .mempalaceignore."""
+        from mempalace.sync import sync_palace
+
+        repo_path = Path(tmp_dir) / "repo"
+        distill = repo_path / "docs" / "distill_extractions"
+        (distill / "build").mkdir(parents=True)
+        (repo_path / ".mempalaceignore").write_text("docs/distill_extractions/\n")
+        (distill / ".mempalaceignore").write_text("build/\n")
+        (distill / "keep.md").write_text("# keep\n")
+        (distill / "build" / "drop.md").write_text("# drop\n")
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
+        )
+        col.add(
+            ids=["d_keep", "d_drop"],
+            documents=["k", "d"],
+            embeddings=[[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            metadatas=[
+                {
+                    "wing": "distill_extractions",
+                    "room": "general",
+                    "source_file": str(distill / "keep.md"),
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-05-09T00:00:00",
+                },
+                {
+                    "wing": "distill_extractions",
+                    "room": "general",
+                    "source_file": str(distill / "build" / "drop.md"),
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-05-09T00:00:00",
+                },
+            ],
+        )
+        del client
+
+        report = sync_palace(
+            palace_path=palace_path,
+            project_dirs=[str(repo_path)],
+            wing="distill_extractions",
+            dry_run=True,
+        )
+        assert report["scanned"] == 2
+        assert report["kept"] == 1
+        assert report["gitignored"] == 1
+
     def test_sub_wing_local_mempalaceignore_still_honored(self, tmp_dir, palace_path):
         """Per-wing ignore patterns inside the wing's own source root must
         still take effect — only ancestors above the wing's mempalace.yaml

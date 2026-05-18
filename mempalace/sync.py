@@ -16,6 +16,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Optional, TypedDict
 
+from .config import normalize_wing_name
 from .miner import is_ignored as is_gitignored, load_ignore_matcher as load_gitignore_matcher
 from .palace import (
     MineAlreadyRunning,
@@ -60,30 +61,42 @@ def _resolve_project_root(source_file: Path, project_roots: list) -> Optional[Pa
     return None
 
 
-def _find_wing_source_root(source_file: Path, project_root: Path, wing_root_cache: dict) -> Path:
-    """Return the nearest ``mempalace.yaml``-rooted ancestor of ``source_file``
-    (within ``project_root``). Falls back to ``project_root`` when no per-wing
-    config marker is found.
+def _find_wing_source_root(
+    source_file: Path,
+    project_root: Path,
+    wing_root_cache: dict,
+    wing: Optional[str] = None,
+) -> Path:
+    """Return the nearest per-wing mine root for ``source_file`` (within
+    ``project_root``).
 
-    The miner walks each wing's tree from its own ``mempalace.yaml`` dir, so
-    that directory — not a higher ancestor — is the matcher scope for the
-    wing's drawers. A root-level ``.mempalaceignore`` typically lists each
-    sub-wing's source dir so the ROOT wing's mine skips them; those patterns
-    are not in scope for sub-wing drawers, which were deliberately mined
-    from inside the listed dirs. Without this check, sync flags every sub-
-    wing drawer as gitignored and would delete them on ``--apply``.
+    Stops at the nearest ``mempalace.yaml``, at the first ancestor whose
+    basename matches ``wing`` (auto-detect parity with ``load_config``), or
+    at ``project_root``.
 
-    Walks are cached per directory: once we decide a wing root for ``a/b/c``,
-    every chunk of every file under that subtree reuses the answer.
+    The miner walks each wing's tree from its own mine directory, so that
+    directory — not a higher ancestor — is the matcher scope for the wing's
+    drawers. A root-level ``.mempalaceignore`` typically lists each sub-
+    wing's source dir so the ROOT wing's mine skips them; those patterns are
+    not in scope for sub-wing drawers, which were deliberately mined from
+    inside the listed dirs.
+
+    Walks are cached per (directory, wing) so every chunk under a subtree
+    reuses the answer.
     """
+    cache_wing = wing or ""
     visited: list = []
     candidate = source_file.parent
     while True:
-        if candidate in wing_root_cache:
-            answer = wing_root_cache[candidate]
+        cache_key = (candidate, cache_wing)
+        if cache_key in wing_root_cache:
+            answer = wing_root_cache[cache_key]
             break
         visited.append(candidate)
         if any((candidate / name).is_file() for name in _WING_CONFIG_NAMES):
+            answer = candidate
+            break
+        if wing and normalize_wing_name(candidate.name) == wing:
             answer = candidate
             break
         if candidate == project_root or candidate.parent == candidate:
@@ -91,8 +104,18 @@ def _find_wing_source_root(source_file: Path, project_root: Path, wing_root_cach
             break
         candidate = candidate.parent
     for d in visited:
-        wing_root_cache[d] = answer
+        wing_root_cache[(d, cache_wing)] = answer
     return answer
+
+
+def _resolve_matcher_root(
+    source_file: Path,
+    project_root: Path,
+    wing: Optional[str],
+    wing_root_cache: dict,
+) -> Path:
+    """Pick the per-wing ignore-matcher scope for ``source_file``."""
+    return _find_wing_source_root(source_file, project_root, wing_root_cache, wing)
 
 
 def _ancestor_matchers(source_file: Path, root: Path, matcher_cache: dict) -> list:
@@ -145,14 +168,13 @@ def _classify_drawer(
 
     Returns one of: kept, gitignored, missing, no_source, out_of_scope.
 
-    ``wing_root_cache`` (optional, recommended for production callers)
-    narrows the matcher scope to the drawer's per-wing source root — the
-    nearest ``mempalace.yaml`` ancestor — so a root-level ``.mempalaceignore``
-    that excludes sub-wing source dirs from the ROOT wing's mine does not
-    flag legitimate sub-wing drawers as gitignored. Without it the function
-    falls back to the user-supplied project_root, which is the historical
-    (buggy-for-multi-wing-palaces) behaviour and only safe for single-wing
-    palaces.
+    ``wing_root_cache`` (optional, recommended for production callers) narrows
+    the matcher scope to the drawer's per-wing mine root — the nearest
+    ``mempalace.yaml`` or auto-detect dirname match — so a root-level
+    ``.mempalaceignore`` that excludes sub-wing source dirs from the ROOT wing's
+    mine does not flag legitimate sub-wing drawers as gitignored. Without it
+    the function falls back to the user-supplied project_root, which is only
+    safe for single-wing palaces.
     """
     # Defensive: main loop filters registry rows; this guards direct callers.
     if _is_registry_row(meta, drawer_id):
@@ -175,7 +197,12 @@ def _classify_drawer(
         return "missing"
 
     if wing_root_cache is not None:
-        matcher_root = _find_wing_source_root(src, root, wing_root_cache)
+        matcher_root = _resolve_matcher_root(
+            src,
+            root,
+            (meta or {}).get("wing"),
+            wing_root_cache,
+        )
     else:
         matcher_root = root
     matchers = _ancestor_matchers(src, matcher_root, matcher_cache)
@@ -309,9 +336,8 @@ def sync_palace(
             roots = _auto_detect_project_roots(col, wing)
 
         matcher_cache: dict = {}
-        # Wing-root lookups (nearest mempalace.yaml ancestor) are cached
-        # per-directory so every drawer under one wing reuses the answer
-        # instead of re-walking the tree.
+        # Wing-root lookups are cached per (directory, wing) so every drawer
+        # under one wing reuses the answer instead of re-walking the tree.
         wing_root_cache: dict = {}
         # Same source_file → same verdict holds because mine_palace_lock
         # blocks concurrent writers and the loop is synchronous.
@@ -327,7 +353,13 @@ def sync_palace(
             elif source_file and source_file in classification_cache:
                 bucket = classification_cache[source_file]
             else:
-                bucket = _classify_drawer(meta, matcher_cache, roots, drawer_id, wing_root_cache)
+                bucket = _classify_drawer(
+                    meta,
+                    matcher_cache,
+                    roots,
+                    drawer_id,
+                    wing_root_cache,
+                )
                 if source_file:
                     classification_cache[source_file] = bucket
 
