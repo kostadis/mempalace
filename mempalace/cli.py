@@ -613,7 +613,7 @@ def cmd_sync(args):
     from .palace import MineAlreadyRunning
     from .sync import sync_palace
 
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    palace_path = _resolve_cli_palace(args)
 
     if not os.path.isdir(palace_path):
         print(f"\n  No palace found at {palace_path}")

@@ -365,6 +365,178 @@ class TestSyncPalace:
         finally:
             del client
 
+    def test_root_mempalaceignore_does_not_flag_sub_wing_drawers(self, tmp_dir, palace_path):
+        """Bug: a root-level ``.mempalaceignore`` listing each sub-wing's
+        source dir (so the root mine skips them) must NOT flag the sub-
+        wing's drawers as gitignored. Sub-wings are mined from inside
+        those dirs and carry their own ``mempalace.yaml``; the root's
+        ignore patterns are out of scope for them.
+
+        Without the fix, ``sync --wing <sub>`` reports every sub-wing
+        drawer as "gitignored" and ``--apply`` wipes the wing.
+        """
+        from mempalace.sync import sync_palace
+
+        repo_path = Path(tmp_dir) / "repo"
+        chapters = repo_path / "docs" / "chapters"
+        chapters.mkdir(parents=True)
+        # Root .mempalaceignore excludes the narrative sub-wing's source dir
+        # from the ROOT wing's mine — mirrors the Phandalin bug report.
+        (repo_path / ".mempalaceignore").write_text("docs/chapters/\n")
+        # Each sub-wing has its own mempalace.yaml — the per-wing root marker.
+        (chapters / "mempalace.yaml").write_text("wing: narrative\nrooms: []\n")
+        (chapters / "chapter_01.md").write_text("# chapter 1\n")
+        (chapters / "chapter_02.md").write_text("# chapter 2\n")
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
+        )
+        col.add(
+            ids=["d_ch01", "d_ch02"],
+            documents=["c1", "c2"],
+            embeddings=[[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            metadatas=[
+                {
+                    "wing": "narrative",
+                    "room": "chapters",
+                    "source_file": str(chapters / "chapter_01.md"),
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-05-09T00:00:00",
+                },
+                {
+                    "wing": "narrative",
+                    "room": "chapters",
+                    "source_file": str(chapters / "chapter_02.md"),
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-05-09T00:00:00",
+                },
+            ],
+        )
+        del client
+
+        report = sync_palace(
+            palace_path=palace_path,
+            project_dirs=[str(repo_path)],
+            wing="narrative",
+            dry_run=True,
+        )
+        assert report["scanned"] == 2
+        assert report["kept"] == 2
+        assert report["gitignored"] == 0
+        assert report["missing"] == 0
+
+    def test_sub_wing_local_mempalaceignore_still_honored(self, tmp_dir, palace_path):
+        """Per-wing ignore patterns inside the wing's own source root must
+        still take effect — only ancestors above the wing's mempalace.yaml
+        are out of scope.
+        """
+        from mempalace.sync import sync_palace
+
+        repo_path = Path(tmp_dir) / "repo"
+        chapters = repo_path / "docs" / "chapters"
+        (chapters / "build").mkdir(parents=True)
+        (repo_path / ".mempalaceignore").write_text("docs/chapters/\n")
+        (chapters / "mempalace.yaml").write_text("wing: narrative\nrooms: []\n")
+        # Sub-wing's OWN .mempalaceignore — should still apply.
+        (chapters / ".mempalaceignore").write_text("build/\n")
+        (chapters / "keep.md").write_text("# keep\n")
+        (chapters / "build" / "drop.md").write_text("# drop\n")
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
+        )
+        col.add(
+            ids=["d_keep", "d_drop"],
+            documents=["k", "d"],
+            embeddings=[[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            metadatas=[
+                {
+                    "wing": "narrative",
+                    "room": "chapters",
+                    "source_file": str(chapters / "keep.md"),
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-05-09T00:00:00",
+                },
+                {
+                    "wing": "narrative",
+                    "room": "chapters",
+                    "source_file": str(chapters / "build" / "drop.md"),
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-05-09T00:00:00",
+                },
+            ],
+        )
+        del client
+
+        report = sync_palace(
+            palace_path=palace_path,
+            project_dirs=[str(repo_path)],
+            wing="narrative",
+            dry_run=True,
+        )
+        assert report["scanned"] == 2
+        assert report["kept"] == 1
+        assert report["gitignored"] == 1
+
+    def test_root_wing_with_own_yaml_still_uses_root_ignore(self, tmp_dir, palace_path):
+        """The root wing's drawers should still see the root ``.mempalaceignore``:
+        its wing source root IS the project root because its ``mempalace.yaml``
+        lives there. Anything matching the root's ignore patterns is correctly
+        flagged.
+        """
+        from mempalace.sync import sync_palace
+
+        repo_path = Path(tmp_dir) / "repo"
+        (repo_path / "junk").mkdir(parents=True)
+        (repo_path / "mempalace.yaml").write_text("wing: root\nrooms: []\n")
+        (repo_path / ".mempalaceignore").write_text("junk/\n")
+        (repo_path / "keep.md").write_text("# keep\n")
+        (repo_path / "junk" / "drop.md").write_text("# drop\n")
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
+        )
+        col.add(
+            ids=["d_keep", "d_drop"],
+            documents=["k", "d"],
+            embeddings=[[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            metadatas=[
+                {
+                    "wing": "root",
+                    "room": "general",
+                    "source_file": str(repo_path / "keep.md"),
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-05-09T00:00:00",
+                },
+                {
+                    "wing": "root",
+                    "room": "general",
+                    "source_file": str(repo_path / "junk" / "drop.md"),
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-05-09T00:00:00",
+                },
+            ],
+        )
+        del client
+
+        report = sync_palace(
+            palace_path=palace_path,
+            project_dirs=[str(repo_path)],
+            wing="root",
+            dry_run=True,
+        )
+        assert report["kept"] == 1
+        assert report["gitignored"] == 1
+
     def test_closet_purge_runs_on_apply(self, synced_world):
         """Closets pointing at removed sources must also disappear."""
         from mempalace.sync import sync_palace
@@ -444,9 +616,9 @@ class TestSyncPalace:
         # Allow-list — params must be exactly the documented audit shape so
         # any future leak (source_file, content, ID lists, etc.) trips a
         # test failure rather than slipping through a deny-list.
-        assert set(params.keys()) <= {
-            "first_id"
-        }, f"WAL params drifted from the audit allow-list: {params.keys()}"
+        assert set(params.keys()) <= {"first_id"}, (
+            f"WAL params drifted from the audit allow-list: {params.keys()}"
+        )
 
     def test_registry_sentinels_preserved_on_apply(self, tmp_dir, palace_path):
         """F2 regression: convo miner `_reg_*` sentinels must survive sync apply.
@@ -567,9 +739,9 @@ class TestSyncPalace:
         inner_resolved = inner.resolve(strict=False)
         outer_resolved = outer.resolve(strict=False)
         assert inner_resolved in roots, f"expected inner in roots, got {roots}"
-        assert (
-            outer_resolved not in roots
-        ), f"deepest should win exclusively: roots={roots}, outer leaked"
+        assert outer_resolved not in roots, (
+            f"deepest should win exclusively: roots={roots}, outer leaked"
+        )
 
     def test_apply_with_empty_project_dirs_raises(self, palace_path):
         """Round-2 P1: `project_dirs=[]` (empty list) with apply must raise,
@@ -608,9 +780,9 @@ class TestSyncPalace:
                 project_dirs=[synced_world["repo_path"]],
                 dry_run=False,
             )
-        assert any(
-            "Closet purge skipped" in record.getMessage() for record in caplog.records
-        ), f"expected closet-skip warning, got: {[r.getMessage() for r in caplog.records]}"
+        assert any("Closet purge skipped" in record.getMessage() for record in caplog.records), (
+            f"expected closet-skip warning, got: {[r.getMessage() for r in caplog.records]}"
+        )
 
     def test_metadata_cache_cleared_on_exception(self, monkeypatch, config, synced_world, kg):
         """F9 regression: tool_sync's try/finally must clear `_metadata_cache`
@@ -651,9 +823,9 @@ class TestSyncPalace:
         assert result.get("success") is False
         assert "simulated" in result.get("error", "")
 
-        assert (
-            mcp_server._metadata_cache is None
-        ), "F9: cache must be cleared even when sync_palace raises"
+        assert mcp_server._metadata_cache is None, (
+            "F9: cache must be cleared even when sync_palace raises"
+        )
 
     def test_sync_report_keys_stable(self, synced_world):
         """Regression: SyncReport schema must not silently drop a field."""
@@ -946,9 +1118,9 @@ class TestSyncPalace:
             wing="demo",
             dry_run=True,
         )
-        assert (
-            report["gitignored"] == 1
-        ), f"symmetric resolve broken: drawer mis-bucketed; report={report}"
+        assert report["gitignored"] == 1, (
+            f"symmetric resolve broken: drawer mis-bucketed; report={report}"
+        )
         assert report["out_of_scope"] == 0
 
     def test_classification_cache_avoids_redundant_disk_hits(
@@ -1005,9 +1177,9 @@ class TestSyncPalace:
         )
         assert report["scanned"] == 5
         assert report["gitignored"] == 5
-        assert (
-            call_count["n"] == 1
-        ), f"cache miss: expected 1 _classify_drawer call (4 cache hits), got {call_count['n']}"
+        assert call_count["n"] == 1, (
+            f"cache miss: expected 1 _classify_drawer call (4 cache hits), got {call_count['n']}"
+        )
 
     def test_closet_batch_purge_single_call(self, synced_world, monkeypatch):
         """Batched $in closet purge: one delete() call across all removable
@@ -1074,16 +1246,16 @@ class TestSyncPalace:
             str(repo_path / "deleted.py"),
         }
         expected = len(seeded_sources & set(report["by_source"].keys()))
-        assert (
-            report["removed_closets"] == expected
-        ), f"removed_closets ({report['removed_closets']}) != |seeded ∩ removable| ({expected})"
+        assert report["removed_closets"] == expected, (
+            f"removed_closets ({report['removed_closets']}) != |seeded ∩ removable| ({expected})"
+        )
         assert "wrapper" in captured, "get_closets_collection patch not invoked"
-        assert (
-            captured["wrapper"].delete_calls == 1
-        ), f"expected one batch delete call, got {captured['wrapper'].delete_calls}"
-        assert (
-            captured["wrapper"].get_calls == 1
-        ), f"expected one batch get call, got {captured['wrapper'].get_calls}"
+        assert captured["wrapper"].delete_calls == 1, (
+            f"expected one batch delete call, got {captured['wrapper'].delete_calls}"
+        )
+        assert captured["wrapper"].get_calls == 1, (
+            f"expected one batch get call, got {captured['wrapper'].get_calls}"
+        )
 
     def test_registry_check_runs_before_cache_lookup(self, tmp_dir, palace_path):
         """A non-registry drawer with the same source_file must NOT poison
@@ -1148,9 +1320,9 @@ class TestSyncPalace:
         finally:
             del client
         assert "a_regular" not in survivors
-        assert (
-            "_reg_zzz_sentinel" in survivors
-        ), "registry sentinel was incorrectly pruned via cached non-registry verdict"
+        assert "_reg_zzz_sentinel" in survivors, (
+            "registry sentinel was incorrectly pruned via cached non-registry verdict"
+        )
 
     def test_normalize_project_dirs_sort_stable_on_equal_length(self):
         """`_normalize_project_dirs` must sort by `(-len, str)` so equal-length
@@ -1397,3 +1569,36 @@ class TestSyncCli:
         with pytest.raises(SystemExit) as exc_info:
             cli.main()
         assert exc_info.value.code == 2
+
+    def test_named_palace_alias_resolves(self, monkeypatch, synced_world, capsys):
+        """Bug: ``--palace <alias>`` worked for status/mine/search but not
+        sync — cmd_sync was reading args.palace as a raw filesystem path.
+        Must route through the same named-palace resolver as every other
+        subcommand.
+        """
+        import json as _json
+        from mempalace import cli
+
+        cfg_path = os.path.join(os.environ["HOME"], ".mempalace", "config.json")
+        with open(cfg_path) as f:
+            cfg = _json.load(f)
+        original = _json.dumps(cfg)
+        cfg.setdefault("palaces", {})["sync_test_alias"] = synced_world["palace_path"]
+        with open(cfg_path, "w") as f:
+            _json.dump(cfg, f)
+        try:
+            argv = [
+                "mempalace",
+                "--palace",
+                "sync_test_alias",
+                "sync",
+                synced_world["repo_path"],
+            ]
+            monkeypatch.setattr("sys.argv", argv)
+            cli.main()
+            captured = capsys.readouterr().out
+            assert "No palace found" not in captured, captured
+            assert "Scanned:" in captured, captured
+        finally:
+            with open(cfg_path, "w") as f:
+                f.write(original)
