@@ -273,6 +273,33 @@ def test_rebuilds_index_when_tvim_missing(palace, tmp_path):
 # ── embedding-function path (query_texts) with a fake EF ───────────────────
 
 
+def test_mempalace_backend_env_routes_palace_default():
+    """MEMPALACE_BACKEND=turbovec makes palace._DEFAULT_BACKEND a TurboVecBackend.
+
+    Run in a subprocess so the env-resolved module-level singleton doesn't leak
+    into this test process (palace.py resolves the backend once at import).
+    """
+    import os
+    import subprocess
+    import sys
+
+    def _backend_name(env_value):
+        env = dict(os.environ)
+        if env_value is None:
+            env.pop("MEMPALACE_BACKEND", None)
+        else:
+            env["MEMPALACE_BACKEND"] = env_value
+        out = subprocess.check_output(
+            [sys.executable, "-c",
+             "import mempalace.palace as p; print(type(p._DEFAULT_BACKEND).__name__)"],
+            env=env, text=True,
+        )
+        return out.strip()
+
+    assert _backend_name("turbovec") == "TurboVecBackend"
+    assert _backend_name(None) == "ChromaBackend"  # default unchanged
+
+
 def test_query_texts_uses_embedding_function(palace, monkeypatch):
     def fake_ef(texts):
         # Map any text containing 'a' → VECS['a'], else VECS['b'].
