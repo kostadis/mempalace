@@ -24,8 +24,12 @@ a DGX Spark, but nothing here is Spark-specific):
   (``searcher.py`` ``_hybrid_rank``) consumes an *absolute* cosine distance via
   ``1 - distance``. So we use turbovec only to fetch a candidate pool, then
   recompute true cosine from the stored float32 vectors and return
-  ``distance = 1 - cosine`` in ``[0, 2]``. This costs the on-disk size win but
-  keeps the hybrid blend correctly calibrated.
+  ``distance = 1 - cosine`` in ``[0, 2]``. Storing the float32 vectors forfeits
+  turbovec's ~8x *index* compression, but the backend is still smaller on disk
+  than ChromaDB end-to-end — the 4-bit ``.tvim`` is far lighter than an HNSW
+  graph. Measured local parity at 15.8k docs / MiniLM-384: turbovec backend vs
+  chroma backend — build 12x faster, query p50/p95 ~3x faster, ~2.3x smaller on
+  disk, retrieval quality a wash. See ~/src/dgx/turbovec-backend-parity.py.
 * **BM25/hybrid is above this layer** (searcher.py). This backend only does
   vector ANN + returns documents + correct cosine distances.
 
