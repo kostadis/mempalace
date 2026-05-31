@@ -154,7 +154,17 @@ def test_filter_with_no_matches_preserves_outer_dim(collection):
     assert res.ids == [[]]
 
 
-@pytest.mark.parametrize("bad", [{"$regex": "x"}, {"$or": []}, {"room": {"$ne": "b"}}])
+def test_expanded_operators_supported(collection):
+    """turbovecdb ships the full operator set; it must flow through the adapter."""
+    r_or = collection.query(query_embeddings=[VECS["a"]], n_results=4,
+                            where={"$or": [{"room": "a"}, {"room": "b"}]})
+    assert set(r_or.ids[0]) == {"a", "b"}
+    r_ne = collection.query(query_embeddings=[VECS["a"]], n_results=4,
+                            where={"room": {"$ne": "a"}})
+    assert "a" not in r_ne.ids[0] and "b" in r_ne.ids[0]
+
+
+@pytest.mark.parametrize("bad", [{"$regex": "x"}, {"$or": []}, {"room": {"$contains": "b"}}])
 def test_unsupported_where_operator_raises(collection, bad):
     with pytest.raises(UnsupportedFilterError):
         collection.query(query_embeddings=[VECS["a"]], n_results=1, where=bad)

@@ -62,10 +62,10 @@ spellcheck = ["autocorrect>=2.0"]
 gpu = ["onnxruntime-gpu>=1.16"]
 dml = ["onnxruntime-directml>=1.16"]
 coreml = ["onnxruntime>=1.16"]
-# Experimental CPU vector backend (turbovec, 4-bit TurboQuant ANN). Pairs the
-# turbovec index with a SQLite sidecar; select via MEMPALACE_BACKEND=turbovec.
-# turbovec ships aarch64/x86_64 wheels; numpy is the array interface.
-turbovec = ["turbovec>=0.1", "numpy>=1.21"]
+# Experimental CPU vector backend, powered by the standalone turbovecdb library
+# (turbovec 4-bit ANN + durable SQLite store). Select via MEMPALACE_BACKEND=turbovec.
+# turbovecdb pulls turbovec, numpy, and filelock.
+turbovec = ["turbovecdb>=0.1"]
 
 [dependency-groups]
 dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.4.0", "psutil>=5.9"]
