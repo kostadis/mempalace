@@ -13,7 +13,7 @@ import sys
 import threading
 from typing import Optional
 
-from .backends.chroma import ChromaBackend
+from .backends import get_backend, resolve_backend_for_palace
 from .config import check_palace_storage
 
 logger = logging.getLogger("mempalace_mcp")
@@ -44,7 +44,15 @@ SKIP_DIRS = {
     "target",
 }
 
-_DEFAULT_BACKEND = ChromaBackend()
+# The process-wide storage backend. Resolved once from MEMPALACE_BACKEND
+# (falling back to "chroma"), so a normal run is unchanged but
+# `MEMPALACE_BACKEND=turbovec mempalace mine/search` routes the whole stack —
+# miner, searcher, MCP server — through the turbovec backend. Selecting a
+# backend whose package isn't installed raises a clear KeyError from the
+# registry at startup.
+_DEFAULT_BACKEND = get_backend(
+    resolve_backend_for_palace(env_value=os.environ.get("MEMPALACE_BACKEND"))
+)
 
 # Schema version for drawer normalization. Bump when the normalization
 # pipeline changes in a way that existing drawers should be rebuilt to pick up

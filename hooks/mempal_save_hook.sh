@@ -79,6 +79,18 @@ if [ -z "$MEMPAL_PYTHON_BIN" ] || [ ! -x "$MEMPAL_PYTHON_BIN" ]; then
     MEMPAL_PYTHON_BIN="$(command -v python3 2>/dev/null || echo python3)"
 fi
 
+# Resolve how to invoke the mempalace CLI for mining. Prefer running it as a
+# module through the interpreter resolved above — that finds a venv/pyenv
+# install even when its bin dir is not on the hook's PATH (the common failure
+# mode for GUI-launched harnesses, where a bare `mempalace` is "command not
+# found"). Fall back to a `mempalace` console script on PATH. find_spec is used
+# instead of `import mempalace` so the probe stays cheap (no package import).
+if "$MEMPAL_PYTHON_BIN" -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('mempalace') else 1)" 2>/dev/null; then
+    MEMPAL_CLI=("$MEMPAL_PYTHON_BIN" -m mempalace)
+else
+    MEMPAL_CLI=(mempalace)
+fi
+
 # Hook writes are chat-palace-only — never touch a curated campaign palace.
 # This is the load-bearing isolation invariant: see docs/design/palace-isolation.md.
 # Override only if you've relocated your chat palace.
@@ -195,14 +207,14 @@ if [ "$SINCE_LAST" -ge "$SAVE_INTERVAL" ] && [ "$EXCHANGE_COUNT" -gt 0 ]; then
     # MEMPAL_DIR is *additive*, not an override: a user with MEMPAL_DIR
     # pointed at their project still gets the active conversation mined.
     if is_valid_transcript_path "$TRANSCRIPT_PATH" && [ -f "$TRANSCRIPT_PATH" ]; then
-        mempalace --palace "$MEMPAL_CHAT_PALACE" mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
+        "${MEMPAL_CLI[@]}" --palace "$MEMPAL_CHAT_PALACE" mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
             >> "$STATE_DIR/hook.log" 2>&1 &
     elif [ -n "$TRANSCRIPT_PATH" ]; then
         echo "[$(date '+%H:%M:%S')] Skipping invalid transcript path: $TRANSCRIPT_PATH" \
             >> "$STATE_DIR/hook.log"
     fi
     if [ -n "$MEMPAL_DIR" ] && [ -d "$MEMPAL_DIR" ]; then
-        mempalace --palace "$MEMPAL_CHAT_PALACE" mine "$MEMPAL_DIR" --mode projects \
+        "${MEMPAL_CLI[@]}" --palace "$MEMPAL_CHAT_PALACE" mine "$MEMPAL_DIR" --mode projects \
             >> "$STATE_DIR/hook.log" 2>&1 &
     fi
 
