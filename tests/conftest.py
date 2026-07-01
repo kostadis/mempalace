@@ -56,7 +56,10 @@ with open(os.path.join(_session_config_dir, "config.json"), "w") as _cf:
 os.environ.setdefault("MEMPALACE_HTTP_KEEPALIVE", "0")
 
 # Now it is safe to import mempalace modules that trigger initialisation.
-import chromadb  # noqa: E402
+# NOTE: chromadb is imported lazily inside the ``collection`` fixture, not here.
+# On a turbovec-only deploy chromadb may be absent or have broken transitive deps;
+# an eager top-level import would break test *collection* for the entire suite,
+# including tests that never touch Chroma (RFC 001 / issue #20).
 import pytest  # noqa: E402
 
 from mempalace.config import MempalaceConfig  # noqa: E402
@@ -154,6 +157,8 @@ def config(tmp_dir, palace_path):
 @pytest.fixture
 def collection(palace_path):
     """A ChromaDB collection pre-seeded in the temp palace."""
+    import chromadb
+
     client = chromadb.PersistentClient(path=palace_path)
     col = client.get_or_create_collection("mempalace_drawers", metadata={"hnsw:space": "cosine"})
     yield col
