@@ -77,8 +77,11 @@ def _discover_entry_points() -> None:
                 continue  # explicit registration wins
             try:
                 cls = ep.load()
-            except Exception:
-                logger.exception("failed to load backend entry point %r", ep.name)
+            except Exception as exc:  # noqa: BLE001
+                # An OPTIONAL backend whose import fails (e.g. chroma with absent/broken
+                # chromadb on a turbovec-only deploy) is a soft condition — skip it quietly.
+                # A caller that explicitly requests it via get_backend() still fails loudly.
+                logger.debug("skipping backend entry point %r (failed to load): %s", ep.name, exc)
                 continue
             if not isinstance(cls, type) or not issubclass(cls, BaseBackend):
                 logger.warning(
@@ -178,8 +181,18 @@ def resolve_backend_for_palace(
 
 
 def _register_builtins() -> None:
-    """Register chroma as the in-tree default."""
-    from .chroma import ChromaBackend
+    """Register chroma as the in-tree default — best-effort.
+
+    Chroma is optional: a turbovec-only deployment neither needs nor installs a working
+    ``chromadb``. Import failures (absent or with broken transitive deps) must not take
+    down the whole registry — chroma simply isn't registered, and other backends
+    (e.g. turbovec, via entry points) still resolve.
+    """
+    try:
+        from .chroma import ChromaBackend
+    except Exception as exc:  # noqa: BLE001 — any import-time failure disables chroma only
+        logger.debug("chroma backend unavailable, not registering: %s", exc)
+        return
 
     # Use setdefault semantics so a caller that pre-registered for tests wins.
     if "chroma" not in _registry:

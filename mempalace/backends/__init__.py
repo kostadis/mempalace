@@ -28,7 +28,6 @@ from .base import (
     QueryResult,
     UnsupportedFilterError,
 )
-from .chroma import ChromaBackend, ChromaCollection
 from .registry import (
     available_backends,
     get_backend,
@@ -38,6 +37,19 @@ from .registry import (
     resolve_backend_for_palace,
     unregister,
 )
+
+
+# Chroma is an OPTIONAL in-tree backend. Import it lazily (PEP 562) so that importing
+# `mempalace.backends` on a turbovec-only deployment — where chromadb is absent or has
+# broken transitive deps — does not fail at import time. `ChromaBackend`/`ChromaCollection`
+# still resolve on first access if chromadb is importable.
+def __getattr__(name: str):
+    if name in ("ChromaBackend", "ChromaCollection"):
+        from . import chroma
+
+        return getattr(chroma, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "BackendClosedError",
