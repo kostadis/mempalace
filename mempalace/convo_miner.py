@@ -10,7 +10,6 @@ Same palace as project mining. Different ingest strategy.
 
 import os
 import sys
-import hashlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +17,9 @@ from datetime import datetime
 from collections import defaultdict
 from typing import Optional
 
+from .collision_scan import assert_no_collisions
 from .config import MempalaceConfig
+from .ids import ID_RECIPE, make_convo_drawer_id, make_convo_sentinel_id
 from .normalize import normalize
 from .palace import (
     NORMALIZE_VERSION,
@@ -89,8 +90,7 @@ def _register_file(collection, source_file: str, wing: str, agent: str, extract_
     an empty file mined in exchange-mode does not mask a later general-mode
     mine of the same transcript (and vice versa).
     """
-    sentinel_key = f"{source_file}:{extract_mode}"
-    sentinel_id = f"_reg_{hashlib.sha256(sentinel_key.encode()).hexdigest()[:24]}"
+    sentinel_id = make_convo_sentinel_id(source_file, extract_mode)
     collection.upsert(
         documents=[f"[registry] {source_file}"],
         ids=[sentinel_id],
@@ -104,6 +104,7 @@ def _register_file(collection, source_file: str, wing: str, agent: str, extract_
                 "ingest_mode": "registry",
                 "extract_mode": extract_mode,
                 "normalize_version": NORMALIZE_VERSION,
+                "id_recipe": ID_RECIPE,
             }
         ],
     )
@@ -248,11 +249,15 @@ def _chunk_by_exchange(lines: list, chunk_size: int, min_chunk_size: int) -> lis
                 next_line = lines[i]
                 if next_line.strip().startswith(">") or next_line.strip().startswith("---"):
                     break
-                if next_line.strip():
-                    ai_lines.append(next_line.strip())
+                # Preserve the line as-is — blank lines and indentation carry meaning
+                # (paragraph breaks, list/code structure) and must survive verbatim.
+                ai_lines.append(next_line)
                 i += 1
 
-            ai_response = " ".join(ai_lines)
+            # Join on newline (not space) so line structure, blank lines, and
+            # indentation reach the drawer unchanged. Trim only trailing blank
+            # lines produced by the loop stopping at the next `>` turn.
+            ai_response = "\n".join(ai_lines).rstrip("\n")
             content = f"{user_turn}\n{ai_response}" if ai_response else user_turn
 
             _emit_bounded(chunks, content, chunk_size, min_chunk_size)
@@ -521,9 +526,8 @@ def _prepare_convo(
         batch_rooms: list = []
         for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
             chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
-            drawer_key = f"{source_file}:{extract_mode}:{chunk['chunk_index']}"
-            drawer_id = (
-                f"drawer_{wing}_{chunk_room}_{hashlib.sha256(drawer_key.encode()).hexdigest()[:24]}"
+            drawer_id = make_convo_drawer_id(
+                wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
             )
             batch_docs.append(chunk["content"])
             batch_ids.append(drawer_id)
@@ -539,6 +543,7 @@ def _prepare_convo(
                     "ingest_mode": "convos",
                     "extract_mode": extract_mode,
                     "normalize_version": NORMALIZE_VERSION,
+                    "id_recipe": ID_RECIPE,
                 }
             )
             batch_rooms.append(chunk_room)
@@ -600,6 +605,7 @@ def _write_prepared_convo(
             logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
 
         for batch, batch_embeddings in zip(prepared.batches, embeddings_batches):
+            assert_no_collisions(list(zip(batch.ids, batch.metadatas)), collection)
             try:
                 collection.upsert(
                     documents=batch.documents,

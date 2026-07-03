@@ -17,6 +17,7 @@ Public surface:
 from .base import (
     BackendClosedError,
     BackendError,
+    BackendMismatchError,
     BaseBackend,
     BaseCollection,
     CollectionNotInitializedError,
@@ -24,13 +25,24 @@ from .base import (
     EmbedderIdentityMismatchError,
     GetResult,
     HealthStatus,
+    LexicalHit,
+    LexicalResult,
     PalaceNotFoundError,
     PalaceRef,
     QueryResult,
+    UnsupportedCapabilityError,
     UnsupportedFilterError,
 )
+# Chroma is imported lazily below (PEP 562 __getattr__) so it stays optional.
+# pgvector/qdrant/sqlite_exact import their heavy client deps lazily inside
+# methods, so importing their classes here is cheap and safe on any deploy.
+from .pgvector import PgVectorBackend, PgVectorCollection
+from .qdrant import QdrantBackend, QdrantCollection
+from .sqlite_exact import SQLiteExactBackend, SQLiteExactCollection
 from .registry import (
     available_backends,
+    detect_backend_for_path,
+    detect_backends_for_path,
     get_backend,
     get_backend_class,
     register,
@@ -55,6 +67,7 @@ def __getattr__(name: str):
 __all__ = [
     "BackendClosedError",
     "BackendError",
+    "BackendMismatchError",
     "BaseBackend",
     "BaseCollection",
     "ChromaBackend",
@@ -64,11 +77,22 @@ __all__ = [
     "EmbedderIdentityMismatchError",
     "GetResult",
     "HealthStatus",
+    "LexicalHit",
+    "LexicalResult",
     "PalaceNotFoundError",
     "PalaceRef",
+    "PgVectorBackend",
+    "PgVectorCollection",
+    "QdrantBackend",
+    "QdrantCollection",
     "QueryResult",
+    "SQLiteExactBackend",
+    "SQLiteExactCollection",
+    "UnsupportedCapabilityError",
     "UnsupportedFilterError",
     "available_backends",
+    "detect_backend_for_path",
+    "detect_backends_for_path",
     "get_backend",
     "get_backend_class",
     "register",

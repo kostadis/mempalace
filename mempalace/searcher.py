@@ -18,8 +18,12 @@ import re
 import sqlite3
 from pathlib import Path
 
-from .backends import CollectionNotInitializedError, PalaceNotFoundError
-from .palace import get_closets_collection, get_collection
+from .backends import BackendError
+from .palace import (
+    _open_collection_or_explain,
+    get_closets_collection,
+    get_collection,
+)
 
 # Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
 # Multiple lines may join with newlines inside one closet document.
@@ -328,32 +332,11 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     Search the palace. Returns verbatim drawer content.
     Optionally filter by wing (project) or room (aspect).
     """
-    # Filesystem-first checks distinguish State A / State B before reaching
-    # chromadb. PersistentClient lazily creates chroma.sqlite3 on first open
-    # of an empty palace dir, so without these checks State B collapses into
-    # the "initialized but empty" State C message and mutates the dir as a
-    # side effect of a read-only search call (#1498).
-    if not os.path.isdir(palace_path):
-        print(f"\n  No palace found at {palace_path}")
-        print("  Run: mempalace init <dir> then mempalace mine <dir>")
-        raise SearchError(f"No palace found at {palace_path}")
-    if not os.path.isfile(os.path.join(palace_path, "chroma.sqlite3")):
-        print(f"\n  Palace dir at {palace_path} exists but has no chroma.sqlite3 yet.")
-        print("  Run: mempalace mine <dir>")
+    col = _open_collection_or_explain(palace_path, opener=get_collection)
+    if col is None:
+        if not os.path.isdir(palace_path):
+            raise SearchError(f"No palace found at {palace_path}")
         raise SearchError(f"No palace database at {palace_path}")
-    try:
-        col = get_collection(palace_path, create=False)
-    except CollectionNotInitializedError as e:
-        # State C from #1498: palace initialized but never mined.
-        print(f"\n  Palace at {palace_path} is initialized but empty (no drawers yet).")
-        print("  Run: mempalace mine <dir>")
-        raise SearchError(f"Palace at {palace_path} is initialized but empty") from e
-    except PalaceNotFoundError as e:
-        # Backend filesystem-race fallback: dir was deleted between our
-        # check above and the backend call. Same message as State A.
-        print(f"\n  No palace found at {palace_path}")
-        print("  Run: mempalace init <dir> then mempalace mine <dir>")
-        raise SearchError(f"No palace found at {palace_path}") from e
 
     # Alert the user if this palace predates hnsw:space=cosine being set on
     # creation — their similarity scores will be junk until they run repair.
@@ -766,6 +749,57 @@ def _taxonomy_penalty() -> float:
         return 0.05
 
 
+def _query_drawers_with_filter_fallback(
+    drawers_col, dkwargs, query, n_results, wing_list, room_list
+):
+    """Run the filtered drawer query, falling back to an unfiltered query plus a
+    Python-side post-filter when ChromaDB raises on the filtered query.
+
+    A ChromaDB HNSW/SQLite index mismatch makes filtered queries fail with
+    "Error finding id" even when unfiltered search works fine — it happens when
+    drawers are ingested via two different paths (e.g. bulk import vs MCP tool
+    calls), leaving the vector index inconsistent with the metadata store. We
+    retry unfiltered (over-fetching) and re-apply the wing/room filter in Python.
+    See #1245 / #1035.
+
+    Adapted to the local two-list ``search_within`` shape: ``wing_list`` /
+    ``room_list`` are the normalized multi-value filters, so the post-filter is
+    a set-membership test rather than upstream's single-value equality.
+    """
+    where = dkwargs.get("where")
+    try:
+        return drawers_col.query(**dkwargs)
+    except Exception as filter_err:
+        if not where:
+            raise
+        logger.warning(
+            "Filtered search failed (%s); falling back to unfiltered + post-filter",
+            filter_err,
+        )
+        raw = drawers_col.query(
+            query_texts=[query],
+            n_results=min(n_results * 15, 500),
+            include=["documents", "metadatas", "distances"],
+        )
+        wing_set = set(wing_list or [])
+        room_set = set(room_list or [])
+        fdocs, fmetas, fdists = [], [], []
+        for doc, meta, dist in zip(
+            _first_or_empty(raw, "documents"),
+            _first_or_empty(raw, "metadatas"),
+            _first_or_empty(raw, "distances"),
+        ):
+            meta = meta or {}
+            if wing_set and meta.get("wing") not in wing_set:
+                continue
+            if room_set and meta.get("room") not in room_set:
+                continue
+            fdocs.append(doc)
+            fmetas.append(meta)
+            fdists.append(dist)
+        return {"documents": [fdocs], "metadatas": [fmetas], "distances": [fdists]}
+
+
 def search_within(
     query: str,
     palace_path: str,
@@ -806,6 +840,16 @@ def search_within(
             drawers_col = get_collection(palace_path, collection_name=collection_name, create=False)
         else:
             drawers_col = get_collection(palace_path, create=False)
+    except BackendError as e:
+        # Distinguish a backend that failed to open (service down, mismatch)
+        # from a palace that simply doesn't exist yet — collapsing both to
+        # "No palace found" hid real backend failures behind an init hint.
+        return {
+            "error": "Backend error",
+            "details": str(e),
+            "hint": "The configured storage backend failed to open. "
+            "Check the backend service and configuration.",
+        }
     except Exception as e:
         logger.error("No palace found at %s: %s", palace_path, e)
         return {
@@ -831,7 +875,9 @@ def search_within(
         }
         if where:
             dkwargs["where"] = where
-        drawer_results = drawers_col.query(**dkwargs)
+        drawer_results = _query_drawers_with_filter_fallback(
+            drawers_col, dkwargs, query, n_results, wing_list, room_list
+        )
     except Exception as e:
         return {"error": f"Search error: {e}"}
 

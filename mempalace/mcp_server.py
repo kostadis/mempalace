@@ -72,6 +72,7 @@ from .backends.chroma import (  # noqa: E402
     _pin_hnsw_threads,
     hnsw_capacity_status,
 )
+from .backends import PalaceRef, detect_backend_for_path  # noqa: E402
 from .query_sanitizer import sanitize_query  # noqa: E402
 from .searcher import search_memories, search_within  # noqa: E402
 from .palace import (  # noqa: E402
@@ -89,6 +90,8 @@ from .palace_graph import (  # noqa: E402
 )
 
 from .knowledge_graph import KnowledgeGraph  # noqa: E402
+from .collision_scan import assert_no_collisions  # noqa: E402
+from .ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
 
 
 def _init_logging() -> None:
@@ -164,6 +167,11 @@ def _parse_args():
         metavar="PATH",
         help="Path to the palace directory (overrides config file and env var)",
     )
+    parser.add_argument(
+        "--backend",
+        metavar="NAME",
+        help="Storage backend to use (default: config/env/detected/chroma)",
+    )
     args, unknown = parser.parse_known_args()
     if unknown:
         logger.debug("Ignoring unknown args: %s", unknown)
@@ -205,6 +213,13 @@ elif not (os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get("MEMPAL_PALA
             MempalaceConfig().resolved_palace_path()
         except PalaceNotDeclared as e:
             raise SystemExit(f"mcp_server: {e}")
+if _args.backend:
+    backend_name = str(_args.backend).strip().lower()
+    from .backends import get_backend_class  # noqa: E402
+
+    get_backend_class(backend_name)
+    os.environ["MEMPALACE_BACKEND_EXPLICIT"] = backend_name
+    os.environ["MEMPALACE_BACKEND"] = backend_name
 
 _config = MempalaceConfig()
 # KG for the active default palace. ``_get_kg(palace_path)`` below falls back
@@ -269,6 +284,14 @@ def _call_kg(op, palace_path=None):
 _palace_caches: dict = {}
 _kg_cache: dict = {}
 
+# The per-palace cache design does not track a detailed backend-open error the
+# way upstream's single-palace scalar cache did; the chroma-centric
+# ``_get_collection`` simply returns ``None`` on failure. This sentinel stays
+# ``None`` so the auto-merged ``_collection_error_or_no_palace`` helper (and its
+# ~17 tool-handler callers) degrade to the plain ``_no_palace()`` message under
+# the local design instead of raising ``NameError``.
+_collection_open_error = None
+
 
 def _cache_entry(palace_path: str) -> dict:
     key = os.path.abspath(os.path.expanduser(palace_path))
@@ -329,7 +352,15 @@ def _is_transient_index_error(result) -> bool:
     if not isinstance(result, dict):
         return False
     err = result.get("error", "")
-    return isinstance(err, str) and ("Error finding id" in err or "Internal error" in err)
+    if not isinstance(err, str):
+        return False
+    err_l = err.lower()
+    return (
+        "error finding id" in err_l
+        or "internal error" in err_l
+        or "stale-index" in err_l
+        or "stale index" in err_l
+    )
 
 
 def _force_chroma_cache_reset() -> None:
@@ -341,10 +372,10 @@ def _force_chroma_cache_reset() -> None:
     # palace.get_collection -> backend cache.
     _palace_caches.pop(os.path.abspath(os.path.expanduser(_config.palace_path)), None)
     try:
-        from .palace import _DEFAULT_BACKEND
+        from .palace import get_backend_for_palace
 
-        _DEFAULT_BACKEND._clients.pop(_config.palace_path, None)
-        _DEFAULT_BACKEND._freshness.pop(_config.palace_path, None)
+        backend = get_backend_for_palace(_config.palace_path)
+        backend.close_palace(PalaceRef(id=_config.palace_path, local_path=_config.palace_path))
     except Exception:
         pass
 
@@ -373,6 +404,11 @@ def _refresh_vector_disabled_flag() -> None:
     would defeat the point.
     """
     global _vector_disabled, _vector_disabled_reason, _vector_capacity_status
+    if not _is_chroma_backend():
+        _vector_disabled = False
+        _vector_disabled_reason = ""
+        _vector_capacity_status = None
+        return
     try:
         info = hnsw_capacity_status(_config.palace_path, _config.collection_name)
     except Exception:
@@ -404,21 +440,51 @@ def _refresh_vector_disabled_flag() -> None:
 # This provides an audit trail for detecting memory poisoning and
 # enables review/rollback of writes from external or untrusted sources.
 
-_WAL_DIR = Path(os.path.expanduser("~/.mempalace/wal"))
-_WAL_DIR.mkdir(parents=True, exist_ok=True)
-try:
-    _WAL_DIR.chmod(0o700)
-except (OSError, NotImplementedError):
-    pass
-_WAL_FILE = _WAL_DIR / "write_log.jsonl"
-# Atomically create WAL file with restricted permissions (no TOCTOU race).
-# os.open with O_CREAT|O_WRONLY and mode 0o600 creates the file if absent
-# or opens it if present, both in a single syscall.
-try:
-    _fd = os.open(str(_WAL_FILE), os.O_CREAT | os.O_WRONLY, 0o600)
-    os.close(_fd)
-except (OSError, NotImplementedError):
-    pass
+_WAL_FILE = Path(os.path.expanduser("~/.mempalace/wal")) / "write_log.jsonl"
+_WAL_INITIALIZED_DIR = None
+
+
+def _ensure_wal() -> None:
+    """Create (and re-harden) the WAL directory lazily, on the first write.
+
+    This must NOT run at import time: a user who removed ``~/.mempalace`` has
+    engaged the documented kill-switch (``hooks_cli._palace_root_exists()``,
+    #1305), and recreating the directory just by importing this module would
+    silently re-arm the autosave/mining hooks they disabled (#1676). Creating
+    it on the first real write keeps the kill-switch contract intact.
+
+    It is deliberately not gated on ``_palace_root_exists()``: by the time a
+    write reaches here the palace is already being recreated by the ChromaDB/KG
+    layer regardless, so gating would only drop audit records, not prevent
+    recreation. Runtime kill-switch enforcement for MCP writes is the broader
+    question tracked in #504.
+
+    Hardening is attempted once per directory and the path cached in
+    ``_WAL_INITIALIZED_DIR`` regardless of outcome (keyed on the path, so a
+    test repointing ``_WAL_FILE`` re-initialises), so a persistent failure on a
+    restricted filesystem does not retry on every write. ``mkdir`` runs only
+    when the initial ``chmod`` raises ``FileNotFoundError`` (EAFP). The parent
+    ``~/.mempalace`` keeps its umask mode, like the other palace directories;
+    the WAL file is created atomically with mode 0o600 by ``_wal_log``.
+    """
+    global _WAL_INITIALIZED_DIR
+    wal_dir = _WAL_FILE.parent
+    if _WAL_INITIALIZED_DIR == wal_dir:
+        return
+    try:
+        wal_dir.chmod(0o700)
+    except FileNotFoundError:
+        try:
+            wal_dir.mkdir(parents=True, exist_ok=True)
+            wal_dir.chmod(0o700)
+        except (OSError, NotImplementedError):
+            pass
+    except (OSError, NotImplementedError):
+        pass
+    # Cache regardless of outcome: one attempt per directory, so a persistent
+    # chmod/mkdir failure (restricted FS) is not retried on every write.
+    _WAL_INITIALIZED_DIR = wal_dir
+
 
 # Keys whose values should be redacted in WAL entries to avoid logging sensitive content
 _WAL_REDACT_KEYS = frozenset(
@@ -442,6 +508,9 @@ def _wal_log(operation: str, params: dict, result: dict = None):
         "result": result,
     }
     try:
+        # Dir setup shares the append's exception handler below: any WAL
+        # failure is logged and non-fatal, never crashing the tool call.
+        _ensure_wal()
         fd = os.open(str(_WAL_FILE), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, default=str) + "\n")
@@ -495,7 +564,7 @@ def _get_client(palace_path=None):
         # Run the HNSW capacity probe BEFORE chromadb opens the segment —
         # if the index is severely undersized, segment load can segfault
         # the whole MCP server (#1222). The probe is pure sqlite +
-        # metadata-pickle read; never touches the HNSW binary files.
+        # metadata read; never touches the HNSW binary files.
         _refresh_vector_disabled_flag()
         entry["client"] = ChromaBackend.make_client(palace_path)
         entry["collection"] = None
@@ -600,6 +669,42 @@ def _no_palace():
         "error": "No palace found",
         "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
     }
+
+
+def _collection_error_or_no_palace():
+    if not _collection_open_error:
+        return _no_palace()
+    result = dict(_collection_open_error)
+    try:
+        result["backend"] = _selected_backend_name()
+    except Exception:
+        pass
+    return result
+
+
+def _selected_backend_name() -> str:
+    from .palace import resolve_backend_name
+
+    return resolve_backend_name(
+        _config.palace_path,
+        explicit=os.environ.get("MEMPALACE_BACKEND_EXPLICIT"),
+    )
+
+
+def _is_chroma_backend() -> bool:
+    try:
+        return _selected_backend_name() == "chroma"
+    except Exception:
+        logger.debug("backend resolution failed", exc_info=True)
+        return False
+
+
+def _backend_db_exists() -> bool:
+    try:
+        return detect_backend_for_path(_config.palace_path) is not None
+    except Exception:
+        logger.debug("backend artifact detection failed", exc_info=True)
+        return False
 
 
 # ==================== HELPERS ====================
@@ -753,6 +858,7 @@ def _tool_status_via_sqlite(palace_path: str = None) -> dict:
         "palace_path": palace_path,
         "protocol": PALACE_PROTOCOL,
         "aaak_dialect": AAAK_SPEC,
+        "backend": "chroma",
         "vector_disabled": True,
         "vector_disabled_reason": _vector_disabled_reason,
     }
@@ -787,7 +893,7 @@ def tool_status(palace: str = None):
     # accidentally creating a palace in a non-existent directory (#830).
     col = _get_collection(palace_path=resolved, create=db_exists)
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     count = col.count()
     wings = {}
     rooms = {}
@@ -798,6 +904,7 @@ def tool_status(palace: str = None):
         "palace_path": resolved,
         "protocol": PALACE_PROTOCOL,
         "aaak_dialect": AAAK_SPEC,
+        "backend": _selected_backend_name(),
     }
     try:
         all_meta = _get_cached_metadata(col, palace_path=resolved)
@@ -850,7 +957,7 @@ When WRITING AAAK: use entity codes, mark emotions, keep structure tight."""
 def tool_list_wings():
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     wings = {}
     result = {"wings": wings}
     try:
@@ -873,7 +980,7 @@ def tool_list_rooms(wing: str = None):
         return {"error": str(e)}
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     rooms = {}
     result = {"wing": wing or "all", "rooms": rooms}
     try:
@@ -893,7 +1000,7 @@ def tool_list_rooms(wing: str = None):
 def tool_get_taxonomy():
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     taxonomy = {}
     result = {"taxonomy": taxonomy}
     try:
@@ -964,6 +1071,7 @@ def tool_search(
             n_results=limit,
             max_distance=dist,
             vector_disabled=_vector_disabled,
+            collection_name=_config.collection_name,
         )
         if not _is_transient_index_error(result):
             result["index_recovered"] = True
@@ -1240,7 +1348,7 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
         }
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     try:
         content = strip_lone_surrogates(content)
         results = col.query(
@@ -1286,7 +1394,7 @@ def tool_traverse_graph(start_room: str, max_hops: int = 2):
     max_hops = max(1, min(max_hops, 10))
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     return traverse(start_room, col=col, max_hops=max_hops)
 
 
@@ -1299,7 +1407,7 @@ def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
         return {"error": str(e)}
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     return find_tunnels(wing_a, wing_b, col=col)
 
 
@@ -1307,7 +1415,7 @@ def tool_graph_stats():
     """Palace graph overview: nodes, tunnels, edges, connectivity."""
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     return graph_stats(col=col)
 
 
@@ -1373,6 +1481,8 @@ def tool_follow_tunnels(wing: str, room: str):
     except ValueError as e:
         return {"error": str(e)}
     col = _get_collection()
+    if not col:
+        return _collection_error_or_no_palace()
     return follow_tunnels(wing, room, col=col)
 
 
@@ -1406,11 +1516,9 @@ def tool_add_drawer(
 
     col = _get_collection(create=True)
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
 
-    drawer_id = (
-        f"drawer_{wing}_{room}_{hashlib.sha256((wing + room + content).encode()).hexdigest()[:24]}"
-    )
+    drawer_id = make_drawer_id_from_content(wing, room, content)
 
     _wal_log(
         "add_drawer",
@@ -1431,6 +1539,7 @@ def tool_add_drawer(
         "source_file": source_file or "",
         "added_by": added_by,
         "filed_at": datetime.now().isoformat(),
+        "id_recipe": ID_RECIPE,
     }
 
     # Idempotency. Three cases to detect a prior committed write:
@@ -1492,6 +1601,7 @@ def tool_add_drawer(
             chunk_metas.append(
                 {**base_meta, "chunk_index": chunk_idx, "parent_drawer_id": drawer_id}
             )
+        assert_no_collisions(list(zip(chunk_ids, chunk_metas)), col)
         col.upsert(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
         # Probe the LAST chunk id, not the first — its presence confirms
         # the whole batch landed, not just the leading row.
@@ -1519,7 +1629,7 @@ def tool_delete_drawer(drawer_id: str):
     """Delete a single drawer by ID."""
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     existing = col.get(ids=[drawer_id])
     if not existing["ids"]:
         return {"success": False, "error": f"Drawer not found: {drawer_id}"}
@@ -1588,7 +1698,7 @@ def tool_get_drawer(drawer_id: str):
     """Fetch a single drawer by ID. Returns full content and metadata."""
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     try:
         result = col.get(ids=[drawer_id], include=["documents", "metadatas"])
         if not result["ids"]:
@@ -1626,7 +1736,7 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
         return {"error": str(e)}
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     try:
         where = None
         conditions = []
@@ -1681,7 +1791,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
     try:
         existing = col.get(ids=[drawer_id], include=["documents", "metadatas"])
         if not existing["ids"]:
@@ -1903,7 +2013,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     room = "diary"
     col = _get_collection(create=True)
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
 
     now = datetime.now()
     entry_id = (
@@ -2026,7 +2136,7 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
     last_n = max(1, min(last_n, 100))
     col = _get_collection()
     if not col:
-        return _no_palace()
+        return _collection_error_or_no_palace()
 
     # Build filter: always scope by agent + room=diary. Wing is optional —
     # when empty, return entries across all wings for this agent (matches
@@ -2163,28 +2273,37 @@ def tool_reconnect():
     from . import palace as palace_module
 
     close_errors = []
+    palace_ref = PalaceRef(id=_config.palace_path, local_path=_config.palace_path)
     try:
-        palace_module._DEFAULT_BACKEND.close_palace(_config.palace_path)
+        backend = palace_module.get_backend_for_palace(_config.palace_path)
+        backend.close_palace(palace_ref)
     except Exception as exc:
         logger.debug("Failed to close shared palace backend during reconnect", exc_info=True)
         close_errors.append(f"backend close_palace failed: {exc}")
-    try:
-        from chromadb.api.client import SharedSystemClient
+    if _is_chroma_backend():
+        try:
+            from chromadb.api.client import SharedSystemClient
 
-        clear_system_cache = getattr(SharedSystemClient, "clear_system_cache", None)
-        if callable(clear_system_cache):
-            clear_system_cache()
-        else:
+            clear_system_cache = getattr(SharedSystemClient, "clear_system_cache", None)
+            if callable(clear_system_cache):
+                clear_system_cache()
+            else:
+                logger.debug(
+                    "SharedSystemClient.clear_system_cache is unavailable; "
+                    "skipping shared Chroma cache clear during reconnect"
+                )
+        except Exception as exc:
             logger.debug(
-                "SharedSystemClient.clear_system_cache is unavailable; skipping shared Chroma cache clear during reconnect"
+                "Failed to clear Chroma shared system cache during reconnect",
+                exc_info=True,
             )
-    except Exception as exc:
-        logger.debug(
-            "Failed to clear Chroma shared system cache during reconnect",
-            exc_info=True,
-        )
-        close_errors.append(f"shared Chroma cache clear failed: {exc}")
+            close_errors.append(f"shared Chroma cache clear failed: {exc}")
     _palace_caches.clear()
+    # Re-arm the per-process HNSW quarantine gate so the safety probe re-runs
+    # on the next open after an out-of-band write (#1573). The set is a
+    # ChromaBackend class attribute reachable without importing chromadb, so
+    # this is safe on turbovec-only deploys.
+    ChromaBackend._quarantined_paths.discard(_config.palace_path)
     # Force probe re-run on next _get_client by clearing the flag now;
     # _refresh_vector_disabled_flag will re-set it if the divergence
     # still applies after the reconnect.
@@ -2206,12 +2325,17 @@ def tool_reconnect():
     try:
         col = _get_collection()
         if col is None:
+            open_error = _collection_error_or_no_palace()
             result = {
                 "success": False,
-                "message": "No palace found after reconnect",
+                "message": open_error.get("error", "No palace found after reconnect"),
                 "drawers": 0,
                 "vector_disabled": _vector_disabled,
             }
+            if "details" in open_error:
+                result["details"] = open_error["details"]
+            if "hint" in open_error:
+                result["hint"] = open_error["hint"]
             if close_errors:
                 result["error"] = "; ".join(close_errors)
             return result
@@ -2710,8 +2834,18 @@ TOOLS = {
                     "type": "string",
                     "description": "Target wing for this diary entry (optional). If omitted, uses wing_{agent_name}. Use this to write diary entries to a project wing instead of an agent-specific wing.",
                 },
+                "content": {
+                    "type": "string",
+                    "description": "Alias for 'entry' — accepted because add_drawer uses 'content'. Provide either 'entry' or 'content'; 'entry' wins if both are given.",
+                },
             },
-            "required": ["agent_name", "entry"],
+            # agent_name is always required; 'entry' or its alias 'content' must
+            # be present (the server remaps content->entry at dispatch).
+            "required": ["agent_name"],
+            "anyOf": [
+                {"required": ["entry"]},
+                {"required": ["content"]},
+            ],
         },
         "handler": tool_diary_write,
     },
@@ -2918,6 +3052,17 @@ def handle_request(request):
                     "error": {"code": -32602, "message": f"Invalid value for parameter '{key}'"},
                 }
         tool_args.pop("wait_for_previous", None)
+        # 'content' is an accepted alias for diary_write's 'entry' (callers often
+        # reuse add_drawer's 'content' name). Map it in here, before dispatch, so a
+        # content-only call still satisfies the required 'entry' param while the
+        # signature-based missing-parameter diagnostic (-32602) keeps working.
+        # 'entry' wins if both are supplied.
+        if tool_name == "mempalace_diary_write" and "content" in tool_args:
+            content_val = tool_args.pop("content")
+            # Only fill from the alias when the caller did not supply 'entry' at
+            # all (or passed it as null). An explicit entry — even "" — wins.
+            if "entry" not in tool_args or tool_args["entry"] is None:
+                tool_args["entry"] = content_val
         try:
             result = TOOLS[tool_name]["handler"](**tool_args)
             return {
@@ -3080,8 +3225,17 @@ def _maybe_eager_warmup_embedder() -> None:
         )
         return
     palace_path = _config.palace_path
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
-    if not os.path.isfile(db_path):
+    try:
+        backend_name = _selected_backend_name()
+    except Exception as exc:  # fail-soft per docstring
+        logger.warning(
+            "MEMPALACE_EAGER_WARMUP=%s: backend resolution failed for %s (%s)",
+            raw,
+            palace_path,
+            exc,
+        )
+        return
+    if not _backend_db_exists():
         # Pre-check (NOT a try/except on _ChromaNotFoundError, which never
         # propagates out of _get_collection — see docstring). No palace
         # file means nothing to warm AND avoids the chromadb-client
@@ -3125,9 +3279,11 @@ def _maybe_eager_warmup_embedder() -> None:
             type(exc).__name__,
         )
     else:
+        warmed = "embedder + HNSW ready" if backend_name == "chroma" else "embedder + backend ready"
         logger.info(
-            "MEMPALACE_EAGER_WARMUP=%s: embedder + HNSW ready (palace=%s, device=%s)",
+            "MEMPALACE_EAGER_WARMUP=%s: %s (palace=%s, device=%s)",
             raw,
+            warmed,
             palace_path,
             device,
         )
