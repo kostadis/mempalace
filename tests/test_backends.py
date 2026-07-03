@@ -9,7 +9,9 @@ import chromadb
 import pytest
 
 from mempalace.backends import (
+    CollectionNotInitializedError,
     GetResult,
+    PalaceNotFoundError,
     PalaceRef,
     QueryResult,
     UnsupportedFilterError,
@@ -1026,6 +1028,43 @@ def test_get_collection_applies_retrofit_on_existing_palace(tmp_path):
     assert wrapper._collection.configuration_json["hnsw"]["num_threads"] == 1
 
 
+def test_get_collection_raises_palace_not_found_when_dir_missing(tmp_path):
+    """create=False on a missing dir raises PalaceNotFoundError, not the
+    new CollectionNotInitializedError. The two states must be distinguishable
+    so callers can render state-specific messages (#1498)."""
+    missing = tmp_path / "no-such-dir"
+    with pytest.raises(PalaceNotFoundError) as excinfo:
+        ChromaBackend().get_collection(
+            str(missing),
+            collection_name="mempalace_drawers",
+            create=False,
+        )
+    # Must be the parent class, not the new subclass: dir is genuinely absent.
+    assert not isinstance(excinfo.value, CollectionNotInitializedError)
+
+
+def test_get_collection_raises_collection_not_initialized_on_empty_palace(tmp_path):
+    """When the palace dir + DB exist but the collection has never been
+    created, ChromaBackend.get_collection(create=False) raises the new
+    CollectionNotInitializedError instead of leaking chromadb.NotFoundError
+    (#1498)."""
+    palace_path = tmp_path / "palace"
+    palace_path.mkdir()
+    # PersistentClient lazily creates chroma.sqlite3 — no collection yet.
+    chromadb.PersistentClient(path=str(palace_path))
+    assert (palace_path / "chroma.sqlite3").is_file()
+
+    with pytest.raises(CollectionNotInitializedError) as excinfo:
+        ChromaBackend().get_collection(
+            str(palace_path),
+            collection_name="mempalace_drawers",
+            create=False,
+        )
+    # Backward-compat: subclass of PalaceNotFoundError (and FileNotFoundError).
+    assert isinstance(excinfo.value, PalaceNotFoundError)
+    assert isinstance(excinfo.value, FileNotFoundError)
+
+
 def test_quarantine_invalid_hnsw_metadata_renames_missing_dimensionality(tmp_path):
     palace = tmp_path / "palace"
     palace.mkdir()
@@ -1033,6 +1072,59 @@ def test_quarantine_invalid_hnsw_metadata_renames_missing_dimensionality(tmp_pat
     seg.mkdir()
     with open(seg / "index_metadata.pickle", "wb") as f:
         pickle.dump({"dimensionality": None, "id_to_label": {"a": 1}}, f)
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert len(moved) == 1
+    assert ".corrupt-" in moved[0]
+    assert not seg.exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_keeps_consistent_missing_dimensionality(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    (seg / "data_level0.bin").write_bytes(b"x" * 2048)
+    (seg / "link_lists.bin").write_bytes(b"x" * 128)
+    with open(seg / "index_metadata.pickle", "wb") as f:
+        pickle.dump(
+            {
+                "dimensionality": None,
+                "total_elements_added": 2,
+                "max_seq_id": None,
+                "id_to_label": {"a": 1, "b": 2},
+                "label_to_id": {1: "a", 2: "b"},
+                "id_to_seq_id": {},
+            },
+            f,
+        )
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert moved == []
+    assert seg.exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_renames_mismatched_missing_dimensionality(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    (seg / "data_level0.bin").write_bytes(b"x" * 2048)
+    (seg / "link_lists.bin").write_bytes(b"x" * 128)
+    with open(seg / "index_metadata.pickle", "wb") as f:
+        pickle.dump(
+            {
+                "dimensionality": None,
+                "total_elements_added": 2,
+                "max_seq_id": None,
+                "id_to_label": {"a": 1, "b": 2},
+                "label_to_id": {1: "b", 2: "a"},
+                "id_to_seq_id": {},
+            },
+            f,
+        )
 
     moved = quarantine_invalid_hnsw_metadata(str(palace))
 
@@ -1266,6 +1358,65 @@ def test_chroma_backend_requarantines_after_inode_replacement(tmp_path, monkeypa
         ("invalid", str(palace)),
         ("stale", str(palace)),
     ]
+
+
+def test_explain_ef_mismatch_recognizes_chromadb_conflict():
+    """When ChromaDB rejects a collection read due to an EF-name mismatch
+    (user changed MEMPALACE_EMBEDDING_MODEL on an existing palace), the
+    backend wraps the bare ValueError with a message that tells the user
+    how to recover. Without this, users hit a stack trace and don't know
+    rebuild-index exists."""
+    err = ValueError(
+        "An embedding function already exists in the collection configuration, "
+        "and a new one is provided. Embedding function conflict: new: "
+        "embeddinggemma_300m vs persisted: default"
+    )
+    msg = ChromaBackend._explain_ef_mismatch(err, "/tmp/palace.db")
+    assert msg is not None
+    assert "/tmp/palace.db" in msg
+    assert "MEMPALACE_EMBEDDING_MODEL" in msg
+    assert "rebuild-index" in msg
+
+
+def test_explain_ef_mismatch_returns_none_for_unrelated_errors():
+    """Don't paper over unrelated ValueErrors with the EF-mismatch message —
+    the caller needs to re-raise unmodified so debugging stays sane."""
+    err = ValueError("Some other ChromaDB problem")
+    assert ChromaBackend._explain_ef_mismatch(err, "/tmp/palace.db") is None
+
+
+def test_get_collection_translates_ef_mismatch_to_helpful_error(tmp_path):
+    """End-to-end: create a palace with the default EF, then try to read it
+    with a different EF name and confirm we surface the rebuild-index hint."""
+    backend = ChromaBackend()
+    palace_path = str(tmp_path / "palace")
+    os.makedirs(palace_path, exist_ok=True)
+
+    # Create the collection using the default (minilm-based) EF.
+    coll = backend.get_collection(palace_path, "drawers", create=True)
+    coll.add(documents=["seed"], ids=["1"])
+
+    # Now swap in an incompatible EF name (simulates the user setting
+    # MEMPALACE_EMBEDDING_MODEL=embeddinggemma without rebuild-index).
+    class _ConflictingEF:
+        @staticmethod
+        def name() -> str:
+            return "embeddinggemma_300m"
+
+        def __call__(self, input):
+            return [[0.0] * 384 for _ in input]
+
+    original_resolver = backend._resolve_embedding_function
+    backend._resolve_embedding_function = lambda: _ConflictingEF()
+    # Drop the cached client so the next call goes through the open path.
+    backend.close_palace(palace_path)
+
+    try:
+        with pytest.raises(ValueError, match=r"rebuild-index"):
+            backend.get_collection(palace_path, "drawers", create=False)
+    finally:
+        backend._resolve_embedding_function = original_resolver
+        backend.close_palace(palace_path)
 
 
 def test_palace_get_collection_uses_configured_collection_name(monkeypatch):
