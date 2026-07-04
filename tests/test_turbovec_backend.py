@@ -1,6 +1,6 @@
 """Contract + persistence tests for the experimental turbovec backend.
 
-Skipped wholesale on platforms without a turbovec wheel. Vectors are supplied
+Skipped wholesale where ``turbovecdb`` is not importable. Vectors are supplied
 explicitly so the unit tests are fully offline — the embedding-function path
 (``query_texts``) is exercised with a fake EF; the real nomic/vllm-embed path
 is covered by the on-Spark parity step, not here.
@@ -8,7 +8,11 @@ is covered by the on-Spark parity step, not here.
 
 import pytest
 
-turbovec = pytest.importorskip("turbovec")
+# Gate on ``turbovecdb`` (what the adapter imports), not the ``turbovec`` ANN
+# Python package — turbovecdb 0.5+ statically links the turbovec Rust engine
+# into its native extension, so the standalone ``turbovec`` wheel is no longer
+# a runtime dependency.
+pytest.importorskip("turbovecdb")
 
 from mempalace.backends import (  # noqa: E402  (must follow importorskip)
     GetResult,

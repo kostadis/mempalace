@@ -115,8 +115,10 @@ dml = ["onnxruntime-directml>=1.16"]
 coreml = ["onnxruntime>=1.16"]
 # Experimental CPU vector backend, powered by the standalone turbovecdb library
 # (turbovec 4-bit ANN + durable SQLite store). Select via MEMPALACE_BACKEND=turbovec.
-# turbovecdb pulls turbovec, numpy, and filelock.
-turbovec = ["turbovecdb>=0.1"]
+# turbovecdb 0.5+ statically links the turbovec Rust ANN engine into its
+# native extension (turbovecdb._core); it no longer needs the standalone
+# turbovec Python wheel. Pinned to the local editable via [tool.uv.sources].
+turbovec = ["turbovecdb>=0.5"]
 # Multilingual extra kept as a no-op alias for back-compat with
 # `pip install mempalace[multilingual]` — these deps now ship in core.
 multilingual = []
@@ -202,3 +204,10 @@ exclude_lines = [
     "if __name__",
     "pragma: no cover",
 ]
+
+[tool.uv.sources]
+# Local editable turbovecdb (0.5.x lives at ~/src/turbovecdb; the index only
+# publishes 0.1.0). Relative path resolves from both ~/src/mempalace and the
+# ~/src/mempalace-v3.5.0 worktree. A clone without a sibling ~/src/turbovecdb
+# cannot `uv sync --extra turbovec` — the turbovec backend is dev-local only.
+turbovecdb = { path = "../turbovecdb", editable = true }
