@@ -859,6 +859,53 @@ def cmd_status(args):
     status(palace_path=palace_path)
 
 
+def cmd_palace_set_embedder(args):
+    """Record (or force-override) a palace's embedder identity (RFC 001).
+
+    Resolves the ``unknown`` state for a legacy palace, or records a specific
+    model with ``--model``. It records identity on the palace only; it does not
+    change the configured model — when the two differ it prints how to align
+    ``MEMPALACE_EMBEDDING_MODEL``. ``--force`` overwrites an existing,
+    differently-named identity.
+    """
+    from .backends.base import EmbedderIdentityMismatchError
+    from .palace import set_palace_embedder_identity
+
+    config = MempalaceConfig()
+    palace_path = os.path.abspath(
+        os.path.expanduser(args.palace) if args.palace else config.palace_path
+    )
+    model = getattr(args, "model", None)
+    try:
+        old, new = set_palace_embedder_identity(
+            palace_path,
+            model=model,
+            force=getattr(args, "force", False),
+            backend=_backend_arg(args),
+        )
+    except EmbedderIdentityMismatchError as exc:
+        print(f"  ✗ {exc}")
+        raise SystemExit(2) from exc
+    if old is None:
+        print(f"  ✓ recorded embedder identity: {new.model_name} (dim={new.dimension})")
+    elif old.model_name == new.model_name:
+        print(f"  ✓ embedder identity unchanged: {new.model_name} (dim={new.dimension})")
+    else:
+        print(
+            f"  ✓ embedder identity changed: {old.model_name} → {new.model_name} "
+            f"(dim={new.dimension})"
+        )
+    # set-embedder records the palace's identity; it does not change the
+    # configured model. If they differ, the next normal open would mismatch —
+    # tell the user how to align them.
+    configured = config.embedding_model
+    if new.model_name and configured and new.model_name != configured:
+        print(
+            f"  ⚠ configured model is {configured!r}; set MEMPALACE_EMBEDDING_MODEL="
+            f"{new.model_name} (or run onboarding) so normal opens of this palace match."
+        )
+
+
 def cmd_repair_status(args):
     """Read-only HNSW capacity health check (#1222)."""
     palace_path = _resolve_cli_palace(args)
@@ -870,7 +917,12 @@ def cmd_repair_status(args):
 
 
 def cmd_repair(args):
-    """Rebuild palace vector index from SQLite metadata."""
+    """Rebuild palace vector index from SQLite metadata.
+
+    On success the palace SQLite file is VACUUMed and the FTS5 index is
+    rebuilt, so the next repair's integrity preflight reads a consistent
+    database (#1747).
+    """
     config = MempalaceConfig()
     collection_name = config.collection_name
     palace_path = _resolve_cli_palace(args)
@@ -885,6 +937,7 @@ def cmd_repair(args):
         TruncationDetected,
         _close_chroma_handles,
         _extract_drawers,
+        _post_rebuild_cleanup,
         _rebuild_collection_via_temp,
         check_extraction_safety,
         maybe_repair_poisoned_max_seq_id_before_rebuild,
@@ -1077,6 +1130,10 @@ def cmd_repair(args):
                 print(f"    2. Restore the backup directory to: {palace_path}")
                 print(f"       Backup location: {backup_path}")
         sys.exit(1)
+
+    # The bulk delete + re-upsert cycle above leaves the FTS5 inverted index
+    # inconsistent, which fails the next repair's integrity preflight (#1747).
+    _post_rebuild_cleanup(palace_path, backend=backend, progress=print)
 
     print(f"\n  Repair complete. {filed} drawers rebuilt.")
     print(f"  Backup saved at {backup_path}")
@@ -1741,6 +1798,31 @@ def main():
         help="Storage backend to use for status (default: config/env/detected/chroma)",
     )
 
+    p_palace = sub.add_parser("palace", help="Palace maintenance commands")
+    palace_sub = p_palace.add_subparsers(dest="palace_action")
+    p_set_embedder = palace_sub.add_parser(
+        "set-embedder",
+        help="Record/override the palace's embedder identity (resolve 'unknown', or switch models)",
+    )
+    p_set_embedder.add_argument(
+        "--model",
+        default=None,
+        help="Embedder model to record (default: current configured model). "
+        "Records identity on the palace only; does not change the configured "
+        "model (prints how to align MEMPALACE_EMBEDDING_MODEL if they differ).",
+    )
+    p_set_embedder.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing identity that names a different model "
+        "(only if you know the stored vectors are compatible)",
+    )
+    p_set_embedder.add_argument(
+        "--backend",
+        default=None,
+        help="Storage backend (default: config/env/detected/chroma)",
+    )
+
     args = parser.parse_args()
     _apply_backend_arg(args)
 
@@ -1763,6 +1845,13 @@ def main():
             return
         args.name = name
         cmd_instructions(args)
+        return
+
+    if args.command == "palace":
+        if getattr(args, "palace_action", None) == "set-embedder":
+            cmd_palace_set_embedder(args)
+        else:
+            p_palace.print_help()
         return
 
     dispatch = {

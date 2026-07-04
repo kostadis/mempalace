@@ -1485,3 +1485,196 @@ class TestDrawerGrepExpansion:
     # mechanism. The ``_expand_with_neighbors`` helper itself is still
     # exercised by the tests above; reintroducing hydration on
     # ``themes`` hits is a follow-up (see docs/design/two-tier-retrieval.md).
+
+    def test_expand_isolates_chunks_by_parent_drawer_id_when_source_file_shared(self, palace_path):
+        """Regression for #1580. After #1539 the chunked ``tool_add_drawer``
+        path stores per-chunk drawers tagged with a ``parent_drawer_id``
+        linking them to the logical group. If two unrelated logical
+        drawers happen to share the same ``source_file`` (e.g. two pastes
+        labelled ``source_file="chat.log"``), filtering only by
+        ``source_file + chunk_index`` pulls chunks from both groups as if
+        they were sequential neighbors, corrupting the enriched text.
+        Scoping by ``parent_drawer_id`` when present keeps each logical
+        group isolated. (``tool_diary_write`` chunks tag a different key
+        (``parent_entry_id``) and are written without ``source_file``, so
+        they never reach this enrichment path.)
+        """
+        col = get_collection(palace_path)
+        source = "shared.log"
+        # Group A: 2 chunks under parent_drawer_id="drawer_A".
+        col.upsert(
+            ids=["drawer_A_chunk_000000", "drawer_A_chunk_000001"],
+            documents=["alpha-A-chunk-0 content", "alpha-A-chunk-1 content"],
+            metadatas=[
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "source_file": source,
+                    "chunk_index": 0,
+                    "parent_drawer_id": "drawer_A",
+                    "filed_at": "2026-04-13T00:00:00",
+                },
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "source_file": source,
+                    "chunk_index": 1,
+                    "parent_drawer_id": "drawer_A",
+                    "filed_at": "2026-04-13T00:00:00",
+                },
+            ],
+        )
+        # Group B: 2 chunks under the SAME source_file but a different
+        # parent_drawer_id. Chunk indices intentionally collide with A.
+        col.upsert(
+            ids=["drawer_B_chunk_000000", "drawer_B_chunk_000001"],
+            documents=["bravo-B-chunk-0 content", "bravo-B-chunk-1 content"],
+            metadatas=[
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "source_file": source,
+                    "chunk_index": 0,
+                    "parent_drawer_id": "drawer_B",
+                    "filed_at": "2026-04-13T00:00:00",
+                },
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "source_file": source,
+                    "chunk_index": 1,
+                    "parent_drawer_id": "drawer_B",
+                    "filed_at": "2026-04-13T00:00:00",
+                },
+            ],
+        )
+
+        matched_doc = "alpha-A-chunk-0 content"
+        matched_meta = {
+            "source_file": source,
+            "chunk_index": 0,
+            "parent_drawer_id": "drawer_A",
+        }
+        out = _expand_with_neighbors(col, matched_doc, matched_meta, radius=1)
+        text = out["text"]
+        # Group A's chunks are returned in chunk_index order.
+        assert "alpha-A-chunk-0" in text
+        assert "alpha-A-chunk-1" in text
+        # No leakage of group B's chunks through the shared source_file key.
+        assert "bravo-B-chunk-0" not in text
+        assert "bravo-B-chunk-1" not in text
+        # total_drawers is scoped to the parent group so the caller sees a
+        # count consistent with the text returned (2 chunks in group A),
+        # not 4 (every row sharing the source_file key).
+        assert out["total_drawers"] == 2
+        assert out["drawer_index"] == 0
+
+    def test_expand_backwards_compat_no_parent_drawer_id_returns_all_source_neighbors(
+        self, palace_path
+    ):
+        """Drawers without a ``parent_drawer_id`` (single-chunk writes,
+        legacy palaces, ``diary_ingest`` chunks grouped by real file path)
+        must take the 2-clause fallback (``source_file + chunk_index``)
+        unchanged, so neighbor expansion still works file-globally for
+        those callers.
+        """
+        col, _ = self._seed_source_file(palace_path, "/proj/legacy.md", n_chunks=5)
+        matched_meta = {"source_file": "/proj/legacy.md", "chunk_index": 2}
+        out = _expand_with_neighbors(
+            col, "chunk_2 content about topic alpha", matched_meta, radius=1
+        )
+        # Same expectations as test_expand_returns_matched_plus_neighbors:
+        # no parent_drawer_id anywhere, so behavior is unchanged.
+        assert out["total_drawers"] == 5
+        assert out["drawer_index"] == 2
+        text = out["text"]
+        assert "chunk_1" in text
+        assert "chunk_2" in text
+        assert "chunk_3" in text
+
+    def test_expand_isolates_asymmetric_groups_under_shared_source_file(self, palace_path):
+        """Asymmetric coverage: group A has 1 chunk, group B has 3 chunks
+        under the shared ``source_file``. Catches a regression where
+        ``total_drawers`` accidentally drifts back to the unscoped
+        file-global count (4) when one group dominates the row mix.
+        """
+        col = get_collection(palace_path)
+        source = "asym.log"
+        col.upsert(
+            ids=["drawer_solo_chunk_000000"],
+            documents=["solo-A-chunk-0 content"],
+            metadatas=[
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "source_file": source,
+                    "chunk_index": 0,
+                    "parent_drawer_id": "drawer_solo",
+                    "filed_at": "2026-04-13T00:00:00",
+                }
+            ],
+        )
+        col.upsert(
+            ids=[
+                "drawer_trio_chunk_000000",
+                "drawer_trio_chunk_000001",
+                "drawer_trio_chunk_000002",
+            ],
+            documents=[
+                "trio-B-chunk-0 content",
+                "trio-B-chunk-1 content",
+                "trio-B-chunk-2 content",
+            ],
+            metadatas=[
+                {
+                    "wing": "w",
+                    "room": "r",
+                    "source_file": source,
+                    "chunk_index": i,
+                    "parent_drawer_id": "drawer_trio",
+                    "filed_at": "2026-04-13T00:00:00",
+                }
+                for i in range(3)
+            ],
+        )
+
+        out = _expand_with_neighbors(
+            col,
+            "solo-A-chunk-0 content",
+            {
+                "source_file": source,
+                "chunk_index": 0,
+                "parent_drawer_id": "drawer_solo",
+            },
+            radius=1,
+        )
+        # Singleton group A: text is the matched chunk, total_drawers == 1.
+        assert "solo-A-chunk-0" in out["text"]
+        assert "trio-B-chunk" not in out["text"]
+        assert out["total_drawers"] == 1
+        assert out["drawer_index"] == 0
+
+    def test_expand_empty_string_parent_drawer_id_treated_as_absent(self, palace_path):
+        """Contract pin: an empty-string ``parent_drawer_id`` value
+        degrades to the 2-clause file-global filter (matches the
+        ``if not src`` empty-string handling for ``source_file`` at
+        ``searcher.py:239``). Writers in the codebase never emit an
+        empty parent id, but pinning the contract guards against a
+        future migration that does and avoids a silent narrow-then-
+        miss surprise.
+        """
+        col, _ = self._seed_source_file(palace_path, "/proj/empty_parent.md", n_chunks=3)
+        matched_meta = {
+            "source_file": "/proj/empty_parent.md",
+            "chunk_index": 1,
+            "parent_drawer_id": "",
+        }
+        out = _expand_with_neighbors(
+            col, "chunk_1 content about topic alpha", matched_meta, radius=1
+        )
+        # Empty parent_drawer_id is treated as absent; full file-global
+        # neighborhood is returned. Mirrors backwards-compat behavior.
+        assert out["total_drawers"] == 3
+        assert "chunk_0" in out["text"]
+        assert "chunk_1" in out["text"]
+        assert "chunk_2" in out["text"]

@@ -697,8 +697,6 @@ def _mine_convos_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run
     wing = _resolve_wing(convo_path, wing)
 
     files = scan_convos(convo_dir)
-    if limit > 0:
-        files = files[:limit]
 
     # Resolve workers from arg → config (asymmetric default: 1 onnx, 8 remote).
     if workers is None:
@@ -709,7 +707,8 @@ def _mine_convos_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run
     print(f"{'=' * 55}")
     print(f"  Wing:    {wing}")
     print(f"  Source:  {convo_path}")
-    print(f"  Files:   {len(files)}")
+    limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
+    print(f"  Files:   {len(files)}{limit_suffix}")
     print(f"  Palace:  {palace_path}")
     if not dry_run:
         print(f"  Workers: {workers}")
@@ -817,9 +816,14 @@ def _mine_convos_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run
                 return
 
             if kind == "register":
+                # A readable file that yields no chunks is registered (sentinel
+                # written) but is NOT an "already filed" skip — it was processed
+                # this run. Counting it under files_skipped mislabels it and
+                # inflates the skip line (e.g. re-mining a transcript in a
+                # different extract_mode). Matches the serial mine, which
+                # registers-and-continues without incrementing the skip count.
                 source_file = result.payload[1]
                 _register_file(collection, source_file, wing, agent, extract_mode)
-                files_skipped += 1
                 return
 
             # drawers

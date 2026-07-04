@@ -125,18 +125,70 @@ def _bm25_scores(
     return scores
 
 
+def _distance_to_similarity(distance, metric: str = "cosine") -> float:
+    """Map a backend-reported ``distance`` to a [0, 1]-ish similarity.
+
+    The backend contract for the ``distances`` field is *lower = closer*
+    regardless of metric (RFC 001, backend metric declaration), so every
+    mapping here is monotonic decreasing in ``distance``. The output stays
+    bounded so it is
+    commensurable with the min-max-normalized BM25 term in
+    :func:`_hybrid_rank`.
+
+    * ``cosine`` — distance ∈ [0, 2], 0 = identical: ``max(0, 1 - d)``.
+    * ``l2`` — Euclidean ∈ [0, ∞): ``1 / (1 + d)`` (1 at d=0, →0 as d→∞).
+    * ``ip`` — inner-product distance (e.g. pgvector ``<#>`` = -dot, lower =
+      closer), unbounded and signed: logistic squash ``1 / (1 + e^d)``.
+      Provisional until a real ip backend exercises it; no in-tree backend
+      uses ip today.
+
+    ``distance is None`` (vector-unknown, e.g. a BM25-only candidate) maps to
+    0.0 so the candidate scores on its BM25 contribution alone.
+    """
+    if distance is None:
+        return 0.0
+    m = (metric or "cosine").lower()
+    if m == "l2":
+        return 1.0 / (1.0 + max(0.0, distance))
+    if m == "ip":
+        # Clamp the exponent so a large positive distance can't overflow.
+        return 1.0 / (1.0 + math.exp(min(60.0, distance)))
+    # cosine (default)
+    return max(0.0, 1.0 - distance)
+
+
+def _metric_for_collection(col) -> str:
+    """Resolve a collection's declared distance metric, defaulting to cosine.
+
+    Reads the ``distance_metric`` exposed by the backend collection (the
+    RFC 001 backend metric declaration). ``EmbeddingCollection`` delegates the
+    attribute to its inner collection; legacy Chroma palaces report their
+    actual ``hnsw:space``.
+    Any failure falls back to ``"cosine"`` — the value all in-tree backends
+    use and the only metric MemPalace created palaces with historically.
+    """
+    try:
+        metric = getattr(col, "distance_metric", "cosine")
+    except Exception:
+        return "cosine"
+    metric = str(metric or "cosine").lower()
+    return metric if metric in ("cosine", "l2", "ip") else "cosine"
+
+
 def _hybrid_rank(
     results: list,
     query: str,
     vector_weight: float = 0.6,
     bm25_weight: float = 0.4,
+    metric: str = "cosine",
 ) -> list:
     """Re-rank ``results`` by a convex combination of vector similarity and BM25.
 
-    * Vector similarity uses absolute cosine sim ``max(0, 1 - distance)`` —
-      ChromaDB's hnsw cosine distance lives in ``[0, 2]`` (0 = identical).
-      Absolute (not relative-to-max) means adding/removing a candidate
-      can't reshuffle the others.
+    * Vector similarity is derived from each candidate's backend-reported
+      ``distance`` via :func:`_distance_to_similarity`, interpreted in the
+      collection's declared ``metric`` (per RFC 001) rather than assuming
+      cosine. Absolute (not relative-to-max) means adding/removing a
+      candidate can't reshuffle the others.
     * BM25 is real Okapi-BM25 with corpus-relative IDF over the candidates
       themselves. Since the absolute scale is unbounded, BM25 is min-max
       normalized within the candidate set so weights are commensurable.
@@ -159,11 +211,7 @@ def _hybrid_rank(
 
     scored = []
     for r, raw, norm in zip(results, bm25_raw, bm25_norm):
-        distance = r.get("distance")
-        if distance is None:
-            vec_sim = 0.0
-        else:
-            vec_sim = max(0.0, 1.0 - distance)
+        vec_sim = _distance_to_similarity(r.get("distance"), metric)
         r["bm25_score"] = round(raw, 3)
         scored.append((vector_weight * vec_sim + bm25_weight * norm, r))
 
@@ -227,6 +275,31 @@ def _extract_drawer_ids_from_closet(closet_doc: str) -> list:
     return list(seen.keys())
 
 
+def _scoped_source_filter(source_file: str, parent_drawer_id=None) -> dict:
+    """Build a Chroma ``where`` clause that scopes a query to ``source_file``,
+    additionally constrained by ``parent_drawer_id`` when one is supplied.
+
+    Two unrelated oversized ``tool_add_drawer`` writes (chunked path from
+    #1539) can pass the same ``source_file`` (e.g. two pastes tagged
+    ``"chat.log"``); each call stores its own ``parent_drawer_id`` group
+    of chunks but the bare ``source_file`` filter pulls chunks from both
+    groups as if they were siblings (#1580). When the matched chunk
+    carries a ``parent_drawer_id`` the filter narrows to that logical
+    group. Otherwise (pre-#1539 drawers, single-chunk writes, and
+    ``diary_ingest`` drawers grouped by real file path) the original
+    file-global shape is preserved. Mirrors the conditional-``$and``
+    precedent in ``build_where_filter``.
+    """
+    if parent_drawer_id:
+        return {
+            "$and": [
+                {"source_file": source_file},
+                {"parent_drawer_id": parent_drawer_id},
+            ]
+        }
+    return {"source_file": source_file}
+
+
 def _expand_with_neighbors(drawers_col, matched_doc: str, matched_meta: dict, radius: int = 1):
     """Expand a matched drawer with its ±radius sibling chunks in the same source file.
 
@@ -250,15 +323,20 @@ def _expand_with_neighbors(drawers_col, matched_doc: str, matched_meta: dict, ra
     if not src or not isinstance(chunk_idx, int):
         return {"text": matched_doc, "drawer_index": chunk_idx, "total_drawers": None}
 
+    # Narrow by ``parent_drawer_id`` when present so chunks from unrelated
+    # logical drawers sharing ``source_file`` do not stitch (#1580). See
+    # ``_scoped_source_filter`` for the contract.
+    parent_id = matched_meta.get("parent_drawer_id")
     target_indexes = [chunk_idx + offset for offset in range(-radius, radius + 1)]
+    neighbor_clauses = [
+        {"source_file": src},
+        {"chunk_index": {"$in": target_indexes}},
+    ]
+    if parent_id:
+        neighbor_clauses.append({"parent_drawer_id": parent_id})
     try:
         neighbors = drawers_col.get(
-            where={
-                "$and": [
-                    {"source_file": src},
-                    {"chunk_index": {"$in": target_indexes}},
-                ]
-            },
+            where={"$and": neighbor_clauses},
             include=["documents", "metadatas"],
         )
     except Exception:
@@ -276,10 +354,16 @@ def _expand_with_neighbors(drawers_col, matched_doc: str, matched_meta: dict, ra
     else:
         combined_text = "\n\n".join(doc for _, doc in indexed_docs)
 
-    # Cheap total_drawers lookup: metadata-only scan of the source file.
+    # Cheap total_drawers lookup. When ``parent_drawer_id`` is present the
+    # count is scoped to that group so the returned number matches the
+    # text the caller gets back. Without a parent id, the legacy
+    # file-global count is preserved.
     total_drawers = None
     try:
-        all_meta = drawers_col.get(where={"source_file": src}, include=["metadatas"])
+        all_meta = drawers_col.get(
+            where=_scoped_source_filter(src, parent_id),
+            include=["metadatas"],
+        )
         total_drawers = len(all_meta.ids) if all_meta.ids else None
     except Exception:
         logger.debug("total_drawers lookup failed for %s", src, exc_info=True)
@@ -375,11 +459,12 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     # The MCP tool path already hybridizes BM25 with vector sim via
     # `_hybrid_rank`; do the same here so CLI results match what agents
     # see via `mempalace_search`.
+    metric = _metric_for_collection(col)
     hits = [
         {"text": doc or "", "distance": float(dist), "metadata": meta or {}}
         for doc, meta, dist in zip(docs, metas, dists)
     ]
-    hits = _hybrid_rank(hits, query)
+    hits = _hybrid_rank(hits, query, metric=metric)
 
     print(f"\n{'=' * 60}")
     print(f'  Results for: "{query}"')
@@ -390,7 +475,7 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     print(f"{'=' * 60}\n")
 
     for i, hit in enumerate(hits, 1):
-        vec_sim = round(max(0.0, 1 - hit["distance"]), 3)
+        vec_sim = round(_distance_to_similarity(hit["distance"], metric), 3)
         bm25 = hit.get("bm25_score", 0.0)
         meta = hit["metadata"]
         source = Path(meta.get("source_file", "?")).name
@@ -399,7 +484,7 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
 
         print(f"  [{i}] {wing_name} / {room_name}")
         print(f"      Source: {source}")
-        print(f"      Match:  cosine={vec_sim}  bm25={bm25}")
+        print(f"      Match:  {metric}_sim={vec_sim}  bm25={bm25}")
         print()
         # Print the verbatim text, indented
         for line in hit["text"].strip().split("\n"):

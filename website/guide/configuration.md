@@ -12,7 +12,8 @@ Located at `~/.mempalace/config.json`. Created by `mempalace init`:
     "oota": "~/.mempalace/palaces/oota"
   },
   "collection_name": "mempalace_drawers",
-  "people_map": {"Kai": "KAI", "Priya": "PRI"}
+  "people_map": {"Kai": "KAI", "Priya": "PRI"},
+  "max_backups": 10
 }
 ```
 
@@ -22,6 +23,7 @@ Located at `~/.mempalace/config.json`. Created by `mempalace init`:
 | `palaces` | `{"chat": "~/.mempalace/palaces/chat"}` | Alias map: short name → directory |
 | `collection_name` | `mempalace_drawers` | ChromaDB collection name |
 | `people_map` | `{}` | Entity name → AAAK code mappings |
+| `max_backups` | `10` | How many timestamped palace backups to keep before the oldest are pruned. Applies to `mempalace migrate` (`<palace>.pre-migrate.*`) and `mempalace repair max-seq-id` (`chroma.sqlite3.max-seq-id-backup-*`), which each write a full copy every run. Set to `0` to keep every backup (e.g. when an external retention policy manages cleanup). |
 
 ::: tip
 The legacy `palace_path` key is still read for backwards compatibility but is no longer the primary mechanism. Use `default_palace` + `palaces` for new installs.
@@ -131,3 +133,4 @@ mcp__mempalace__search(query="drow alliance", palace="chat")
 | `MEMPALACE_PALACE_PATH` | Override palace path (same as `--palace`); accepts alias or path |
 | `MEMPAL_CHAT_PALACE` | Override the hook chat-palace path (default `~/.mempalace/palaces/chat`) |
 | `MEMPAL_DIR` | Directory for auto-mining in hooks |
+| `MEMPALACE_MAX_BACKUPS` | Override `max_backups` retention count (`0` disables pruning) |

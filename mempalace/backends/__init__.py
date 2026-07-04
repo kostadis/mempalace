@@ -27,11 +27,13 @@ from .base import (
     HealthStatus,
     LexicalHit,
     LexicalResult,
+    MaintenanceResult,
     PalaceNotFoundError,
     PalaceRef,
     QueryResult,
     UnsupportedCapabilityError,
     UnsupportedFilterError,
+    UnsupportedMaintenanceKindError,
 )
 # Chroma is imported lazily below (PEP 562 __getattr__) so it stays optional.
 # pgvector/qdrant/sqlite_exact import their heavy client deps lazily inside
@@ -79,6 +81,7 @@ __all__ = [
     "HealthStatus",
     "LexicalHit",
     "LexicalResult",
+    "MaintenanceResult",
     "PalaceNotFoundError",
     "PalaceRef",
     "PgVectorBackend",
@@ -90,6 +93,7 @@ __all__ = [
     "SQLiteExactCollection",
     "UnsupportedCapabilityError",
     "UnsupportedFilterError",
+    "UnsupportedMaintenanceKindError",
     "available_backends",
     "detect_backend_for_path",
     "detect_backends_for_path",

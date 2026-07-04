@@ -17,6 +17,30 @@ import importlib
 import json
 import os
 
+import pytest
+
+import mempalace.config as _config_mod
+
+# These tests ``importlib.reload(mempalace.config)`` under a fake ``$HOME`` so
+# the module-level ``os.path.expanduser`` constants pick up the fake home. That
+# reload permanently rebinds those constants on the shared module, so a later
+# test file that reads the real default palace (notably the palace-scoped
+# hallway-file resolver) would otherwise see the stale fake path. Snapshot the
+# real values at import — before any test reloads — and restore them after each
+# test so the leak cannot escape this file.
+_REAL_DEFAULT_PALACE_PATH = _config_mod.DEFAULT_PALACE_PATH
+_REAL_LEGACY_PALACE_DIR = _config_mod.LEGACY_PALACE_DIR
+
+
+@pytest.fixture(autouse=True)
+def _restore_config_palace_constants():
+    yield
+    # Restore by direct assignment rather than reloading: reloading runs the
+    # legacy-palace migration at module top level, which under the real $HOME
+    # could touch the developer's actual ~/.mempalace.
+    _config_mod.DEFAULT_PALACE_PATH = _REAL_DEFAULT_PALACE_PATH
+    _config_mod.LEGACY_PALACE_DIR = _REAL_LEGACY_PALACE_DIR
+
 
 def _reload_config(monkeypatch, fake_home):
     """Re-import ``mempalace.config`` with ``$HOME`` pointing at ``fake_home``

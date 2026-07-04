@@ -1815,7 +1815,8 @@ def _mine_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run/parall
     print(f"{'=' * 55}")
     print(f"  Wing:    {wing}")
     print(f"  Rooms:   {', '.join(r['name'] for r in rooms)}")
-    print(f"  Files:   {len(files)}")
+    limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
+    print(f"  Files:   {len(files)}{limit_suffix}")
     print(f"  Palace:  {palace_path}")
     print(f"  Device:  {describe_device()}")
     if not dry_run:

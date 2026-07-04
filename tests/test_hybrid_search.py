@@ -118,7 +118,7 @@ class TestThemesLayer:
             palace,
             drawer_id="D1",
             source_file="fixture_D1.md",
-            topics=["JWT auth tokens", "24h expiry", "authentication"],
+            topics=["JWT auth tokens", "session expiry", "authentication service"],
         )
         result = search_memories("JWT authentication", palace, n_results=3)
         assert result["themes"], "themes block should be populated"
