@@ -151,8 +151,13 @@ class TestBackwardsCompatibility:
     def test_search_memories_preserves_old_filters_shape(self, palace_path, seeded_collection):
         result = search_memories("auth", palace_path, wing="project", room="backend")
         # Legacy single-value shape survives — scripts that peek at result["filters"]
-        # don't have to learn the new key names.
-        assert result["filters"] == {"wing": "project", "room": "backend"}
+        # don't have to learn the new key names. ``source_file`` was threaded
+        # through in v3.5.0 (#1815) and is echoed back (None when unset).
+        assert result["filters"] == {
+            "wing": "project",
+            "room": "backend",
+            "source_file": None,
+        }
 
     def test_search_memories_and_within_return_same_hits(self, palace_path, seeded_collection):
         via_memories = search_memories("auth", palace_path, wing="project", n_results=5)

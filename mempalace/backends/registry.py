@@ -128,6 +128,38 @@ def get_backend(name: str) -> BaseBackend:
         return inst
 
 
+def detect_backends_for_path(path: str) -> list[str]:
+    """Return all registered backend names whose artifacts are present at ``path``.
+
+    Detection is a migration/protection aid for local palaces. Backends are
+    checked in registry-name order so callers get deterministic diagnostics if
+    a broken directory contains artifacts from more than one backend.
+    """
+    _discover_entry_points()
+    detected = []
+    for name in sorted(_registry):
+        cls = _registry[name]
+        try:
+            if cls.detect(path):
+                detected.append(name)
+        except Exception:
+            logger.exception("detect() raised on backend %r", name)
+    return detected
+
+
+def detect_backend_for_path(path: str) -> Optional[str]:
+    """Return the single detected backend at ``path``, or ``None``.
+
+    If multiple backend artifacts are present, the first name in registry order
+    is returned for backward compatibility. Callers that enforce mismatch
+    protection should use :func:`detect_backends_for_path`.
+    """
+    detected = detect_backends_for_path(path)
+    if detected:
+        return detected[0]
+    return None
+
+
 def reset_backends() -> None:
     """Close and drop all cached backend instances (primarily for tests)."""
     with _lock:
@@ -164,14 +196,9 @@ def resolve_backend_for_palace(
             return candidate
 
     _discover_entry_points()
-    if palace_path:
-        for name, cls in _registry.items():
-            try:
-                if cls.detect(palace_path):
-                    return name
-            except Exception:
-                logger.exception("detect() raised on backend %r", name)
-                continue
+    detected = detect_backend_for_path(palace_path) if palace_path else None
+    if detected:
+        return detected
     return default
 
 
@@ -181,20 +208,33 @@ def resolve_backend_for_palace(
 
 
 def _register_builtins() -> None:
-    """Register chroma as the in-tree default — best-effort.
+    """Register the in-tree backends. Chroma is best-effort.
 
-    Chroma is optional: a turbovec-only deployment neither needs nor installs a working
-    ``chromadb``. Import failures (absent or with broken transitive deps) must not take
-    down the whole registry — chroma simply isn't registered, and other backends
-    (e.g. turbovec, via entry points) still resolve.
+    pgvector/qdrant/sqlite_exact import their heavy client deps lazily (inside
+    methods), so importing their backend classes here is safe even when those
+    deps are absent. Chroma is the exception: a turbovec-only deployment neither
+    needs nor installs a working ``chromadb``, and its import can fail on broken
+    transitive deps — so it is registered best-effort and its failure must not
+    take down the whole registry (other backends, incl. turbovec via entry
+    points, still resolve).
     """
+    from .pgvector import PgVectorBackend
+    from .qdrant import QdrantBackend
+    from .sqlite_exact import SQLiteExactBackend
+
+    # Use setdefault semantics so a caller that pre-registered for tests wins.
+    if "qdrant" not in _registry:
+        _registry["qdrant"] = QdrantBackend
+    if "sqlite_exact" not in _registry:
+        _registry["sqlite_exact"] = SQLiteExactBackend
+    if "pgvector" not in _registry:
+        _registry["pgvector"] = PgVectorBackend
+
     try:
         from .chroma import ChromaBackend
     except Exception as exc:  # noqa: BLE001 — any import-time failure disables chroma only
         logger.debug("chroma backend unavailable, not registering: %s", exc)
         return
-
-    # Use setdefault semantics so a caller that pre-registered for tests wins.
     if "chroma" not in _registry:
         _registry["chroma"] = ChromaBackend
 

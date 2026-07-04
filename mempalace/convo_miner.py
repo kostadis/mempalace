@@ -10,7 +10,6 @@ Same palace as project mining. Different ingest strategy.
 
 import os
 import sys
-import hashlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,14 +17,19 @@ from datetime import datetime
 from collections import defaultdict
 from typing import Optional
 
+from .collision_scan import assert_no_collisions
 from .config import MempalaceConfig
+from .ids import ID_RECIPE, make_convo_drawer_id, make_convo_sentinel_id
 from .normalize import normalize
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
+    _metadata_matches_extract_mode,
+    _validate_palace_fts5_after_mine,
     file_already_mined,
     get_collection,
     mine_lock,
+    mine_palace_lock,
 )
 from .parallel import ParallelPipeline, WorkerResult
 
@@ -61,8 +65,12 @@ CONVO_EXTENSIONS = {
 }
 
 MIN_CHUNK_SIZE = 30
-CHUNK_SIZE = 2000  # chars per drawer — approx 500 tokens, safely under 2048 limit
-DRAWER_UPSERT_BATCH_SIZE = 10
+CHUNK_SIZE = (
+    800  # chars per drawer — align with miner.py; keeps drawers under nomic 2048-token limit
+)
+DRAWER_UPSERT_BATCH_SIZE = 1000
+_LINE_GROUP_SIZE = 25  # lines per fallback group when no paragraph breaks
+_LINE_FALLBACK_MIN_NEWLINES = 20  # trigger line-group fallback above this newline count
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
 # Matches miner.py at 500 MB. Long Claude Code sessions, multi-year
 # ChatGPT exports, and lifetime Slack dumps routinely exceed 10 MB; the
@@ -73,14 +81,16 @@ MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
 # use also scales with source size.
 
 
-def _register_file(collection, source_file: str, wing: str, agent: str):
+def _register_file(collection, source_file: str, wing: str, agent: str, extract_mode: str):
     """Write a sentinel so file_already_mined() returns True for 0-chunk files.
 
     Without this, files that normalize to nothing or produce zero chunks are
     re-read and re-processed on every mine run because nothing was written to
-    ChromaDB on the first pass.
+    ChromaDB on the first pass. The sentinel is scoped to ``extract_mode`` so
+    an empty file mined in exchange-mode does not mask a later general-mode
+    mine of the same transcript (and vice versa).
     """
-    sentinel_id = f"_reg_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
+    sentinel_id = make_convo_sentinel_id(source_file, extract_mode)
     collection.upsert(
         documents=[f"[registry] {source_file}"],
         ids=[sentinel_id],
@@ -92,10 +102,89 @@ def _register_file(collection, source_file: str, wing: str, agent: str):
                 "added_by": agent,
                 "filed_at": datetime.now().isoformat(),
                 "ingest_mode": "registry",
+                "extract_mode": extract_mode,
                 "normalize_version": NORMALIZE_VERSION,
+                "id_recipe": ID_RECIPE,
             }
         ],
     )
+
+
+def _source_file_delete_ids(collection, source_file: str, extract_mode: str) -> list:
+    """Collect drawer IDs for one source file and extraction mode.
+
+    Legacy conversation drawers did not carry extract_mode; treat those as
+    exchange-mode rows so schema rebuilds can still clean them up without
+    deleting newer general-mode drawers for the same transcript.
+    """
+    ids: list = []
+    offset = 0
+    while True:
+        batch = collection.get(
+            where={"source_file": source_file},
+            limit=1000,
+            offset=offset,
+            include=["metadatas"],
+        )
+        batch_ids = batch.get("ids") or []
+        metadatas = batch.get("metadatas") or []
+        for drawer_id, meta in zip(batch_ids, metadatas):
+            if _metadata_matches_extract_mode(meta or {}, extract_mode):
+                ids.append(drawer_id)
+        if not batch_ids:
+            break
+        offset += len(batch_ids)
+    return ids
+
+
+def _is_ai_tool_path(path: Path) -> bool:
+    """Return True when `path` lives inside a known AI-tool storage dir.
+
+    Detected paths (exact-segment match — substrings like `.gemini-backup`
+    or `.codex-archive` do NOT match):
+      - any segment ``.codex`` (Codex CLI sessions / archives)
+      - any segment ``.gemini`` (Gemini CLI sessions under ~/.gemini/tmp/...)
+      - the consecutive segment pair ``.claude/projects`` (Claude Code).
+        ``.claude`` alone is NOT matched — that is the settings/config dir,
+        not a conversation source.
+
+    Used by ``_resolve_wing`` to default the destination wing to
+    ``wing_api`` when the user hasn't passed an explicit ``--wing``.
+    """
+    try:
+        parts = path.resolve().parts
+    except (OSError, RuntimeError):
+        return False
+
+    if ".codex" in parts:
+        return True
+    if ".gemini" in parts:
+        return True
+    for i in range(len(parts) - 1):
+        if parts[i] == ".claude" and parts[i + 1] == "projects":
+            return True
+    return False
+
+
+def _resolve_wing(convo_path: Path, wing: Optional[str]) -> str:
+    """Determine the destination wing for ``mine_convos``.
+
+    Precedence (first match wins):
+
+      1. Explicit ``wing`` argument from the user — always wins, even on
+         an AI-tool path. Empty string is treated as "no wing".
+      2. AI-tool path detection — defaults to ``wing_api`` so Claude
+         Code / Codex / Gemini conversations group under a single wing
+         dedicated to API-sourced content.
+      3. Basename fallback — sanitized via ``config.normalize_wing_name``.
+    """
+    from .config import normalize_wing_name
+
+    if wing:
+        return wing
+    if _is_ai_tool_path(convo_path):
+        return "wing_api"
+    return normalize_wing_name(convo_path.name)
 
 
 # =============================================================================
@@ -103,29 +192,47 @@ def _register_file(collection, source_file: str, wing: str, agent: str):
 # =============================================================================
 
 
-def chunk_exchanges(content: str) -> list:
+def chunk_exchanges(
+    content: str,
+    chunk_size: int = None,
+    min_chunk_size: int = None,
+) -> list:
     """
     Chunk by exchange pair: one > turn + AI response = one unit.
     Falls back to paragraph chunking if no > markers.
+
+    Optional params override module-level defaults when provided.
+
+    Raises ``ValueError`` if ``chunk_size`` is not a positive integer or
+    ``min_chunk_size`` is negative. A non-positive ``chunk_size`` would
+    cause ``_chunk_by_exchange`` below to loop forever — ``content[:0]``
+    is empty, ``content[0:]`` is the whole string, and the remainder
+    never shrinks.
     """
-    if not content.strip():
-        return []
+    if chunk_size is None:
+        chunk_size = CHUNK_SIZE
+    if min_chunk_size is None:
+        min_chunk_size = MIN_CHUNK_SIZE
+
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
+    if min_chunk_size < 0:
+        raise ValueError(f"min_chunk_size must be >= 0, got {min_chunk_size}")
+
     lines = content.split("\n")
     quote_lines = sum(1 for line in lines if line.strip().startswith(">"))
 
-    if quote_lines >= 1:
-        return _chunk_by_exchange(lines)
+    if quote_lines >= 3:
+        return _chunk_by_exchange(lines, chunk_size, min_chunk_size)
     else:
-        # If there are few quote lines, it's likely not a standard exchange-pair format.
-        # Use paragraph chunking as a fallback.
-        return _chunk_by_paragraph(content)
+        return _chunk_by_paragraph(content, chunk_size, min_chunk_size)
 
 
-def _chunk_by_exchange(lines: list) -> list:
+def _chunk_by_exchange(lines: list, chunk_size: int, min_chunk_size: int) -> list:
     """One user turn (>) + the AI response that follows = one or more chunks.
-    
+
     The full AI response is preserved verbatim.  When the combined
-    user-turn + response exceeds CHUNK_SIZE the response is split across
+    user-turn + response exceeds chunk_size the response is split across
     consecutive drawers so nothing is silently discarded.
     """
     chunks = []
@@ -142,75 +249,60 @@ def _chunk_by_exchange(lines: list) -> list:
                 next_line = lines[i]
                 if next_line.strip().startswith(">") or next_line.strip().startswith("---"):
                     break
-                if next_line.strip():
-                    ai_lines.append(next_line.strip())
+                # Preserve the line as-is — blank lines and indentation carry meaning
+                # (paragraph breaks, list/code structure) and must survive verbatim.
+                ai_lines.append(next_line)
                 i += 1
 
-            ai_response = " ".join(ai_lines)
+            # Join on newline (not space) so line structure, blank lines, and
+            # indentation reach the drawer unchanged. Trim only trailing blank
+            # lines produced by the loop stopping at the next `>` turn.
+            ai_response = "\n".join(ai_lines).rstrip("\n")
             content = f"{user_turn}\n{ai_response}" if ai_response else user_turn
 
-            # Split into multiple drawers when the exchange exceeds CHUNK_SIZE
-            if len(content) > CHUNK_SIZE:
-                # First chunk: user turn + as much response as fits
-                first_part = content[:CHUNK_SIZE]
-                chunks.append({"content": first_part, "chunk_index": len(chunks)})
-                
-                # Remaining response in CHUNK_SIZE-sized continuation drawers
-                remainder = content[CHUNK_SIZE:]
-                while remainder:
-                    part = remainder[:CHUNK_SIZE]
-                    remainder = remainder[CHUNK_SIZE:]
-                    chunks.append({"content": part, "chunk_index": len(chunks)})
-            else:
-                chunks.append(
-                    {
-                        "content": content,
-                        "chunk_index": len(chunks),
-                    }
-                )
-            # Safety check: ensure no chunk somehow escaped the limit
-            assert len(chunks[-1]["content"]) <= CHUNK_SIZE, f"Chunk size {len(chunks[-1]['content'])} exceeds CHUNK_SIZE {CHUNK_SIZE}"
-
-
+            _emit_bounded(chunks, content, chunk_size, min_chunk_size)
         else:
             i += 1
 
     return chunks
 
 
+def _emit_bounded(
+    chunks: list,
+    content: str,
+    chunk_size: int,
+    min_chunk_size: int,
+) -> None:
+    """Append ``content`` as one or more drawers, none exceeding ``chunk_size``.
 
-def _chunk_by_paragraph(content: str) -> list:
-    """Fallback: chunk by paragraph breaks, with sub-chunking for large paragraphs."""
+    The ``min_chunk_size`` floor gates the WHOLE call (drops the input if
+    its stripped length is at or below the floor, treated as noise). Once
+    the input passes the floor, every slice is emitted verbatim so a
+    small trailing remainder is preserved instead of silently dropped.
+    The index-based loop avoids the O(N^2) repeated-substring allocation
+    of a ``while content: content = content[chunk_size:]`` shape.
+    """
+    if len(content.strip()) <= min_chunk_size:
+        return
+    for i in range(0, len(content), chunk_size):
+        chunks.append({"content": content[i : i + chunk_size], "chunk_index": len(chunks)})
+
+
+def _chunk_by_paragraph(content: str, chunk_size: int, min_chunk_size: int) -> list:
+    """Fallback: chunk by paragraph breaks."""
     chunks = []
     paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
 
     # If no paragraph breaks and long content, chunk by line groups
-    if len(paragraphs) <= 1 and content.count("\n") > 20:
+    if len(paragraphs) <= 1 and content.count("\n") > _LINE_FALLBACK_MIN_NEWLINES:
         lines = content.split("\n")
-        for i in range(0, len(lines), 25):
-            group = "\n".join(lines[i : i + 25]).strip()
-            if len(group) > MIN_CHUNK_SIZE:
-                # Sub-chunk the line group if it's still too big
-                remainder = group
-                while remainder:
-                    part = remainder[:CHUNK_SIZE]
-                    remainder = remainder[CHUNK_SIZE:]
-                    chunks.append({"content": part, "chunk_index": len(chunks)})
+        for i in range(0, len(lines), _LINE_GROUP_SIZE):
+            group = "\n".join(lines[i : i + _LINE_GROUP_SIZE]).strip()
+            _emit_bounded(chunks, group, chunk_size, min_chunk_size)
         return chunks
 
     for para in paragraphs:
-        if len(para) < MIN_CHUNK_SIZE:
-            continue
-
-        if len(para) <= CHUNK_SIZE:
-            chunks.append({"content": para, "chunk_index": len(chunks)})
-        else:
-            # Sub-chunk the large paragraph
-            remainder = para
-            while remainder:
-                part = remainder[:CHUNK_SIZE]
-                remainder = remainder[CHUNK_SIZE:]
-                chunks.append({"content": part, "chunk_index": len(chunks)})
+        _emit_bounded(chunks, para, chunk_size, min_chunk_size)
 
     return chunks
 
@@ -322,6 +414,11 @@ def scan_convos(convo_dir: str) -> list:
             if filepath.suffix.lower() in CONVO_EXTENSIONS:
                 # Skip symlinks and oversized files
                 if filepath.is_symlink():
+                    rel = filepath.relative_to(convo_path).as_posix()
+                    try:
+                        print(f"  SKIP: {rel} (symlink)", file=sys.stderr)
+                    except OSError:
+                        pass
                     continue
                 try:
                     if filepath.stat().st_size > MAX_FILE_SIZE:
@@ -365,6 +462,8 @@ def _prepare_convo(
     extract_mode: str,
     dry_run: bool,
     collection,
+    chunk_size: int = None,
+    min_chunk_size: int = None,
 ):
     """Read + normalize + chunk + build per-batch documents/ids/metadata.
 
@@ -375,11 +474,18 @@ def _prepare_convo(
         seen on the next run.
       * ``_PreparedConvo(...)`` — ready for embed + write.
 
+    Idempotency and drawer IDs are scoped to ``extract_mode`` so exchange-
+    and general-mode drawers for the same transcript coexist instead of
+    overwriting each other.
+
     Safe to call from a producer thread; does NOT acquire mine_lock and
     does NOT touch the collection writer.
     """
+    effective_chunk_size = chunk_size if chunk_size is not None else CHUNK_SIZE
+    effective_min = min_chunk_size if min_chunk_size is not None else MIN_CHUNK_SIZE
+
     source_file = str(filepath)
-    if not dry_run and file_already_mined(collection, source_file):
+    if not dry_run and file_already_mined(collection, source_file, extract_mode=extract_mode):
         return None
 
     try:
@@ -387,15 +493,19 @@ def _prepare_convo(
     except (OSError, ValueError):
         return ("register", source_file)
 
-    if not content or len(content.strip()) < MIN_CHUNK_SIZE:
+    if not content or len(content.strip()) < effective_min:
         return ("register", source_file)
 
     if extract_mode == "general":
         from .general_extractor import extract_memories
 
-        chunks = extract_memories(content)
+        chunks = extract_memories(content, chunk_size=effective_chunk_size)
     else:
-        chunks = chunk_exchanges(content)
+        chunks = chunk_exchanges(
+            content,
+            chunk_size=effective_chunk_size,
+            min_chunk_size=effective_min,
+        )
 
     if not chunks:
         return ("register", source_file)
@@ -416,7 +526,9 @@ def _prepare_convo(
         batch_rooms: list = []
         for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
             chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
-            drawer_id = f"drawer_{wing}_{chunk_room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
+            drawer_id = make_convo_drawer_id(
+                wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
+            )
             batch_docs.append(chunk["content"])
             batch_ids.append(drawer_id)
             batch_metas.append(
@@ -431,6 +543,7 @@ def _prepare_convo(
                     "ingest_mode": "convos",
                     "extract_mode": extract_mode,
                     "normalize_version": NORMALIZE_VERSION,
+                    "id_recipe": ID_RECIPE,
                 }
             )
             batch_rooms.append(chunk_room)
@@ -476,17 +589,23 @@ def _write_prepared_convo(
     room_counts_delta: dict = defaultdict(int)
     drawers_added = 0
     with mine_lock(source_file):
-        if file_already_mined(collection, source_file):
+        if file_already_mined(collection, source_file, extract_mode=prepared.extract_mode):
             return 0, room_counts_delta, True
 
         # Purge stale drawers first — pre-v2 drawers wouldn't have triggered
-        # file_already_mined, so we clean them out before re-insert.
+        # file_already_mined, so we clean them out before re-insert. The
+        # delete is scoped to this extract_mode so a general-mode re-mine
+        # doesn't wipe the transcript's exchange-mode drawers (and vice
+        # versa) — the two modes coexist for the same source file.
         try:
-            collection.delete(where={"source_file": source_file})
+            delete_ids = _source_file_delete_ids(collection, source_file, prepared.extract_mode)
+            if delete_ids:
+                collection.delete(ids=delete_ids)
         except Exception:
             logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
 
         for batch, batch_embeddings in zip(prepared.batches, embeddings_batches):
+            assert_no_collisions(list(zip(batch.ids, batch.metadatas)), collection)
             try:
                 collection.upsert(
                     documents=batch.documents,
@@ -524,28 +643,72 @@ def mine_convos(
     workers: producer-thread fan-out for the parallel embed path. ``None``
     (default) resolves to :attr:`MempalaceConfig.workers` — 1 onnx /
     8 remote. ``1`` reproduces the historic fully-serial mine.
+
+    The real work is in :func:`_mine_convos_impl`; this wrapper holds the
+    per-palace flock around it so two concurrent ``mempalace mine --mode
+    convos`` invocations against the same palace can't pile up (mirrors
+    :func:`mempalace.miner.mine`). ``MineAlreadyRunning`` propagates to the
+    caller. Dry-run skips the lock — it never writes.
     """
+    if dry_run:
+        return _mine_convos_impl(
+            convo_dir,
+            palace_path,
+            wing=wing,
+            agent=agent,
+            limit=limit,
+            dry_run=dry_run,
+            extract_mode=extract_mode,
+            workers=workers,
+        )
+
+    with mine_palace_lock(palace_path):
+        return _mine_convos_impl(
+            convo_dir,
+            palace_path,
+            wing=wing,
+            agent=agent,
+            limit=limit,
+            dry_run=dry_run,
+            extract_mode=extract_mode,
+            workers=workers,
+        )
+
+
+def _mine_convos_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run/parallel branch plus per-file extract-mode routing are intrinsically branchy
+    convo_dir: str,
+    palace_path: str,
+    wing: str = None,
+    agent: str = "mempalace",
+    limit: int = 0,
+    dry_run: bool = False,
+    extract_mode: str = "exchange",
+    workers: Optional[int] = None,
+):
+    palace_config = MempalaceConfig()
+    cfg_chunk_size = palace_config.chunk_size
+    # Only override convo_miner's MIN_CHUNK_SIZE when the user set
+    # min_chunk_size explicitly — None keeps convo's lower 30-char floor
+    # (more permissive than the 50-char project default).
+    explicit_min = palace_config.min_chunk_size_explicit
+    cfg_min_chunk_size = explicit_min if explicit_min is not None else MIN_CHUNK_SIZE
 
     convo_path = Path(convo_dir).expanduser().resolve()
-    if not wing:
-        from .config import normalize_wing_name
-
-        wing = normalize_wing_name(convo_path.name)
+    wing = _resolve_wing(convo_path, wing)
 
     files = scan_convos(convo_dir)
-    if limit > 0:
-        files = files[:limit]
 
     # Resolve workers from arg → config (asymmetric default: 1 onnx, 8 remote).
     if workers is None:
-        workers = MempalaceConfig().workers
+        workers = palace_config.workers
 
     print(f"\n{'=' * 55}")
     print("  MemPalace Mine — Conversations")
     print(f"{'=' * 55}")
     print(f"  Wing:    {wing}")
     print(f"  Source:  {convo_path}")
-    print(f"  Files:   {len(files)}")
+    limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
+    print(f"  Files:   {len(files)}{limit_suffix}")
     print(f"  Palace:  {palace_path}")
     if not dry_run:
         print(f"  Workers: {workers}")
@@ -564,22 +727,24 @@ def mine_convos(
         # Dry-run keeps the serial path — no point parallelizing prints,
         # and there's no collection writer to coordinate around anyway.
         for i, filepath in enumerate(files, 1):
-            source_file = str(filepath)
-
             try:
                 content = normalize(str(filepath))
             except (OSError, ValueError):
                 continue
 
-            if not content or len(content.strip()) < MIN_CHUNK_SIZE:
+            if not content or len(content.strip()) < cfg_min_chunk_size:
                 continue
 
             if extract_mode == "general":
                 from .general_extractor import extract_memories
 
-                chunks = extract_memories(content)
+                chunks = extract_memories(content, chunk_size=cfg_chunk_size)
             else:
-                chunks = chunk_exchanges(content)
+                chunks = chunk_exchanges(
+                    content,
+                    chunk_size=cfg_chunk_size,
+                    min_chunk_size=cfg_min_chunk_size,
+                )
 
             if not chunks:
                 continue
@@ -610,7 +775,14 @@ def mine_convos(
         def producer(item):
             idx, filepath = item
             result = _prepare_convo(
-                filepath, wing, agent, extract_mode, False, collection
+                filepath,
+                wing,
+                agent,
+                extract_mode,
+                False,
+                collection,
+                chunk_size=cfg_chunk_size,
+                min_chunk_size=cfg_min_chunk_size,
             )
             if result is None:
                 return WorkerResult(
@@ -644,9 +816,14 @@ def mine_convos(
                 return
 
             if kind == "register":
+                # A readable file that yields no chunks is registered (sentinel
+                # written) but is NOT an "already filed" skip — it was processed
+                # this run. Counting it under files_skipped mislabels it and
+                # inflates the skip line (e.g. re-mining a transcript in a
+                # different extract_mode). Matches the serial mine, which
+                # registers-and-continues without incrementing the skip count.
                 source_file = result.payload[1]
-                _register_file(collection, source_file, wing, agent)
-                files_skipped += 1
+                _register_file(collection, source_file, wing, agent, extract_mode)
                 return
 
             # drawers
@@ -686,6 +863,11 @@ def mine_convos(
             on_error=on_error,
         )
         pipeline.run(list(enumerate(files, 1)))
+
+    if not dry_run:
+        # End-of-mine FTS5 integrity gate (#1537), mirroring miner._mine_impl.
+        # Runs only after real writes; raises MineValidationError on corruption.
+        _validate_palace_fts5_after_mine(palace_path)
 
     print(f"\n{'=' * 55}")
     print("  Done.")

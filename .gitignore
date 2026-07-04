@@ -47,3 +47,6 @@ MagicMock/
 
 # Runtime logs
 mining_output.log
+
+# Review logs
+.review-logs

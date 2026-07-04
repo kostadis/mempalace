@@ -411,7 +411,7 @@ def regenerate_closets(
         f"Regenerating closets for {len(sources)} source files via {cfg.endpoint} ({cfg.model})..."
     )
     if dry_run:
-        print("DRY RUN — no changes will be written")
+        print("DRY RUN - no changes will be written")
 
     processed = 0
     failed = 0
