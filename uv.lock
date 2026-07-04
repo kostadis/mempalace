@@ -2053,7 +2053,7 @@ requires-dist = [
     { name = "striprtf", marker = "extra == 'extract'", specifier = ">=0.0.27" },
     { name = "tokenizers", specifier = ">=0.15" },
     { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0.0" },
-    { name = "turbovecdb", marker = "extra == 'turbovec'", specifier = ">=0.1" },
+    { name = "turbovecdb", marker = "extra == 'turbovec'", editable = "../turbovecdb" },
 ]
 provides-extras = ["dev", "spellcheck", "pgvector", "gpu", "dml", "coreml", "turbovec", "multilingual", "extract"]
 
@@ -5289,38 +5289,23 @@ wheels = [
 ]
 
 [[package]]
-name = "turbovec"
-version = "0.8.0"
-source = { registry = "https://pypi.org/simple" }
+name = "turbovecdb"
+version = "0.5.0"
+source = { editable = "../turbovecdb" }
 dependencies = [
     { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/1e/d4/e3735c9144d4d674f9188bc46e3a7b5d2102fa26517963447f28b1206de2/turbovec-0.8.0.tar.gz", hash = "sha256:4ff24956ef159cd8ccdb19c561b07eea3c191c344a23368cd0adad9cdd87382c", size = 183036, upload-time = "2026-06-10T18:11:10.63Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/00/d6/cabba621300d06e0d496f3af5edc0048a0796cec17e1fb656d682b4c64ae/turbovec-0.8.0-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:323f8e1775865e9c9ed1ac33b3d44b82eae725c5e3f5473a8a423eec9e82d387", size = 843172, upload-time = "2026-06-10T18:11:03.606Z" },
-    { url = "https://files.pythonhosted.org/packages/6c/e9/923fe79602f5b51dde1f7d1d631990b2fba1719e4ae0c5b33ca15c6461df/turbovec-0.8.0-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:d6e3dbeda655f3bb7fcaa68474ae105dd99c3f13ab7da6e980fe4d939667a26a", size = 6121226, upload-time = "2026-06-10T18:11:05.392Z" },
-    { url = "https://files.pythonhosted.org/packages/f8/00/971e9d614f145d9363415aec000cf09eae2cd26639478887637ece9d4fe1/turbovec-0.8.0-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:1195d4e15ee6f1404c1390817cce1f134561bbe6d3b3462c32e091a45a0f7e6d", size = 13118923, upload-time = "2026-06-10T18:11:07.169Z" },
-    { url = "https://files.pythonhosted.org/packages/da/9d/2687d4e4c8fedf4d8ed8dfa4d4d6ea26c77c38bd9e56ad00fe20c46e6270/turbovec-0.8.0-cp39-abi3-win_amd64.whl", hash = "sha256:9b5d713f619597dc4e5f9614cac0adc167e861bca3272c66b7b2ba90f67b298f", size = 666929, upload-time = "2026-06-10T18:11:09.129Z" },
 ]
 
-[[package]]
-name = "turbovecdb"
-version = "0.1.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "filelock", version = "3.19.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
-    { name = "filelock", version = "3.25.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
-    { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
-    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "turbovec" },
+[package.metadata]
+requires-dist = [
+    { name = "filelock", marker = "extra == 'dev'", specifier = ">=3.12" },
+    { name = "numpy", specifier = ">=1.21" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4.0" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/cb/09/6f7b70c65bff467cdd9dffa1560d7e435ba9c02aca4ae04f915142dce209/turbovecdb-0.1.0.tar.gz", hash = "sha256:07ea5f839fea17ed96742da10922287b047713265f6c936ae928ad3081823841", size = 24538, upload-time = "2026-06-03T21:31:32.372Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/b2/77/03c0ef770bc79c05a1c58fffe9adcf50428fb1dafb643353e2c107e19977/turbovecdb-0.1.0-py3-none-any.whl", hash = "sha256:013a831c47a829192b6d4a6e55a3a056bcc7225fba5bc4855a85c8e46be52c50", size = 13752, upload-time = "2026-06-03T21:31:31.096Z" },
-]
+provides-extras = ["dev"]
 
 [[package]]
 name = "typer"
