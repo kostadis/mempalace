@@ -347,7 +347,7 @@ def test_cache_key_separates_models(monkeypatch):
     """
 
     class DummyMiniLM:
-        def __init__(self, preferred_providers=None):
+        def __init__(self, preferred_providers=None, intra_op_num_threads=0):
             self.kind = "minilm"
 
     monkeypatch.setattr(embedding, "_build_ef_class", lambda: DummyMiniLM)

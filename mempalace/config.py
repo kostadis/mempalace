@@ -385,6 +385,21 @@ def _maybe_migrate_legacy_palace_dir():
             pass
 
 
+def sqlite_read_uri(db_path: str) -> str:
+    """Return a read-only ``file:`` URI for ``sqlite3.connect(..., uri=True)``.
+
+    A bare ``f"file:{db_path}?mode=ro"`` mis-parses paths containing spaces or
+    other URI-reserved characters — common in real home directories (a Windows
+    user folder like ``First Last``, many macOS paths). ``pathname2url``
+    percent-encodes the path and normalizes separators so the database opens on
+    every platform.
+    """
+    from urllib.request import pathname2url
+
+    db_path = os.fspath(db_path)
+    return f"file:{pathname2url(db_path)}?mode=ro"
+
+
 @lru_cache(maxsize=1)
 def get_configured_collection_name() -> str:
     """Return the configured drawer collection name without repeated config-file reads."""
@@ -1095,6 +1110,37 @@ class MempalaceConfig:
                 pass
         return 1 if self.embedding_provider == "onnx" else 8
 
+    @property
+    def embedding_threads(self) -> int:
+        """Cap on the embedder's ONNX Runtime intra-op thread pool (#1068).
+
+        ChromaDB's ONNX embedder builds its ``InferenceSession`` with no thread
+        cap, so the intra-op pool defaults to the physical core count and a
+        background ``mine`` pins every core — stacked Stop-hook fires turn into
+        thermal events. ``OMP_NUM_THREADS`` is inert here (ORT owns its own
+        pool), so the cap is applied via ``SessionOptions`` in
+        :mod:`mempalace.embedding`.
+
+        Read from env ``MEMPALACE_EMBEDDING_THREADS`` first, then
+        ``embedding_threads`` in ``config.json``. Semantics:
+
+        - unset / ``"auto"`` → half the logical CPUs (min 1), so a background
+          mine leaves the machine usable out of the box.
+        - a positive integer → exactly that many intra-op threads.
+        - ``0`` or negative → uncapped: ORT's default (physical core count),
+          for users who want maximum indexing throughput.
+        """
+        raw = os.environ.get("MEMPALACE_EMBEDDING_THREADS")
+        if raw is None:
+            raw = self._file_config.get("embedding_threads")
+        if raw is None or str(raw).strip().lower() in ("", "auto"):
+            return max(1, (os.cpu_count() or 2) // 2)
+        try:
+            val = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return max(1, (os.cpu_count() or 2) // 2)
+        return val if val > 0 else 0
+
     def set_embedding_model(self, model: str) -> None:
         """Persist the embedding-model choice to ``config.json``.
 
@@ -1198,6 +1244,19 @@ class MempalaceConfig:
     def hook_desktop_toast(self):
         """Whether the stop hook shows a desktop notification via notify-send."""
         return self._file_config.get("hooks", {}).get("desktop_toast", False)
+
+    @property
+    def hook_use_daemon(self):
+        """Whether hooks should submit save/mine work to the opt-in daemon."""
+        env_val = os.environ.get("MEMPALACE_HOOKS_DAEMON")
+        if env_val is not None:
+            return env_val.lower() in ("true", "1", "yes", "on")
+        value = self._file_config.get("hooks", {}).get("daemon", False)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() in ("true", "1", "yes", "on")
+        return value == 1
 
     def set_hook_setting(self, key: str, value: bool):
         """Update a hook setting and write config to disk."""

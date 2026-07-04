@@ -19,6 +19,7 @@ import sqlite3
 from pathlib import Path
 
 from .backends import BackendError
+from .config import sqlite_read_uri
 from .palace import (
     _open_collection_or_explain,
     get_closets_collection,
@@ -220,18 +221,27 @@ def _hybrid_rank(
     return results
 
 
-def build_where_filter(wing: str = None, room: str = None) -> dict:
-    """Build ChromaDB where filter for wing/room filtering."""
-    if wing and room:
-        return {"$and": [{"wing": wing}, {"room": room}]}
-    elif wing:
-        return {"wing": wing}
-    elif room:
-        return {"room": room}
-    return {}
+def build_where_filter(wing: str = None, room: str = None, source_file: str = None) -> dict:
+    """Build a ChromaDB where filter from optional wing/room/source_file.
+
+    ChromaDB needs a ``$and`` only when ≥2 clauses are present; a single
+    clause is returned bare and zero clauses yield an empty filter (#1815).
+    """
+    clauses = []
+    if wing:
+        clauses.append({"wing": wing})
+    if room:
+        clauses.append({"room": room})
+    if source_file:
+        clauses.append({"source_file": source_file})
+    if not clauses:
+        return {}
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
 
 
-def _build_where_filter_multi(wing_filters=None, room_filters=None) -> dict:
+def _build_where_filter_multi(wing_filters=None, room_filters=None, source_file=None) -> dict:
     """Build ChromaDB where filter supporting multi-valued wing/room scopes.
 
     Used by ``search_within`` to express ``wing IN {a, b, c}`` and/or
@@ -256,9 +266,15 @@ def _build_where_filter_multi(wing_filters=None, room_filters=None) -> dict:
 
     wing_clause = _clause("wing", wing_filters)
     room_clause = _clause("room", room_filters)
-    if wing_clause and room_clause:
-        return {"$and": [wing_clause, room_clause]}
-    return wing_clause or room_clause or {}
+    # ``source_file`` is an exact single-value equality on the full stored
+    # value (#1815) — matching ``build_where_filter``'s semantics.
+    source_clause = {"source_file": source_file} if source_file else {}
+    clauses = [c for c in (wing_clause, room_clause, source_clause) if c]
+    if not clauses:
+        return {}
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
 
 
 def _extract_drawer_ids_from_closet(closet_doc: str) -> list:
@@ -578,6 +594,7 @@ def _bm25_only_via_sqlite(
     palace_path: str,
     wing: str = None,
     room: str = None,
+    source_file: str = None,
     n_results: int = 5,
     max_candidates: int = 500,
     _include_internal: bool = False,
@@ -613,7 +630,7 @@ def _bm25_only_via_sqlite(
     def _metadata_filter_sql(row_id_expr: str) -> tuple[str, list[str]]:
         clauses = []
         params = []
-        for key, value in (("wing", wing), ("room", room)):
+        for key, value in (("wing", wing), ("room", room), ("source_file", source_file)):
             if not value:
                 continue
             clauses.append(
@@ -636,7 +653,7 @@ def _bm25_only_via_sqlite(
         return "".join(clauses), params
 
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
     except sqlite3.Error as e:
         return {"error": f"sqlite open failed: {e}"}
 
@@ -726,7 +743,7 @@ def _bm25_only_via_sqlite(
         if not candidate_ids:
             return {
                 "query": query,
-                "filters": {"wing": wing, "room": room},
+                "filters": {"wing": wing, "room": room, "source_file": source_file},
                 "total_before_filter": 0,
                 "primary": [],
                 "results": [],
@@ -764,6 +781,8 @@ def _bm25_only_via_sqlite(
             continue
         if room and meta.get("room") != room:
             continue
+        if source_file and meta.get("source_file") != source_file:
+            continue
         full_source = meta.get("source_file", "") or ""
         candidates.append(
             {
@@ -771,6 +790,7 @@ def _bm25_only_via_sqlite(
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
                 "source_file": Path(full_source).name if full_source else "?",
+                "source_path": full_source,
                 "created_at": meta.get("filed_at", "unknown"),
                 # No vector distance available in BM25-only mode.
                 "similarity": None,
@@ -806,7 +826,7 @@ def _bm25_only_via_sqlite(
 
     return {
         "query": query,
-        "filters": {"wing": wing, "room": room},
+        "filters": {"wing": wing, "room": room, "source_file": source_file},
         "total_before_filter": len(candidates),
         "primary": hits,
         # ``results`` is an alias for ``primary`` kept so v3.3.5 callers that
@@ -835,7 +855,7 @@ def _taxonomy_penalty() -> float:
 
 
 def _query_drawers_with_filter_fallback(
-    drawers_col, dkwargs, query, n_results, wing_list, room_list
+    drawers_col, dkwargs, query, n_results, wing_list, room_list, source_file=None
 ):
     """Run the filtered drawer query, falling back to an unfiltered query plus a
     Python-side post-filter when ChromaDB raises on the filtered query.
@@ -844,7 +864,7 @@ def _query_drawers_with_filter_fallback(
     "Error finding id" even when unfiltered search works fine — it happens when
     drawers are ingested via two different paths (e.g. bulk import vs MCP tool
     calls), leaving the vector index inconsistent with the metadata store. We
-    retry unfiltered (over-fetching) and re-apply the wing/room filter in Python.
+    retry unfiltered (over-fetching) and re-apply the wing/room/source_file filter in Python.
     See #1245 / #1035.
 
     Adapted to the local two-list ``search_within`` shape: ``wing_list`` /
@@ -879,6 +899,8 @@ def _query_drawers_with_filter_fallback(
                 continue
             if room_set and meta.get("room") not in room_set:
                 continue
+            if source_file and meta.get("source_file") != source_file:
+                continue
             fdocs.append(doc)
             fmetas.append(meta)
             fdists.append(dist)
@@ -891,6 +913,7 @@ def search_within(
     *,
     wing_filters=None,
     room_filters=None,
+    source_file: str = None,
     ids=None,
     n_results: int = 5,
     n_themes: int = None,
@@ -910,6 +933,9 @@ def search_within(
         palace_path: Path to the ChromaDB palace directory.
         wing_filters: Optional iterable of wing names to restrict the search to.
         room_filters: Optional iterable of room names to restrict the search to.
+        source_file: Optional exact source_file filter. Matches the full
+            stored ``source_file`` metadata value verbatim, scoping both
+            the drawer (primary) and closet (themes) queries (#1815).
         ids: Optional iterable of drawer IDs; results are post-filtered to
             this set. Use when a prior pruning step has chosen specific
             drawers and you want to rerank them against a fresh query.
@@ -948,7 +974,7 @@ def search_within(
     id_set = set(ids) if ids else None
     theme_limit = n_themes if n_themes is not None else n_results
 
-    where = _build_where_filter_multi(wing_list, room_list)
+    where = _build_where_filter_multi(wing_list, room_list, source_file)
 
     # Primary path: drawer cosine + BM25 hybrid. Closet content plays no
     # role here — that's what makes ``primary`` immune to bad closets.
@@ -961,7 +987,7 @@ def search_within(
         if where:
             dkwargs["where"] = where
         drawer_results = _query_drawers_with_filter_fallback(
-            drawers_col, dkwargs, query, n_results, wing_list, room_list
+            drawers_col, dkwargs, query, n_results, wing_list, room_list, source_file
         )
     except Exception as e:
         return {"error": f"Search error: {e}"}
@@ -986,6 +1012,9 @@ def search_within(
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
                 "source_file": Path(source).name if source else "?",
+                # Full stored source_file value; lets a caller round-trip a
+                # result back into an exact ``source_file`` filter (#1815).
+                "source_path": source,
                 "created_at": meta.get("filed_at", "unknown"),
                 "similarity": round(max(0.0, 1 - dist), 3),
                 "distance": round(dist, 4),
@@ -1061,6 +1090,7 @@ def search_within(
         "filters": {
             "wing_filters": wing_list or None,
             "room_filters": room_list or None,
+            "source_file": source_file,
             "ids": list(id_set) if id_set is not None else None,
         },
         "total_before_filter": len(_first_or_empty(drawer_results, "documents")),
@@ -1077,6 +1107,7 @@ def search_memories(
     palace_path: str,
     wing: str = None,
     room: str = None,
+    source_file: str = None,
     n_results: int = 5,
     max_distance: float = 0.0,
     vector_disabled: bool = False,
@@ -1102,20 +1133,23 @@ def search_memories(
             palace_path,
             wing=wing,
             room=room,
+            source_file=source_file,
             n_results=n_results,
+            collection_name=collection_name,
         )
     result = search_within(
         query,
         palace_path,
         wing_filters=[wing] if wing else None,
         room_filters=[room] if room else None,
+        source_file=source_file,
         n_results=n_results,
         max_distance=max_distance,
         collection_name=collection_name,
     )
     # Preserve the pre-search_within return shape for existing consumers.
     if "filters" in result:
-        result["filters"] = {"wing": wing, "room": room}
+        result["filters"] = {"wing": wing, "room": room, "source_file": source_file}
     return result
 
 

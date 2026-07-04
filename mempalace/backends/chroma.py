@@ -9,6 +9,7 @@ import os
 import pickle
 import re
 import sqlite3
+import time
 from collections import defaultdict
 from numbers import Integral
 from pathlib import Path
@@ -17,6 +18,7 @@ from typing import Any, Optional
 import chromadb
 from chromadb.errors import NotFoundError as _ChromaNotFoundError
 
+from ..config import sqlite_read_uri
 from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
     BaseBackend,
@@ -454,7 +456,7 @@ def _vector_segment_id(palace_path: str, collection_name: str) -> Optional[str]:
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
         try:
             row = conn.execute(
                 """
@@ -603,6 +605,7 @@ def _hnsw_element_count(palace_path: str, segment_id: str) -> Optional[int]:
 # sync_threshold) from expected steady-state lag.
 _HNSW_DIVERGENCE_FALLBACK_FLOOR = 2000
 _HNSW_DIVERGENCE_FRACTION = 0.10
+_HNSW_PERSISTENT_DIVERGENCE_GRACE_SECONDS = 300.0
 
 
 def _read_sync_threshold(palace_path: str, collection_name: str) -> int:
@@ -623,7 +626,7 @@ def _read_sync_threshold(palace_path: str, collection_name: str) -> int:
     if not os.path.isfile(db_path):
         return 1000
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
         try:
             cur = conn.cursor()
             cur.execute(
@@ -644,6 +647,45 @@ def _read_sync_threshold(palace_path: str, collection_name: str) -> int:
     except Exception:
         logger.debug("_read_sync_threshold failed", exc_info=True)
         return 1000
+
+
+def _collection_has_sync_threshold_metadata(palace_path: str, collection_name: str) -> bool:
+    """Return True when the collection explicitly stores hnsw:sync_threshold."""
+
+    db_path = os.path.join(palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return False
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                """
+                SELECT 1
+                  FROM collection_metadata cm
+                  JOIN collections c ON cm.collection_id = c.id
+                 WHERE c.name = ?
+                   AND cm.key = 'hnsw:sync_threshold'
+                 LIMIT 1
+                """,
+                (collection_name,),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("_collection_has_sync_threshold_metadata failed", exc_info=True)
+        return False
+
+
+def _hnsw_metadata_age_seconds(palace_path: str, segment_id: str) -> Optional[float]:
+    """Return index_metadata.pickle age in seconds, or None when unreadable."""
+
+    pickle_path = os.path.join(palace_path, segment_id, "index_metadata.pickle")
+    try:
+        return max(0.0, time.time() - os.path.getmtime(pickle_path))
+    except OSError:
+        return None
 
 
 def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_drawers") -> dict:
@@ -690,11 +732,15 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
 
         hnsw_count = _hnsw_element_count(palace_path, seg_id)
         out["hnsw_count"] = hnsw_count
-
         sync_threshold = _read_sync_threshold(palace_path, collection_name)
-        # Two synchronization windows worth — see comment above
-        # _HNSW_DIVERGENCE_FALLBACK_FLOOR for the rationale.
-        divergence_floor = max(_HNSW_DIVERGENCE_FALLBACK_FLOOR, 2 * sync_threshold)
+        has_explicit_sync_threshold = _collection_has_sync_threshold_metadata(
+            palace_path,
+            collection_name,
+        )
+        metadata_age_seconds = (
+            _hnsw_metadata_age_seconds(palace_path, seg_id) if hnsw_count is not None else None
+        )
+        out["hnsw_metadata_age_seconds"] = metadata_age_seconds
 
         if hnsw_count is None:
             # No pickle yet, so this probe cannot measure HNSW capacity.
@@ -712,21 +758,53 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
 
         divergence = sqlite_count - hnsw_count
         out["divergence"] = divergence
-        threshold = max(divergence_floor, int(sqlite_count * _HNSW_DIVERGENCE_FRACTION))
-        if divergence > threshold:
+
+        # Newer palaces explicitly store mempalace's low sync threshold
+        # (currently 2), so a gap of dozens of rows is far beyond ordinary
+        # flush lag. Older palaces may lack the metadata row; keep the
+        # historical floor for fresh lag there, but do not let a stale pickle
+        # sit below the floor forever (#1816).
+        if has_explicit_sync_threshold:
+            threshold = max(0, 2 * sync_threshold)
+        else:
+            divergence_floor = max(_HNSW_DIVERGENCE_FALLBACK_FLOOR, 2 * sync_threshold)
+            threshold = max(
+                divergence_floor,
+                int(sqlite_count * _HNSW_DIVERGENCE_FRACTION),
+            )
+
+        out["threshold"] = threshold
+        stale_below_threshold = (
+            not has_explicit_sync_threshold
+            and divergence > 0
+            and metadata_age_seconds is not None
+            and metadata_age_seconds >= _HNSW_PERSISTENT_DIVERGENCE_GRACE_SECONDS
+        )
+
+        if divergence > threshold or stale_below_threshold:
             out["status"] = "diverged"
             out["diverged"] = True
             pct = 100.0 * divergence / max(sqlite_count, 1)
+            if divergence > threshold:
+                reason = f"exceeds threshold {threshold:,}"
+            else:
+                age = metadata_age_seconds or 0.0
+                reason = f"persisted below the old flush-lag floor for {age:.0f}s"
             out["message"] = (
                 f"HNSW index holds {hnsw_count:,} elements but sqlite has "
-                f"{sqlite_count:,} embeddings — {divergence:,} drawers ({pct:.0f}%) "
-                "are invisible to vector search. Run `mempalace repair` to rebuild."
+                f"{sqlite_count:,} embeddings - {divergence:,} drawers "
+                f"({pct:.0f}%) are missing from the flushed HNSW index "
+                f"({reason}). Vector reads are disabled until "
+                "`mempalace repair` rebuilds it."
             )
         else:
             out["status"] = "ok"
             out["message"] = (
                 f"HNSW {hnsw_count:,} / sqlite {sqlite_count:,} (within flush-lag tolerance)"
             )
+            if divergence < 0:
+                out["message"] += " (HNSW has extra flushed elements; treating as safe)"
+
     except Exception:
         logger.debug("hnsw_capacity_status failed", exc_info=True)
         out["message"] = "HNSW capacity probe raised; skipping"
@@ -743,7 +821,7 @@ def _sqlite_embedding_count(palace_path: str, collection_name: str) -> Optional[
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
         try:
             row = conn.execute(
                 """
@@ -804,7 +882,7 @@ def _sqlite_wing_room_counts(
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
         try:
             # Wait out a transient writer/checkpoint lock rather than falling
             # straight back to the expensive vector-index path (#1681).
@@ -1567,7 +1645,7 @@ class ChromaCollection(BaseCollection):
         # rowid, embedding_id is the user-facing drawer id.
         public_ids: dict[int, str] = {}
         try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
             conn.row_factory = sqlite3.Row
         except sqlite3.Error:
             logger.debug("Chroma lexical sqlite open failed", exc_info=True)

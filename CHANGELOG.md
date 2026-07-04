@@ -10,6 +10,58 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [3.5.0] — 2026-06-22
+
+### Features
+
+- **Opt-in local daemon for queued writes.** A new `mempalace daemon` queues MemPalace writes through a single local process so background mines, diary saves, and hook-driven ingests serialize against one palace handle instead of racing for it. Opt-in and local-only — nothing binds to a public interface. (#1826)
+
+- **Opt-in HTTP transport for the MCP server.** `mempalace-mcp --transport http` serves JSON-RPC at `POST /mcp` (with a `GET /healthz` liveness probe) for operators running MemPalace behind a long-lived HTTP MCP client/proxy, avoiding the long-lived-stdio framing failures of #1801. stdio remains the default and is unchanged. The transport reuses the exact stdio request dispatcher (no separate write/search path), binds `127.0.0.1` by default, and is hardened against the two ways a local HTTP server leaks to the network: it pins the `Host` header to loopback on a loopback bind and rejects any non-loopback browser `Origin` (DNS-rebinding/SSRF guard), and supports an optional bearer token via `MEMPALACE_MCP_HTTP_TOKEN` (required on `/mcp`, never on `/healthz`). A 16 MiB request cap and a loud warning when bound to a non-loopback host round it out. (#1801, #1806)
+
+- **`mempalace_checkpoint` batch-save MCP tool.** Collapses multiple `add_drawer` calls plus an optional diary entry into a single MCP round-trip for agents that want to file a whole session at once. Stores content verbatim and reuses the existing idempotent add/dedup path. (#1851)
+
+- **`mempalace_delete_by_source` bulk-cleanup MCP tool.** Exact-match, dry-run-by-default deletion of every drawer (and its matching closet/AAAK index entries) for a given `source_file` — the recourse for benchmark/eval files mined into the same wing as real data and drowning out search. The dry run reports the drawer and closet blast radius before anything is removed, and the commit writes a WAL audit entry. (#1722, #1729)
+
+- **Optional `source_file` filter for `mempalace_search`.** Scope a search to an exact stored source path. The filter is threaded through every search path (vector, BM25/SQLite fallback, lexical union, and index-mismatch fallback) so it never silently drops a matching drawer, and results now expose the full `source_path` as a round-trippable key. (#1815, #1817)
+
+- **New transcript parsers / importers.** Continue.dev session parser (#731), Gemini CLI / AI Studio JSON session import (#204), and a Pi agent JSONL session normalizer (#169).
+
+- **Wider miner language coverage.** C# / .NET, PHP (#1819), Swift / Kotlin (#1368), and Java project detection including rootless subprojects (#1720).
+
+- **Final mine on Claude plugin `SessionEnd`.** The Claude Code plugin now runs a closing mine when a session ends so the last exchanges are captured without waiting for the next save nudge. (#1814, #1820)
+
+### Performance
+
+- **Overview/status MCP tools answer from the SQLite aggregate.** Large palaces no longer time out building wing/room/status overviews — the counts come from a single SQLite aggregate instead of a client-side fetch-and-tally. (#1748, #1379)
+
+- **`graph_stats` SQLite fast path.** Knowledge-graph stats are computed in SQLite rather than walking the collection, fixing large-palace timeouts. (#1379)
+
+- **Embedder caps ONNX-runtime intra-op threads** so a background mine no longer pins every core. (#1068)
+
+- **Backend pagination pushed into the query.** `sqlite_exact` (#1841, #1842) and `pgvector` (#1830, #1840) now apply `get(limit, offset)` in SQL, and Qdrant fetches bulk metadata in a single scroll with a larger page size (#1796, #1832).
+
+### Bug Fixes
+
+- **pgvector tolerates hostile transcript bytes.** A lone Unicode surrogate (#1833) or a NUL byte (#1829) in a transcript no longer aborts the whole mine — both are sanitized before the row is written.
+
+- **SQLite read-only URIs are percent-encoded** so palace paths with spaces or special characters open correctly, and `_sqlite_graph_stats` is routed through the same `sqlite_read_uri` helper.
+
+- **Stale ChromaDB HNSW divergence routes to the SQLite fallback** instead of failing the read outright. (#1816, #1822)
+
+- **Diverged-index recovery now points at `repair --mode from-sqlite`, not a re-mine.** A failed ChromaDB HNSW compaction leaves the index out of sync while the rows stay intact in `chroma.sqlite3`; the old "re-mine from source" advice silently dropped MCP-added drawers and diary entries (which have no source file). Both the legacy `repair`/`rebuild_index` error messages and the `repair-status` recommendation, plus the recall skill docs, now guide users to rebuild from SQLite. (#1843, #1847, #1849)
+
+- **The MCP server refuses a second writer for the same palace** rather than letting two processes race the same HNSW handle. (#1818, #1823)
+
+- **Windows hook miner spawns with `CREATE_NO_WINDOW`** so background mines no longer flash a console window. (#1783, #1848)
+
+- **`fact_checker` `__main__` no longer emits a runpy warning** under the test runner. (#1798)
+
+### Internal
+
+- Live-substrate conformance test module for pgvector (#1769); dependabot bumps for `docker/login-action` (3→4), `docker/build-push-action` (6→7), and `docker/metadata-action` (5→6) (#1788, #1787, #1786); ruff dev dependency bumped to 0.15.18.
+
+---
+
 ## [3.4.1] — 2026-06-14
 
 ### Features

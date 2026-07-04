@@ -35,6 +35,7 @@ rather than hard-failing — mining must still work on a laptop without CUDA.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import Optional
 
@@ -115,6 +116,35 @@ def _resolve_providers(device: str) -> tuple[list, str]:
     return (requested, device)
 
 
+def _intra_op_session_options(intra_op_num_threads: int):
+    """Build ORT ``SessionOptions`` capping the intra-op thread pool (#1068).
+
+    Returns ``None`` when ``intra_op_num_threads <= 0`` so the caller leaves
+    ORT at its default (≈ physical core count). ChromaDB's embedder ignores
+    ``OMP_NUM_THREADS`` — ORT owns its own intra-op pool, settable only via
+    ``SessionOptions`` at session construction — so a cap has to be threaded
+    through here rather than via the environment.
+    """
+    if not intra_op_num_threads or intra_op_num_threads <= 0:
+        return None
+    import onnxruntime as ort
+
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = intra_op_num_threads
+    return so
+
+
+def _resolve_intra_op_threads() -> int:
+    """Read the configured ORT intra-op thread cap (``0`` = uncapped, #1068)."""
+    try:
+        from .config import MempalaceConfig
+
+        return MempalaceConfig().embedding_threads
+    except Exception:
+        logger.debug("embedding_threads resolution failed; leaving ORT default", exc_info=True)
+        return 0
+
+
 def _build_ef_class():
     """Subclass ``ONNXMiniLM_L6_V2`` with name ``"default"``.
 
@@ -125,12 +155,50 @@ def _build_ef_class():
     palaces created with ``DefaultEmbeddingFunction`` *and* palaces we
     create ourselves, with the same GPU-capable ``preferred_providers``.
     """
+    from functools import cached_property
+
     from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
 
     class _MempalaceONNX(ONNXMiniLM_L6_V2):
+        def __init__(self, preferred_providers=None, intra_op_num_threads=0):
+            super().__init__(preferred_providers=preferred_providers)
+            self._intra_op_num_threads = intra_op_num_threads
+
         @staticmethod
         def name() -> str:
             return "default"
+
+        @cached_property
+        def model(self):
+            # Upstream builds the InferenceSession with no intra-op thread cap,
+            # so ORT defaults its pool to the physical core count and a
+            # background mine pins every core (#1068). Rebuild the session the
+            # same way upstream does (same SessionOptions, same CoreML pruning,
+            # same model path) but with our cap applied. If upstream's
+            # internals shift, fall back to its uncapped build so embedding
+            # still works.
+            cap = getattr(self, "_intra_op_num_threads", 0)
+            if not cap or cap <= 0:
+                return super().model
+            try:
+                ort = self.ort
+                providers = self._preferred_providers or ort.get_available_providers()
+                providers = [p for p in providers if p != "CoreMLExecutionProvider"]
+                so = ort.SessionOptions()
+                so.log_severity_level = 3
+                so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                so.intra_op_num_threads = cap
+                return ort.InferenceSession(
+                    os.path.join(self.DOWNLOAD_PATH, self.EXTRACTED_FOLDER_NAME, "model.onnx"),
+                    providers=providers,
+                    sess_options=so,
+                )
+            except Exception:
+                logger.warning(
+                    "thread-capped ORT session build failed; using ORT defaults",
+                    exc_info=True,
+                )
+                return super().model
 
     return _MempalaceONNX
 
@@ -194,13 +262,19 @@ class EmbeddinggemmaONNX:
         # when switching models. Keep it stable.
         return "embeddinggemma_300m"
 
-    def __init__(self, preferred_providers=None, batch_size: int = _EMBEDDINGGEMMA_BATCH_SIZE):
+    def __init__(
+        self,
+        preferred_providers=None,
+        batch_size: int = _EMBEDDINGGEMMA_BATCH_SIZE,
+        intra_op_num_threads: int = 0,
+    ):
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
         self._providers = (
             list(preferred_providers) if preferred_providers else ["CPUExecutionProvider"]
         )
         self._batch_size = batch_size
+        self._intra_op_num_threads = intra_op_num_threads
         self._session = None
         self._tokenizer = None
         self._np = None
@@ -242,7 +316,11 @@ class EmbeddinggemmaONNX:
             )
             tok_path = hf_hub_download(_EMBEDDINGGEMMA_REPO, filename="tokenizer.json")
 
-            session = ort.InferenceSession(model_path, providers=self._providers)
+            session = ort.InferenceSession(
+                model_path,
+                sess_options=_intra_op_session_options(self._intra_op_num_threads),
+                providers=self._providers,
+            )
             out_names = [o.name for o in session.get_outputs()]
             # Model card: sentence_embedding is the pooled output (last_hidden_state
             # is the per-token output we don't want).
@@ -381,12 +459,13 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
         if cached is not None:
             return cached
 
+        threads = _resolve_intra_op_threads()
         if model == "embeddinggemma":
-            ef = EmbeddinggemmaONNX(preferred_providers=providers)
+            ef = EmbeddinggemmaONNX(preferred_providers=providers, intra_op_num_threads=threads)
         else:
             # Default: minilm (or anything we don't recognize — back-compat win).
             ef_cls = _build_ef_class()
-            ef = ef_cls(preferred_providers=providers)
+            ef = ef_cls(preferred_providers=providers, intra_op_num_threads=threads)
 
         _EF_CACHE[cache_key] = ef
     logger.info(

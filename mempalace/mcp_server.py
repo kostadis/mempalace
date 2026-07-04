@@ -9,12 +9,13 @@ Tools (read):
   mempalace_list_wings      — all wings with drawer counts
   mempalace_list_rooms      — rooms within a wing
   mempalace_get_taxonomy    — full wing → room → count tree
-  mempalace_search          — semantic search, optional wing/room filter
+  mempalace_search          — semantic search, optional wing/room/source_file filter
   mempalace_check_duplicate — check if content already exists before filing
 
 Tools (write):
   mempalace_add_drawer      — file verbatim content into a wing/room
   mempalace_delete_drawer   — remove a drawer by ID
+  mempalace_delete_by_source — bulk-remove all drawers mined from one source_file
 
 Tools (maintenance):
   mempalace_reconnect       — force cache invalidation and reconnect after external writes
@@ -47,6 +48,7 @@ import json  # noqa: E402
 import logging  # noqa: E402
 import re  # noqa: E402
 import hashlib  # noqa: E402
+import hmac  # noqa: E402
 import sqlite3  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
@@ -60,6 +62,7 @@ from .config import (  # noqa: E402
     sanitize_name,
     sanitize_content,
     sanitize_iso_temporal,
+    sqlite_read_uri,
     strip_lone_surrogates,
 )
 from .version import __version__  # noqa: E402
@@ -196,6 +199,23 @@ def _parse_args():
         metavar="NAME",
         help="Storage backend to use (default: config/env/detected/chroma)",
     )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "http"],
+        default="stdio",
+        help="Serve MCP over stdio (default) or in-process HTTP",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="HTTP host to bind when --transport=http (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="HTTP port to bind when --transport=http (default: 8765)",
+    )
     args, unknown = parser.parse_known_args()
     if unknown:
         logger.debug("Ignoring unknown args: %s", unknown)
@@ -260,6 +280,245 @@ _kg_cache_lock = threading.Lock()
 _MCP_IDLE_HOURS_ENV = "MEMPALACE_MCP_IDLE_HOURS"
 _MCP_IDLE_HOURS_DEFAULT = 8.0
 _last_request_time: float = time.monotonic()
+
+# MCP startup/open SQLite integrity gate (#1818).
+#
+# The peer-writer guard prevents new concurrent writers, but an MCP server can
+# still start against a palace that was already left corrupt by a prior writer
+# crash/kill. Run the existing read-only SQLite quick_check once on startup/open
+# and fail loudly instead of silently serving a malformed FTS5/HNSW index.
+_sqlite_integrity_checked = False
+_sqlite_integrity_errors: list[str] = []
+_sqlite_integrity_check_error = ""
+_SQLITE_INTEGRITY_ERROR_CODE = -32002
+_SQLITE_INTEGRITY_ALLOWED_TOOLS = frozenset(
+    {
+        "mempalace_status",
+        "mempalace_reconnect",
+    }
+)
+
+
+# MCP peer-writer guard (#1818).
+#
+# The existing per-operation palace lock serializes individual writes, but it
+# cannot make another long-lived Chroma PersistentClient forget stale in-memory
+# HNSW/FTS state. Hold the same per-palace mine lock for this MCP process
+# lifetime. A peer MCP process can still serve read tools, but mutating tools
+# refuse before touching Chroma or the knowledge graph.
+_MCP_WRITER_LOCK_CM = None
+_MCP_WRITER_READ_ONLY = False
+_MCP_WRITER_LOCK_FAILED = False
+_MCP_WRITER_LOCK_ERROR = ""
+_MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
+
+_MUTATING_TOOLS = frozenset(
+    {
+        "mempalace_kg_add",
+        "mempalace_kg_invalidate",
+        "mempalace_create_tunnel",
+        "mempalace_delete_tunnel",
+        "mempalace_delete_hallway",
+        "mempalace_add_drawer",
+        "mempalace_delete_drawer",
+        "mempalace_mine",
+        "mempalace_sync",
+        "mempalace_update_drawer",
+        "mempalace_diary_write",
+    }
+)
+
+
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _acquire_mcp_writer_lock() -> tuple[bool, str]:
+    """Acquire this process's per-palace MCP writer lease.
+
+    Returns (True, "") when this process may write. Returns (False, reason)
+    when another live writer already owns the per-palace lease. Once a server
+    starts read-only it stays read-only for its lifetime; restarting is the
+    safe way to become the writer after the original holder exits.
+    """
+
+    global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY, _MCP_WRITER_LOCK_FAILED
+    global _MCP_WRITER_LOCK_ERROR
+
+    if _truthy_env(_MCP_ALLOW_PEER_WRITER_ENV):
+        return True, ""
+
+    if _MCP_WRITER_LOCK_CM is not None:
+        return True, ""
+
+    if _MCP_WRITER_READ_ONLY:
+        return False, _MCP_WRITER_LOCK_ERROR
+
+    if _MCP_WRITER_LOCK_FAILED:
+        return True, _MCP_WRITER_LOCK_ERROR
+
+    try:
+        from .palace import MineAlreadyRunning, mine_palace_lock
+
+        lock_cm = mine_palace_lock(_config.palace_path)
+        lock_cm.__enter__()
+    except MineAlreadyRunning as exc:
+        _MCP_WRITER_READ_ONLY = True
+        _MCP_WRITER_LOCK_ERROR = (
+            "another mempalace writer already holds the palace lock for "
+            f"{_config.palace_path!r}: {exc}"
+        )
+        return False, _MCP_WRITER_LOCK_ERROR
+    except Exception as exc:
+        _MCP_WRITER_LOCK_FAILED = True
+        _MCP_WRITER_LOCK_ERROR = (
+            "could not acquire MCP peer-writer lock for "
+            f"{_config.palace_path!r}: {exc!r}; continuing without "
+            "peer-writer protection"
+        )
+        logger.warning(_MCP_WRITER_LOCK_ERROR)
+        return True, _MCP_WRITER_LOCK_ERROR
+
+    _MCP_WRITER_LOCK_CM = lock_cm
+    import atexit
+
+    atexit.register(lambda: lock_cm.__exit__(None, None, None))
+    _MCP_WRITER_READ_ONLY = False
+    _MCP_WRITER_LOCK_FAILED = False
+    _MCP_WRITER_LOCK_ERROR = ""
+    return True, ""
+
+
+def _mcp_peer_writer_refusal(req_id, tool_name: str):
+    if tool_name not in _MUTATING_TOOLS:
+        return None
+
+    ok, reason = _acquire_mcp_writer_lock()
+    if ok:
+        return None
+
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": -32001,
+            "message": "Peer MCP writer active; this server is read-only for mutating tools",
+            "data": {
+                "tool": tool_name,
+                "palace": _config.palace_path,
+                "reason": reason,
+                "override_env": _MCP_ALLOW_PEER_WRITER_ENV,
+            },
+        },
+    }
+
+
+def _refresh_sqlite_integrity_status() -> None:
+    """Refresh the MCP startup SQLite/FTS5 integrity gate.
+
+    Uses repair.sqlite_integrity_errors(), which is read-only and already backs
+    repair preflight. A failure here is treated as an integrity failure so the
+    server does not proceed silently after a malformed FTS5 index or other
+    SQLite-layer corruption (#1818).
+    """
+
+    global _sqlite_integrity_checked
+    global _sqlite_integrity_errors
+    global _sqlite_integrity_check_error
+
+    if not _config.palace_path or not _is_chroma_backend():
+        _sqlite_integrity_checked = True
+        _sqlite_integrity_errors = []
+        _sqlite_integrity_check_error = ""
+        return
+
+    try:
+        from .repair import sqlite_integrity_errors
+
+        errors = sqlite_integrity_errors(_config.palace_path)
+    except Exception as exc:
+        _sqlite_integrity_check_error = (
+            f"sqlite integrity probe failed: {type(exc).__name__}: {exc}"
+        )
+        _sqlite_integrity_errors = [_sqlite_integrity_check_error]
+    else:
+        _sqlite_integrity_errors = [str(error) for error in errors if str(error)]
+        _sqlite_integrity_check_error = ""
+
+    _sqlite_integrity_checked = True
+
+    if _sqlite_integrity_errors:
+        logger.error(
+            "SQLite integrity check failed for palace=%s: %s",
+            _config.palace_path,
+            "; ".join(_sqlite_integrity_errors[:3]),
+        )
+
+
+def _ensure_sqlite_integrity_status() -> None:
+    if not _sqlite_integrity_checked:
+        _refresh_sqlite_integrity_status()
+
+
+def _sqlite_integrity_payload() -> dict:
+    _ensure_sqlite_integrity_status()
+
+    payload = {
+        "checked": _sqlite_integrity_checked,
+        "ok": not _sqlite_integrity_errors,
+        "palace": _config.palace_path,
+        "sqlite_path": os.path.join(_config.palace_path, "chroma.sqlite3")
+        if _config.palace_path
+        else "",
+        "error_count": len(_sqlite_integrity_errors),
+        "errors": _sqlite_integrity_errors[:10],
+    }
+
+    if len(_sqlite_integrity_errors) > 10:
+        payload["truncated"] = len(_sqlite_integrity_errors) - 10
+
+    if _sqlite_integrity_check_error:
+        payload["check_error"] = _sqlite_integrity_check_error
+
+    return payload
+
+
+def _mcp_sqlite_integrity_refusal(req_id, tool_name: str):
+    if tool_name in _SQLITE_INTEGRITY_ALLOWED_TOOLS:
+        return None
+
+    _ensure_sqlite_integrity_status()
+
+    if not _sqlite_integrity_errors:
+        return None
+
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": _SQLITE_INTEGRITY_ERROR_CODE,
+            "message": (
+                "Palace SQLite integrity check failed; refusing tool call "
+                "until the palace is repaired"
+            ),
+            "data": {
+                "tool": tool_name,
+                "palace": _config.palace_path or "",
+                "sqlite_path": (
+                    os.path.join(_config.palace_path, "chroma.sqlite3")
+                    if _config.palace_path
+                    else ""
+                ),
+                "errors": _sqlite_integrity_errors[:10],
+                "error_count": len(_sqlite_integrity_errors),
+                "hint": (
+                    "Stop all MemPalace MCP clients/writers, back up the palace, "
+                    "repair the SQLite/FTS5 corruption offline, then run "
+                    "mempalace_reconnect or restart the MCP server."
+                ),
+            },
+        },
+    }
 
 
 def _mcp_idle_timeout_secs() -> float:
@@ -481,83 +740,12 @@ def _refresh_vector_disabled_flag() -> None:
 # Every write operation is logged to a JSONL file before execution.
 # This provides an audit trail for detecting memory poisoning and
 # enables review/rollback of writes from external or untrusted sources.
-
-_WAL_FILE = Path(os.path.expanduser("~/.mempalace/wal")) / "write_log.jsonl"
-_WAL_INITIALIZED_DIR = None
-
-
-def _ensure_wal() -> None:
-    """Create (and re-harden) the WAL directory lazily, on the first write.
-
-    This must NOT run at import time: a user who removed ``~/.mempalace`` has
-    engaged the documented kill-switch (``hooks_cli._palace_root_exists()``,
-    #1305), and recreating the directory just by importing this module would
-    silently re-arm the autosave/mining hooks they disabled (#1676). Creating
-    it on the first real write keeps the kill-switch contract intact.
-
-    It is deliberately not gated on ``_palace_root_exists()``: by the time a
-    write reaches here the palace is already being recreated by the ChromaDB/KG
-    layer regardless, so gating would only drop audit records, not prevent
-    recreation. Runtime kill-switch enforcement for MCP writes is the broader
-    question tracked in #504.
-
-    Hardening is attempted once per directory and the path cached in
-    ``_WAL_INITIALIZED_DIR`` regardless of outcome (keyed on the path, so a
-    test repointing ``_WAL_FILE`` re-initialises), so a persistent failure on a
-    restricted filesystem does not retry on every write. ``mkdir`` runs only
-    when the initial ``chmod`` raises ``FileNotFoundError`` (EAFP). The parent
-    ``~/.mempalace`` keeps its umask mode, like the other palace directories;
-    the WAL file is created atomically with mode 0o600 by ``_wal_log``.
-    """
-    global _WAL_INITIALIZED_DIR
-    wal_dir = _WAL_FILE.parent
-    if _WAL_INITIALIZED_DIR == wal_dir:
-        return
-    try:
-        wal_dir.chmod(0o700)
-    except FileNotFoundError:
-        try:
-            wal_dir.mkdir(parents=True, exist_ok=True)
-            wal_dir.chmod(0o700)
-        except (OSError, NotImplementedError):
-            pass
-    except (OSError, NotImplementedError):
-        pass
-    # Cache regardless of outcome: one attempt per directory, so a persistent
-    # chmod/mkdir failure (restricted FS) is not retried on every write.
-    _WAL_INITIALIZED_DIR = wal_dir
-
-
-# Keys whose values should be redacted in WAL entries to avoid logging sensitive content
-_WAL_REDACT_KEYS = frozenset(
-    {"content", "content_preview", "document", "entry", "entry_preview", "query", "text"}
-)
-
-
-def _wal_log(operation: str, params: dict, result: dict = None):
-    """Append a write operation to the write-ahead log."""
-    # Redact sensitive content from params before logging
-    safe_params = {}
-    for k, v in params.items():
-        if k in _WAL_REDACT_KEYS:
-            safe_params[k] = f"[REDACTED {len(v)} chars]" if isinstance(v, str) else "[REDACTED]"
-        else:
-            safe_params[k] = v
-    entry = {
-        "timestamp": datetime.now().isoformat(),
-        "operation": operation,
-        "params": safe_params,
-        "result": result,
-    }
-    try:
-        # Dir setup shares the append's exception handler below: any WAL
-        # failure is logged and non-fatal, never crashing the tool call.
-        _ensure_wal()
-        fd = os.open(str(_WAL_FILE), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        with os.fdopen(fd, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, default=str) + "\n")
-    except Exception as e:
-        logger.error(f"WAL write failed: {e}")
+#
+# The implementation lives in mempalace.wal — a side-effect-free module — so the
+# CLI sync path and the daemon service layer can audit writes without importing
+# this module, whose import installs MCP stdio protection (os.dup2(2, 1) and
+# sys.stdout = sys.stderr) that would misroute their output.
+from .wal import _wal_log  # noqa: E402
 
 
 def _get_client(palace_path=None):
@@ -775,7 +963,22 @@ def _safe_meta(meta):
 
 
 def _fetch_all_metadata(col, where=None):
-    """Paginate col.get() to avoid the 10K silent truncation limit."""
+    """Fetch every matching record's metadata via the backend's best strategy.
+
+    Delegates to BaseCollection.get_all_metadata() (#1796), which Chroma
+    satisfies with the same offset-paginated loop this function used to do
+    inline, and which Qdrant overrides with a single _scroll_all() pass.
+    Routing through one contract method means every backend gets its own
+    correct strategy without this caller needing to know which backend it's
+    talking to.
+    """
+    get_all = getattr(col, "get_all_metadata", None)
+    if callable(get_all):
+        return get_all(where=where)
+
+    # Defensive fallback for any collection object that predates the
+    # get_all_metadata() contract method (e.g. a third-party backend not yet
+    # updated). Preserves the exact previous behavior.
     total = col.count()
     all_meta = []
     offset = 0
@@ -834,6 +1037,41 @@ def _sanitize_optional_name(value: str = None, field_name: str = "name") -> str:
     return sanitize_name(value, field_name)
 
 
+# Bounds the whole stored source_file string (often an absolute path), so it is
+# Linux PATH_MAX rather than the 128-char wing/room NAME limit.
+_MAX_SOURCE_FILE_LENGTH = 4096
+
+
+def _sanitize_optional_source_file(value: str = None) -> str:
+    """Validate an optional source_file search filter (#1815).
+
+    Unlike wing/room, a source_file is a path: ``/``, ``\\`` and ``.`` are
+    legal, so it is NOT run through ``sanitize_name`` (which rejects path
+    characters as traversal attempts). The value is matched verbatim as a
+    ChromaDB metadata-equality / parameterized-SQL value — never used as a
+    filesystem path — so there is no traversal risk to guard against. A null
+    byte or a pathological length can still upset the backend (chromadb
+    add/upsert chokes on null bytes / lone surrogates, #1235), so guard those
+    for parity with ``sanitize_name``. Blank / whitespace-only is "no filter".
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("source_file must be a string")
+    value = value.strip()
+    if not value:
+        return None
+    if "\x00" in value:
+        raise ValueError("source_file contains null bytes")
+    if value != strip_lone_surrogates(value):
+        raise ValueError("source_file contains invalid surrogate characters")
+    if len(value) > _MAX_SOURCE_FILE_LENGTH:
+        raise ValueError(
+            f"source_file exceeds maximum length of {_MAX_SOURCE_FILE_LENGTH} characters"
+        )
+    return value
+
+
 # ==================== READ TOOLS ====================
 
 
@@ -859,7 +1097,7 @@ def _tool_status_via_sqlite(palace_path: str = None) -> dict:
     rooms: dict = {}
     total = 0
     try:
-        conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = _sqlite3.connect(sqlite_read_uri(db_path), uri=True)
         try:
             row = conn.execute(
                 """
@@ -913,11 +1151,188 @@ def _tool_status_via_sqlite(palace_path: str = None) -> dict:
     return result
 
 
+def _sqlite_taxonomy():
+    """Fast wing→room tally straight from ``chroma.sqlite3`` (#1748 / #1379).
+
+    Returns ``(total, {wing: {room: count}})`` or ``None`` to signal the
+    caller to fall back to the ChromaDB client pagination path. ``None`` means
+    a non-chroma backend, a missing/unbootstrapped palace, or a sqlite error —
+    exactly the cases ``backends.chroma._sqlite_wing_room_counts`` already
+    handles for the CLI ``miner.status()``. The point is to answer the
+    overview tools from the relational metadata without cold-loading the HNSW
+    index, which costs tens of seconds per call on large palaces and is what
+    times them out under the MCP host limit.
+    """
+    if not _is_chroma_backend():
+        return None
+    try:
+        from .backends.chroma import _sqlite_wing_room_counts
+
+        counts = _sqlite_wing_room_counts(_config.palace_path, _config.collection_name)
+    except Exception:
+        logger.debug("sqlite taxonomy fast path failed; falling back", exc_info=True)
+        return None
+    if counts is None:
+        return None
+
+    # Preserve the client path's output contract: drawers missing wing/room
+    # read as "unknown" (the ``m.get("wing", "unknown")`` default), not the
+    # sqlite COALESCE placeholder "?". Without this, the fast path would be an
+    # observable API change for MCP clients on legacy/partial drawers.
+    def _norm(key):
+        return "unknown" if key in (None, "?") else key
+
+    total, wing_rooms = counts
+    normalized: dict = {}
+    for wing, room_counts in wing_rooms.items():
+        dest = normalized.setdefault(_norm(wing), {})
+        for room, n in room_counts.items():
+            rkey = _norm(room)
+            dest[rkey] = dest.get(rkey, 0) + n
+    return total, normalized
+
+
+def _sqlite_graph_stats():
+    """Compute ``graph_stats`` from one grouped sqlite read (#1379, graph_stats
+    half; follow-up to #1748).
+
+    ``graph_stats`` only needs grouped counts, but the client path builds the
+    whole graph by paging every metadata row (``build_graph`` →
+    ``col.get(limit, offset)``) and cold-loads the HNSW index — which times out
+    on six-figure palaces. This reads the same wing/room/hall grouping straight
+    from ``chroma.sqlite3`` and reconstructs the stats.
+
+    Returns the stats dict, or ``None`` to fall back to the client path
+    (non-chroma backend, missing/unbootstrapped palace, sqlite error). The
+    reconstruction mirrors ``palace_graph.build_graph`` /
+    ``palace_graph.graph_stats`` exactly: a node is a room with a non-empty
+    wing and a usable room name (the catch-all ``"general"`` is excluded), and
+    edges are the per-hall cross-wing crossings of multi-wing rooms.
+    """
+    if not _is_chroma_backend():
+        return None
+    import sqlite3 as _sqlite3
+    from collections import Counter, defaultdict
+
+    if not _config.palace_path:
+        return None
+    db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return None
+    collection_name = _config.collection_name
+    # Treat any failure as a soft fallback to the client path (sqlite errors,
+    # but also an unexpected schema shape tripping the reconstruction) so
+    # graph_stats degrades to build_graph() rather than raising — mirroring the
+    # sibling sqlite fast paths (_sqlite_taxonomy / _sqlite_wing_room_counts).
+    try:
+        conn = _sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        try:
+            conn.execute("PRAGMA busy_timeout = 3000")
+            if (
+                conn.execute(
+                    "SELECT 1 FROM collections WHERE name = ?", (collection_name,)
+                ).fetchone()
+                is None
+            ):
+                return None
+            rows = conn.execute(
+                """
+                SELECT
+                    COALESCE(rm.string_value, CAST(rm.int_value AS TEXT),
+                             CAST(rm.float_value AS TEXT), '') AS room,
+                    COALESCE(wm.string_value, CAST(wm.int_value AS TEXT),
+                             CAST(wm.float_value AS TEXT), '') AS wing,
+                    COALESCE(hm.string_value, CAST(hm.int_value AS TEXT),
+                             CAST(hm.float_value AS TEXT), '') AS hall,
+                    COUNT(*) AS n
+                FROM embeddings e
+                JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
+                JOIN collections c ON s.collection = c.id
+                LEFT JOIN embedding_metadata rm ON rm.id = e.id AND rm.key = 'room'
+                LEFT JOIN embedding_metadata wm ON wm.id = e.id AND wm.key = 'wing'
+                LEFT JOIN embedding_metadata hm ON hm.id = e.id AND hm.key = 'hall'
+                WHERE c.name = ?
+                GROUP BY room, wing, hall
+                """,
+                (collection_name,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        # Reconstruct build_graph()'s room_data, applying its per-drawer filter
+        # (`if room and room != "general" and wing`).
+        room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0})
+        for room, wing, hall, n in rows:
+            if not room or room == "general" or not wing:
+                continue
+            node = room_data[room]
+            node["wings"].add(wing)
+            if hall:
+                node["halls"].add(hall)
+            node["count"] += int(n)
+
+        tunnel_rooms = 0
+        total_edges = 0
+        wing_counts = Counter()
+        for data in room_data.values():
+            n_wings = len(data["wings"])
+            for wing in data["wings"]:
+                wing_counts[wing] += 1
+            if n_wings >= 2:
+                tunnel_rooms += 1
+                # Edges per multi-wing room: one per wing-pair per hall, matching
+                # build_graph's nested wa<wb × hall expansion.
+                total_edges += (n_wings * (n_wings - 1) // 2) * len(data["halls"])
+
+        top_tunnels = [
+            {"room": room, "wings": sorted(data["wings"]), "count": data["count"]}
+            # build_graph's graph_stats slices the top 10 by wing-count first,
+            # then keeps the multi-wing ones. An explicit room-name tiebreaker
+            # keeps the fast path deterministic across runs — preferable to
+            # leaning on SQLite's unspecified GROUP BY order. (Exact membership
+            # parity with the client path is unattainable anyway; the two never
+            # run on the same palace, since the backend picks one.)
+            for room, data in sorted(
+                room_data.items(), key=lambda kv: (-len(kv[1]["wings"]), kv[0])
+            )[:10]
+            if len(data["wings"]) >= 2
+        ]
+
+        return {
+            "total_rooms": len(room_data),
+            "tunnel_rooms": tunnel_rooms,
+            "total_edges": total_edges,
+            "rooms_per_wing": dict(wing_counts.most_common()),
+            "top_tunnels": top_tunnels,
+        }
+    except Exception:
+        logger.debug("sqlite graph_stats fast path failed; falling back", exc_info=True)
+        return None
+
+
 def tool_status(palace: str = None):
     try:
         resolved = _resolve_palace_arg(palace)
     except ValueError as e:
         return {"error": str(e)}
+
+    is_default = resolved == _default_palace_path()
+
+    # SQLite integrity gate: if the active default palace's chroma.sqlite3
+    # fails PRAGMA quick_check, avoid touching chromadb (a corrupt FTS/HNSW
+    # segment can segfault the client) and answer from sqlite with an error
+    # flag. Only the active default palace is guarded here — a cross-palace
+    # ``palace=`` status uses the client path directly.
+    if is_default:
+        _ensure_sqlite_integrity_status()
+        if _sqlite_integrity_errors:
+            result = _tool_status_via_sqlite()
+            if isinstance(result, dict):
+                result["sqlite_integrity"] = _sqlite_integrity_payload()
+                result["sqlite_integrity_failed"] = True
+                result["error"] = "SQLite integrity check failed"
+                result["partial"] = True
+            return result
 
     # Run the safe sqlite/pickle probe before we touch chromadb. In the
     # #1222 failure mode, opening the persistent client to call .count()
@@ -925,10 +1340,36 @@ def tool_status(palace: str = None):
     # is detected so status stays reachable. The probe runs against the
     # active default palace; for cross-palace status we skip the fallback.
     db_exists = os.path.isfile(os.path.join(resolved, "chroma.sqlite3"))
-    if resolved == _default_palace_path():
+    if is_default:
         _refresh_vector_disabled_flag()
         if _vector_disabled:
             return _tool_status_via_sqlite(resolved)
+
+    # Fast path: tally wing/room straight from sqlite so overview tools stay
+    # responsive on large palaces instead of cold-loading the HNSW index or
+    # paging hundreds of MB of metadata through the client (#1748 / #1379).
+    # ``None`` (non-chroma backend / non-standard layout) falls through to the
+    # client path below. Gated to the active default palace — ``_sqlite_taxonomy``
+    # reads ``_config.palace_path``, so a cross-palace ``palace=`` status must
+    # use the client path against ``resolved`` instead.
+    fast = _sqlite_taxonomy() if is_default else None
+    if fast is not None:
+        total, wing_rooms = fast
+        wings = {}
+        rooms = {}
+        for w, room_counts in wing_rooms.items():
+            wings[w] = wings.get(w, 0) + sum(room_counts.values())
+            for r, n in room_counts.items():
+                rooms[r] = rooms.get(r, 0) + n
+        return {
+            "total_drawers": total,
+            "wings": wings,
+            "rooms": rooms,
+            "palace_path": resolved,
+            "protocol": PALACE_PROTOCOL,
+            "aaak_dialect": AAAK_SPEC,
+            "backend": _selected_backend_name(),
+        }
 
     # Use create=True only when a palace DB already exists on disk -- this
     # bootstraps the ChromaDB collection on a valid-but-empty palace without
@@ -997,6 +1438,13 @@ When WRITING AAAK: use entity codes, mark emotions, keep structure tight."""
 
 
 def tool_list_wings():
+    fast = _sqlite_taxonomy()
+    if fast is not None:
+        _total, wing_rooms = fast
+        wings = {}
+        for w, room_counts in wing_rooms.items():
+            wings[w] = wings.get(w, 0) + sum(room_counts.values())
+        return {"wings": wings}
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
@@ -1020,6 +1468,16 @@ def tool_list_rooms(wing: str = None):
         wing = _sanitize_optional_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
+    fast = _sqlite_taxonomy()
+    if fast is not None:
+        _total, wing_rooms = fast
+        rooms = {}
+        for w, room_counts in wing_rooms.items():
+            if wing and w != wing:
+                continue
+            for r, n in room_counts.items():
+                rooms[r] = rooms.get(r, 0) + n
+        return {"wing": wing or "all", "rooms": rooms}
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
@@ -1040,6 +1498,10 @@ def tool_list_rooms(wing: str = None):
 
 
 def tool_get_taxonomy():
+    fast = _sqlite_taxonomy()
+    if fast is not None:
+        _total, wing_rooms = fast
+        return {"taxonomy": {w: dict(room_counts) for w, room_counts in wing_rooms.items()}}
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
@@ -1066,6 +1528,7 @@ def tool_search(
     limit: int = 5,
     wing: str = None,
     room: str = None,
+    source_file: str = None,
     max_distance: float = 1.5,
     min_similarity: float = None,
     context: str = None,
@@ -1076,6 +1539,7 @@ def tool_search(
         wing = _sanitize_optional_name(wing, "wing")
         room = _sanitize_optional_name(room, "room")
         resolved = _resolve_palace_arg(palace)
+        source_file = _sanitize_optional_source_file(source_file)
     except ValueError as e:
         return {"error": str(e)}
     # Backwards compat: accept old name
@@ -1094,6 +1558,7 @@ def tool_search(
         palace_path=resolved,
         wing=wing,
         room=room,
+        source_file=source_file,
         n_results=limit,
         max_distance=dist,
         vector_disabled=_vector_disabled,
@@ -1111,6 +1576,7 @@ def tool_search(
             palace_path=_config.palace_path,
             wing=wing,
             room=room,
+            source_file=source_file,
             n_results=limit,
             max_distance=dist,
             vector_disabled=_vector_disabled,
@@ -1457,6 +1923,12 @@ def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
 
 def tool_graph_stats():
     """Palace graph overview: nodes, tunnels, edges, connectivity."""
+    # Fast path: grouped sqlite read instead of paging all metadata and
+    # cold-loading HNSW via build_graph(), which times out on large palaces
+    # (#1379). Falls through to the client path for non-chroma backends.
+    fast = _sqlite_graph_stats()
+    if fast is not None:
+        return fast
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
@@ -2172,6 +2644,157 @@ def tool_mine(
             _invalidate_metadata_cache()
 
 
+def _purge_source_closets(source_file: str, *, commit: bool) -> int:
+    """Count, and optionally delete, closets matching ``source_file`` exactly.
+
+    The closets collection is the searchable AAAK index layer; it is keyed by
+    ``source_file`` independently of the drawers collection, so a drawer-only
+    delete would strand stale index pointers at the deleted source (#1722).
+    Mirrors the closet-purge step in :func:`mempalace.sync.sync_palace` and the
+    re-mine purge in :func:`mempalace.palace.purge_file_closets`.
+
+    Best-effort: a missing or unavailable closet collection yields 0 and never
+    raises, so it can never abort a drawer delete that has already committed.
+    Deletion is pushed down via ``delete(where=...)`` so it survives palaces
+    larger than the 10k ``get()`` truncation; the returned count is the (best
+    effort) number of matching closets observed before the delete.
+    """
+    from .palace import get_closets_collection
+
+    try:
+        closets_col = get_closets_collection(_config.palace_path, create=False)
+    except Exception as exc:
+        logger.warning("Closet purge skipped (collection unavailable): %s", exc)
+        return 0
+    if closets_col is None:
+        return 0
+    try:
+        ids = closets_col.get(where={"source_file": source_file}, include=[]).get("ids") or []
+        count = len(ids)
+        if commit and count:
+            closets_col.delete(where={"source_file": source_file})
+        return count
+    except Exception as exc:
+        logger.warning("Closet purge failed for %s: %s", source_file, exc)
+        return 0
+
+
+def tool_delete_by_source(source_file: str, dry_run: bool = True):
+    """Delete every drawer whose ``source_file`` metadata matches exactly.
+
+    Bulk cleanup for the contamination case in #1722, where benchmark/eval
+    files (ShareGPT dumps, ``results_mempal_*.jsonl``, language config JSON)
+    get mined into the same wing as real user data and drown out semantic
+    search. Previously the only recourse was hand-rolled SQLite ``DELETE``
+    against ``chroma.sqlite3``.
+
+    Matching is exact on the stored ``source_file`` value and pushed down to
+    the backend via ``delete(where=...)`` — the same idiom used by the miner
+    and diary ingest paths — so there is no client-side id list and the
+    SQLite "too many variables" limit cannot be hit, regardless of how many
+    drawers share the source (the reporter had 55k).
+
+    Also purges the matching closets (the AAAK index layer) so deleting the
+    drawers doesn't strand stale index pointers at the dead source (#1722).
+
+    Defaults to a dry run: it reports the drawer match count, the closet match
+    count, and a small sample so the caller can confirm the blast radius before
+    anything is removed. Pass ``dry_run=False`` to commit the deletion
+    (irreversible).
+    """
+    if not isinstance(source_file, str) or not source_file.strip():
+        return {"success": False, "error": "source_file must be a non-empty string"}
+    # Mirror the ingestion-side normalization (tool_add_drawer strips lone
+    # surrogates from source_file before storing) so exact matching still hits
+    # rows mined from non-ASCII paths that arrived via a cp1252 stdin (#1488).
+    source_file = strip_lone_surrogates(source_file)
+
+    col = _get_collection()
+    if not col:
+        return _collection_error_or_no_palace()
+
+    where = {"source_file": source_file}
+    try:
+        # Paginated to survive palaces larger than the 10k get() truncation.
+        metas = _fetch_all_metadata(col, where=where)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+    match_count = len(metas)
+    # Distinct (wing, room) pairs so the caller sees where the hits live.
+    sample = []
+    seen = set()
+    for meta in metas:
+        meta = _safe_meta(meta)
+        # Default missing wing/room to "" for consistency with the rest of the
+        # file (drawers are always stored with both, but be defensive).
+        wing = meta.get("wing", "")
+        room = meta.get("room", "")
+        key = (wing, room)
+        if key in seen:
+            continue
+        seen.add(key)
+        sample.append({"wing": wing, "room": room})
+        if len(sample) >= 5:
+            break
+
+    if dry_run:
+        closet_match_count = _purge_source_closets(source_file, commit=False)
+        return {
+            "success": True,
+            "dry_run": True,
+            "source_file": source_file,
+            "match_count": match_count,
+            "closet_match_count": closet_match_count,
+            "sample": sample,
+            "hint": (
+                "No drawers were deleted. Re-run with dry_run=false to remove "
+                f"these {match_count} drawer(s) and {closet_match_count} index "
+                "entr(y/ies)."
+                if match_count
+                else "No drawers match this source_file."
+            ),
+        }
+
+    if match_count == 0:
+        # Idempotent: deleting an absent source is a no-op, not an error.
+        return {
+            "success": True,
+            "dry_run": False,
+            "source_file": source_file,
+            "deleted": 0,
+        }
+
+    _wal_log(
+        "delete_by_source",
+        {"source_file": source_file, "match_count": match_count, "sample": sample},
+    )
+    try:
+        col.delete(where=where)
+        _invalidate_metadata_cache()
+        # Purge the matching closets too so the AAAK index doesn't keep stale
+        # pointers at the now-deleted drawers (#1722). Done after the drawer
+        # delete and intentionally best-effort: the drawers are already gone,
+        # so a closet-purge hiccup must not turn a successful delete into an
+        # error — it just leaves index cruft a later `repair` / re-mine clears.
+        closets_deleted = _purge_source_closets(source_file, commit=True)
+        logger.info(
+            "Deleted %d drawer(s) and %d closet(s) from source: %s",
+            match_count,
+            closets_deleted,
+            source_file,
+        )
+        return {
+            "success": True,
+            "dry_run": False,
+            "source_file": source_file,
+            "deleted": match_count,
+            "closets_deleted": closets_deleted,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
     """Prune drawers whose source files are gitignored, missing, or moved (#1252)."""
     from .palace import MineAlreadyRunning
@@ -2845,6 +3468,24 @@ def tool_reconnect():
             _kg.close()
         except Exception:
             pass
+    _refresh_sqlite_integrity_status()
+    if _sqlite_integrity_errors:
+        result = {
+            "success": False,
+            "message": "SQLite integrity check failed after reconnect",
+            "sqlite_integrity": _sqlite_integrity_payload(),
+            "vector_disabled": _vector_disabled,
+            "vector_disabled_reason": _vector_disabled_reason,
+            "hint": (
+                "Stop all MemPalace MCP clients/writers, back up the palace, "
+                "repair the SQLite/FTS5 corruption offline, then run "
+                "mempalace_reconnect or restart the MCP server."
+            ),
+        }
+        if close_errors:
+            result["error"] = "; ".join(close_errors)
+        return result
+
     try:
         col = _get_collection()
         if col is None:
@@ -2880,6 +3521,79 @@ def tool_reconnect():
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
+    """Batch session save in a single call.
+
+    Semantic-dedups each item, files the non-duplicates as drawers, then
+    writes one diary entry. Collapses the per-item ``check_duplicate`` /
+    ``add_drawer`` / ``diary_write`` sequence into one MCP request so the
+    host UI renders a single tool-call card (and keeps its spinner up for
+    the whole save) instead of one card per underlying call.
+
+    ``items`` is a list of ``{"wing", "room", "content"}`` dicts. ``diary``
+    is an optional ``{"agent_name", "entry", "topic"?, "wing"?}`` dict.
+    Reuses the existing single-item handlers so dedup/idempotency/WAL
+    behaviour is identical to calling them directly.
+    """
+    # Inputs come from MCP clients and handle_request does not validate
+    # nested schemas, so guard every field here. A single malformed item
+    # must record an error and be skipped, never raise and abort the whole
+    # batch (the already-filed items in this call would otherwise be lost
+    # from the response).
+    try:
+        dedup_threshold = float(dedup_threshold)
+    except (ValueError, TypeError):
+        return {"error": "dedup_threshold must be a number"}
+
+    out = {"added": [], "duplicates": [], "errors": []}
+    if not isinstance(items, list):
+        return {"error": "items must be a list of {wing, room, content} objects"}
+    for item in items:
+        if not isinstance(item, dict):
+            out["errors"].append({"item": item, "error": "item must be an object"})
+            continue
+        wing = item.get("wing")
+        room = item.get("room")
+        content = item.get("content")
+        # Non-empty strings only: a non-string here would raise deep in
+        # sanitize_content / strip_lone_surrogates.
+        if not all(isinstance(v, str) and v for v in (wing, room, content)):
+            out["errors"].append(
+                {"item": item, "error": "wing, room, content must be non-empty strings"}
+            )
+            continue
+        dup = tool_check_duplicate(content, threshold=dedup_threshold)
+        if dup.get("is_duplicate"):
+            out["duplicates"].append({"room": room, "matches": dup.get("matches", [])})
+            continue
+        # On a dedup error (genuine index failure — content is guaranteed a
+        # string by the guard above) we still file rather than drop the
+        # memory: verbatim recall is the priority and add_drawer's own
+        # idempotency blocks exact duplicates.
+        res = tool_add_drawer(wing=wing, room=room, content=content, added_by="checkpoint")
+        if res.get("success"):
+            out["added"].append(res)
+        else:
+            out["errors"].append(res)
+    if diary is not None:
+        if not isinstance(diary, dict):
+            out["errors"].append({"diary": diary, "error": "diary must be an object"})
+        else:
+            entry = diary.get("entry") or diary.get("content")
+            if not isinstance(entry, str) or not entry:
+                out["errors"].append(
+                    {"diary": diary, "error": "diary entry must be a non-empty string"}
+                )
+            else:
+                out["diary"] = tool_diary_write(
+                    agent_name=diary.get("agent_name", "cursor-ide"),
+                    entry=entry,
+                    topic=diary.get("topic", "session-checkpoint"),
+                    wing=diary.get("wing", ""),
+                )
+    return out
 
 
 # ==================== MCP PROTOCOL ====================
@@ -3155,6 +3869,15 @@ TOOLS = {
                 },
                 "wing": {"type": "string", "description": "Filter by wing (optional)"},
                 "room": {"type": "string", "description": "Filter by room (optional)"},
+                "source_file": {
+                    "type": "string",
+                    "description": (
+                        "Filter to one exact source_file (optional). Matches the full "
+                        "stored path exactly (leading/trailing whitespace trimmed); no "
+                        "glob or basename matching. Pass the value from a result's "
+                        "'source_path' field; the displayed 'source_file' is only a basename."
+                    ),
+                },
                 "max_distance": {
                     "type": "number",
                     "description": "Max cosine distance threshold (0=identical, 2=opposite). Results further than this are dropped. Lower = stricter. Default 1.5. Set to 0 to disable.",
@@ -3275,6 +3998,52 @@ TOOLS = {
         },
         "handler": tool_add_drawer,
     },
+    "mempalace_checkpoint": {
+        "description": "Save a whole session in one call: semantic-dedups each item, files non-duplicates as drawers, then writes one diary entry. Use this instead of many separate check_duplicate/add_drawer/diary_write calls — it renders as a single tool-call card in the host UI.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "description": "Verbatim items to file. Each is {wing, room, content} — content is the exact words, never summarized.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "wing": {"type": "string", "description": "Wing (project name)"},
+                            "room": {
+                                "type": "string",
+                                "description": "Room (short topic: decisions, backend...)",
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "Verbatim content to store",
+                            },
+                        },
+                        "required": ["wing", "room", "content"],
+                    },
+                },
+                "diary": {
+                    "type": "object",
+                    "description": "Optional diary entry written after filing: {agent_name, entry, topic?, wing?}. entry is AAAK-format.",
+                    "properties": {
+                        "agent_name": {
+                            "type": "string",
+                            "description": "Agent name (e.g. cursor-ide)",
+                        },
+                        "entry": {"type": "string", "description": "Diary entry in AAAK format"},
+                        "topic": {"type": "string", "description": "Topic tag (optional)"},
+                        "wing": {"type": "string", "description": "Target wing (optional)"},
+                    },
+                },
+                "dedup_threshold": {
+                    "type": "number",
+                    "description": "Similarity threshold 0-1 for the per-item dedup check (default 0.9)",
+                },
+            },
+            "required": ["items"],
+        },
+        "handler": tool_checkpoint,
+    },
     "mempalace_delete_drawer": {
         "description": "Delete a drawer by ID. Irreversible.",
         "input_schema": {
@@ -3339,6 +4108,24 @@ TOOLS = {
             "required": ["source"],
         },
         "handler": tool_mine,
+    },
+    "mempalace_delete_by_source": {
+        "description": "Bulk-delete every drawer mined from one source_file (exact match). Use to clean up benchmark/test data accidentally mined into a user wing (#1722). Returns a dry-run match count and sample by default; pass dry_run=false to commit. Irreversible.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "source_file": {
+                    "type": "string",
+                    "description": "Exact source_file metadata value to remove (e.g. the full path that was mined)",
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Preview the match count without deleting; default true. Pass false to actually delete.",
+                },
+            },
+            "required": ["source_file"],
+        },
+        "handler": tool_delete_by_source,
     },
     "mempalace_sync": {
         "description": "Prune drawers whose source files are gitignored, deleted, or moved. Returns dry-run report by default; pass apply=true to commit deletions.",
@@ -3532,6 +4319,25 @@ def _internal_tool_error(req_id, tool_name: str, exc: BaseException = None) -> d
     }
 
 
+def _mcp_tool_preflight_refusal(req_id, tool_name: str):
+    """Run MCP request preflight gates outside handle_request complexity."""
+
+    sqlite_integrity_error = _mcp_sqlite_integrity_refusal(req_id, tool_name)
+    if sqlite_integrity_error is not None:
+        return sqlite_integrity_error
+
+    return _mcp_peer_writer_refusal(req_id, tool_name)
+
+
+def _decorate_mcp_tool_result(tool_name: str, result):
+    """Attach MCP transport-only diagnostics outside handle_request complexity."""
+
+    if tool_name == "mempalace_status" and isinstance(result, dict):
+        result.setdefault("sqlite_integrity", _sqlite_integrity_payload())
+
+    return result
+
+
 def handle_request(request):
     global _last_request_time
     if not isinstance(request, dict):
@@ -3650,6 +4456,10 @@ def handle_request(request):
                     "error": {"code": -32602, "message": f"Invalid value for parameter '{key}'"},
                 }
         tool_args.pop("wait_for_previous", None)
+        preflight_error = _mcp_tool_preflight_refusal(req_id, tool_name)
+        if preflight_error is not None:
+            return preflight_error
+
         # 'content' is an accepted alias for diary_write's 'entry' (callers often
         # reuse add_drawer's 'content' name). Map it in here, before dispatch, so a
         # content-only call still satisfies the required 'entry' param while the
@@ -3662,7 +4472,8 @@ def handle_request(request):
             if "entry" not in tool_args or tool_args["entry"] is None:
                 tool_args["entry"] = content_val
         try:
-            result = TOOLS[tool_name]["handler"](**tool_args)
+            result = _decorate_mcp_tool_result(tool_name, TOOLS[tool_name]["handler"](**tool_args))
+
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -3918,22 +4729,238 @@ def _start_idle_exit_watchdog() -> None:
     t.start()
 
 
-def main():
-    """MCP server entry point for the ``mempalace-mcp`` console script.
+def _json_rpc_parse_error(req_id=None):
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {"code": -32700, "message": "Parse error"},
+    }
 
-    Side effect: pops ``PYTHONPATH`` from ``os.environ`` (see #1423) so
-    any subprocess this server spawns inherits a clean env. Host
-    applications that call ``main()`` programmatically should be aware
-    that the parent process loses ``PYTHONPATH`` as well. Library imports
-    (``import mempalace.searcher`` from a host app) do NOT trigger this
-    side effect; only the CLI/MCP entry points pop the env var.
+
+# Module-level constants for the HTTP transport.
+# Defined here (not inside main()) so _serve_http() / _build_http_server()
+# can reference them as free names without a NameError.
+_HTTP_REQUEST_LOCK = threading.Lock()
+_HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
+# Host literals that always denote this machine. Used both to decide whether a
+# bind is loopback (skip the network-exposure warning) and to pin the Host
+# header against DNS rebinding when serving on loopback.
+_HTTP_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]")
+
+
+def _http_is_loopback(host: str) -> bool:
+    """Whether ``host`` binds only to this machine."""
+    return (host or "").strip().lower() in _HTTP_LOOPBACK_HOSTS
+
+
+def _http_allowed_host_values(bind_host: str, port: int) -> set:
+    """Host-header values accepted when Host pinning is enforced.
+
+    DNS-rebinding defense: a browser tricked into POSTing to ``127.0.0.1`` by a
+    malicious page still carries the *attacker's* domain in the ``Host`` header,
+    so we pin ``Host`` to the loopback literals (and the bound host) with and
+    without the port. Computed from the *actual* bound port so an ephemeral
+    ``port=0`` bind (tests) still matches.
     """
-    # Drop leaked PYTHONPATH so any subprocess this server spawns starts
-    # with a clean env. The sys.path filter in mempalace/__init__.py
-    # already protects this process from the same ABI mismatch; here we
-    # extend the protection to children.
-    os.environ.pop("PYTHONPATH", None)
+    names = set(_HTTP_LOOPBACK_HOSTS)
+    if bind_host:
+        names.add(bind_host.strip().lower())
+    values = set()
+    for name in names:
+        values.add(name)
+        values.add(f"{name}:{port}")
+    return values
+
+
+def _http_origin_allowed(origin: str) -> bool:
+    """Whether a browser ``Origin`` header may call the transport.
+
+    Non-browser MCP clients omit ``Origin`` entirely (allowed). When an
+    ``Origin`` *is* present it must be a loopback origin — this is what stops a
+    page at ``https://evil.example`` from reaching a DNS-rebound localhost
+    server and reading the palace.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        host = (urlparse(origin).hostname or "").strip().lower()
+    except Exception:
+        return False
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def _build_http_server(host: str, port: int):
+    """Construct (but do not start) the MCP HTTP server.
+
+    Split out from :func:`_serve_http` so tests can bind an ephemeral port,
+    exercise the *real* handler, and shut it down — the previous test reached
+    for Starlette/uvicorn (neither a dependency) and so was silently skipped in
+    CI. Returns a bound ``ThreadingHTTPServer`` whose request policy (Host
+    allowlist, Origin check, optional bearer token) is attached as attributes.
+    """
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlparse
+
+    auth_token = os.environ.get("MEMPALACE_MCP_HTTP_TOKEN", "").strip()
+
+    class _MCPHTTPServer(ThreadingHTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+    class _Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        timeout = 10
+
+        def log_message(self, fmt, *args):
+            logger.info("HTTP %s - " + fmt, self.client_address[0], *args)
+
+        def _send_bytes(self, status: int, body: bytes, content_type: str) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            self.close_connection = True
+
+        def _send_json(self, status: int, payload: dict) -> None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self._send_bytes(status, body, "application/json; charset=utf-8")
+
+        def _request_rejected(self, require_auth: bool) -> bool:
+            """Enforce the transport's access policy before any dispatch.
+
+            The palace is the most sensitive data MemPalace holds and ``/mcp``
+            is unauthenticated by default, so this guards the two ways a local
+            HTTP server leaks to the network: DNS rebinding (Host/Origin) and,
+            when the operator opts in, a missing/incorrect bearer token.
+            """
+            srv = self.server
+            if srv.enforce_host_pin:
+                host_hdr = (self.headers.get("Host") or "").strip().lower()
+                if host_hdr not in srv.allowed_hosts:
+                    logger.warning("HTTP request rejected: Host %r not allowed", host_hdr)
+                    self.send_error(403, "Forbidden")
+                    return True
+            origin = self.headers.get("Origin")
+            if origin and not _http_origin_allowed(origin):
+                logger.warning("HTTP request rejected: cross-origin %r", origin)
+                self.send_error(403, "Forbidden")
+                return True
+            if require_auth and srv.auth_token:
+                provided = self.headers.get("Authorization", "")
+                if not hmac.compare_digest(provided, f"Bearer {srv.auth_token}"):
+                    logger.warning("HTTP request rejected: missing/invalid bearer token")
+                    self.send_error(401, "Unauthorized")
+                    return True
+            return False
+
+        def do_GET(self):
+            # Liveness probe is policy-gated for Host/Origin but never requires
+            # the token, so an orchestrator's health check works without creds.
+            if self._request_rejected(require_auth=False):
+                return
+            path = urlparse(self.path).path
+            if path == "/healthz":
+                self._send_bytes(200, b"ok\n", "text/plain; charset=utf-8")
+                return
+
+            self.send_error(404, "Not Found")
+
+        def do_POST(self):
+            if self._request_rejected(require_auth=True):
+                return
+            path = urlparse(self.path).path
+            if path != "/mcp":
+                self.send_error(404, "Not Found")
+                return
+
+            try:
+                content_length = int(self.headers.get("Content-Length", "0") or "0")
+            except (TypeError, ValueError):
+                content_length = 0
+
+            if content_length < 0 or content_length > _HTTP_MAX_REQUEST_BYTES:
+                self._send_json(
+                    413,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32600, "message": "Request too large"},
+                    },
+                )
+                return
+
+            try:
+                raw = self.rfile.read(content_length)
+                request = json.loads(raw.decode("utf-8"))
+            except Exception as exc:
+                logger.warning("HTTP JSON-RPC read or parse error: %s", exc)
+                self._send_json(400, _json_rpc_parse_error())
+                return
+
+            # Preserve the single-process / single-palace-handle behavior that
+            # stdio deployments rely on. HTTP gives us a safer transport, not
+            # concurrent Chroma/HNSW mutation.
+            with _HTTP_REQUEST_LOCK:
+                response = handle_request(request)
+
+            if response is None:
+                # JSON-RPC notifications intentionally have no response body.
+                self.send_response(202)
+                self.send_header("Content-Length", "0")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                return
+
+            self._send_json(200, response)
+
+    httpd = _MCPHTTPServer((host, port), _Handler)
+    bound_port = httpd.server_address[1]
+    # Pin Host only on a loopback bind (the security-critical default). A
+    # deliberately network-exposed bind is the operator's call and may sit
+    # behind a proxy that rewrites Host, so we relax the pin there and lean on
+    # the Origin check + optional token instead.
+    httpd.enforce_host_pin = _http_is_loopback(host)
+    httpd.allowed_hosts = _http_allowed_host_values(host, bound_port)
+    httpd.auth_token = auth_token
+    return httpd
+
+
+def _serve_http(host: str, port: int) -> None:
+    """Serve JSON-RPC over HTTP in-process.
+
+    This transport intentionally reuses the same ``handle_request`` dispatcher
+    as stdio. The only change is the framing layer: HTTP mode avoids a
+    long-lived stdout pipe for operators who run MemPalace behind an HTTP MCP
+    client/proxy for days at a time.
+    """
+    try:
+        httpd = _build_http_server(host, port)
+    except OSError as exc:
+        logger.error("Failed to start MCP HTTP server on %s:%s: %s", host, port, exc)
+        sys.exit(1)
+
+    bound_port = httpd.server_address[1]
+    if not _http_is_loopback(host):
+        logger.warning(
+            "MemPalace MCP HTTP server bound to non-loopback host %s — the palace "
+            "is now reachable from the network and /mcp is unauthenticated unless "
+            "you set MEMPALACE_MCP_HTTP_TOKEN. Bind 127.0.0.1 to keep it local.",
+            host,
+        )
+    with httpd:
+        logger.info("MemPalace MCP HTTP server listening on http://%s:%s/mcp", host, bound_port)
+        try:
+            httpd.serve_forever(poll_interval=0.5)
+        except KeyboardInterrupt:
+            logger.info("MemPalace MCP HTTP server shutting down")
+
+
+def _run_stdio_loop() -> None:
     _restore_stdout()
+
     # Force UTF-8 on stdio. MCP JSON-RPC is UTF-8, but Python on Windows
     # defaults stdin/stdout to the system codepage (e.g. cp1251), which
     # corrupts non-ASCII payloads and surfaces as generic -32000 errors on
@@ -3944,28 +4971,37 @@ def main():
                 stream.reconfigure(encoding="utf-8", errors="replace")
             except (AttributeError, OSError):
                 pass
+
     logger.info("MemPalace MCP Server starting...")
+
     # Pre-flight: probe HNSW capacity before any tool call so the warning
     # is visible at startup rather than on first use (#1222). Pure
     # filesystem read; never opens a chromadb client.
+    _refresh_sqlite_integrity_status()
     _refresh_vector_disabled_flag()
+
     # Opt-in: pre-load the embedder so the first chromadb-write tool call
     # does not pay the ONNX/CoreML cold-load tax under the MCP client
     # timeout (#1495). Default off — preserves current startup latency.
     _maybe_eager_warmup_embedder()
+
     # Idle auto-exit: release ChromaDB file handles from stale servers
     # that outlived their Claude Code session (#1552).
     _start_idle_exit_watchdog()
+
     while True:
         try:
             line = sys.stdin.readline()
             if not line:
                 break
+
             line = line.strip()
             if not line:
                 continue
+
             request = json.loads(line)
             response = handle_request(request)
+
             if response is not None:
                 sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
                 sys.stdout.flush()
@@ -3973,6 +5009,66 @@ def main():
             break
         except Exception as e:
             logger.error(f"Server error: {e}")
+
+
+def _run_http_loop() -> None:
+    # In HTTP mode there is no JSON-RPC stdio channel. Keeping the import-time
+    # stdout->stderr guard in place means any accidental print from a dependency
+    # still cannot masquerade as an HTTP response.
+    logger.info("MemPalace MCP HTTP server starting...")
+
+    # The HTTP transport exists for long-lived deployments. Do the cheap
+    # filesystem-only probe before binding, but never make the listener wait on
+    # optional embedder/HNSW warmup. Operators and tests should see /healthz as
+    # soon as the process is alive.
+    _refresh_vector_disabled_flag()
+    _start_idle_exit_watchdog()
+
+    raw_warmup = os.environ.get("MEMPALACE_EAGER_WARMUP", "").strip().lower()
+    if raw_warmup in _WARMUP_TRUTHY:
+
+        def _warmup_with_lock():
+            with _HTTP_REQUEST_LOCK:
+                _maybe_eager_warmup_embedder()
+
+        threading.Thread(
+            target=_warmup_with_lock,
+            name="mcp-http-eager-warmup",
+            daemon=True,
+        ).start()
+    elif raw_warmup and raw_warmup not in _WARMUP_FALSY:
+        # Keep the same warning behavior as stdio mode for typo values.
+        _maybe_eager_warmup_embedder()
+
+    _serve_http(_args.host, _args.port)
+
+
+def main():
+    """MCP server entry point for the ``mempalace-mcp`` console script.
+
+    Side effect: pops ``PYTHONPATH`` from ``os.environ`` (see #1423) so any
+    subprocess this server spawns inherits a clean env. Host applications that
+    call ``main()`` programmatically should be aware that the parent process
+    loses ``PYTHONPATH`` as well. Library imports do NOT trigger this side
+    effect; only the CLI/MCP entry point does.
+
+    Transports:
+    - ``stdio`` remains the default for existing Claude/MCP deployments.
+    - ``http`` is opt-in and serves JSON-RPC POSTs at ``/mcp`` in the same
+      process, avoiding the long-lived stdio framing failure surface from
+      #1801.
+    """
+
+    # Drop leaked PYTHONPATH so any subprocess this server spawns starts
+    # with a clean env. The sys.path filter in mempalace/__init__.py
+    # already protects this process from the same ABI mismatch; here we
+    # extend the protection to children.
+    os.environ.pop("PYTHONPATH", None)
+
+    if _args.transport == "http":
+        _run_http_loop()
+    else:
+        _run_stdio_loop()
 
 
 if __name__ == "__main__":

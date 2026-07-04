@@ -312,6 +312,32 @@ def test_rebuild_index_empty_palace(mock_backend_cls, mock_shutil, tmp_path):
     mock_backend.delete_collection.assert_not_called()
 
 
+@patch("mempalace.repair.ChromaBackend")
+def test_rebuild_index_read_failure_points_to_from_sqlite(mock_backend_cls, tmp_path):
+    """A chromadb HNSW compactor failure makes the first ``count()`` read
+    raise; rebuild_index cannot recover it, so it must direct the user to
+    ``repair --mode from-sqlite`` (rows are intact in chroma.sqlite3) rather
+    than re-mining from source files, which drops MCP-added drawers (#1843)."""
+    sqlite3.connect(str(tmp_path / "chroma.sqlite3")).close()
+    mock_col = MagicMock()
+    mock_col.count.side_effect = Exception("Failed to apply logs to the hnsw segment writer")
+    mock_backend_cls.return_value.get_collection.return_value = mock_col
+    msgs: list[str] = []
+    repair.rebuild_index(palace_path=str(tmp_path), progress=msgs.append)
+    out = "\n".join(msgs)
+    assert "mempalace repair --mode from-sqlite --archive-existing" in out
+    assert "may need to be re-mined" not in out
+
+
+def test_index_read_recovery_guidance_recommends_from_sqlite():
+    """The shared guidance helper names the from-sqlite recovery command in
+    full and never tells the user the palace ``may need to be re-mined`` —
+    the harmful pre-#1843 advice that silently drops MCP-added drawers."""
+    msg = repair.index_read_recovery_guidance()
+    assert "mempalace repair --mode from-sqlite --archive-existing" in msg
+    assert "may need to be re-mined" not in msg
+
+
 @patch("mempalace.repair.shutil")
 @patch("mempalace.repair.ChromaBackend")
 def test_rebuild_index_success(mock_backend_cls, mock_shutil, tmp_path):
@@ -1995,3 +2021,26 @@ def test_rebuild_index_calls_vacuum(mock_backend_cls, mock_shutil, tmp_path):
         args, kwargs = mock_vacuum.call_args
         assert args[0] == str(tmp_path)
         assert "progress" in kwargs
+
+
+def test_rebuild_from_sqlite_preserves_knowledge_graph_sidecar(tmp_path):
+    """The from-sqlite repair path must not drop the KG SQLite sidecar."""
+    src = tmp_path / "source"
+    dest = tmp_path / "dest"
+    src.mkdir()
+    dest.mkdir()
+
+    (src / "knowledge_graph.sqlite3").write_text("kg-db", encoding="utf-8")
+    (src / "knowledge_graph.sqlite3-wal").write_text("kg-wal", encoding="utf-8")
+    (src / "knowledge_graph.sqlite3-shm").write_text("kg-shm", encoding="utf-8")
+
+    copied = repair._preserve_knowledge_graph_sqlite(str(src), str(dest))
+
+    assert copied == [
+        "knowledge_graph.sqlite3",
+        "knowledge_graph.sqlite3-wal",
+        "knowledge_graph.sqlite3-shm",
+    ]
+    assert (dest / "knowledge_graph.sqlite3").read_text(encoding="utf-8") == "kg-db"
+    assert (dest / "knowledge_graph.sqlite3-wal").read_text(encoding="utf-8") == "kg-wal"
+    assert (dest / "knowledge_graph.sqlite3-shm").read_text(encoding="utf-8") == "kg-shm"

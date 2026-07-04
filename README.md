@@ -226,8 +226,9 @@ Usage and tool reference:
 ## MCP server
 
 MCP tools cover palace reads/writes, knowledge-graph operations,
-cross-wing navigation, drawer management, agent diaries, and hierarchical
-search (`mempalace_search_hierarchical` — wing/room pruning before drawer
+cross-wing navigation, drawer management, agent diaries, batch
+checkpoint/bulk cleanup, and hierarchical search
+(`mempalace_search_hierarchical` — wing/room pruning before drawer
 scoring, useful for large palaces). Installation and the full tool list:
 [mempalaceofficial.com/reference/mcp-tools](https://mempalaceofficial.com/reference/mcp-tools.html).
 
@@ -286,7 +287,7 @@ PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 MIT — see [LICENSE](LICENSE).
 
 <!-- Link Definitions -->
-[version-shield]: https://img.shields.io/badge/version-3.4.1-4dc9f6?style=flat-square&labelColor=0a0e14
+[version-shield]: https://img.shields.io/badge/version-3.5.0-4dc9f6?style=flat-square&labelColor=0a0e14
 [release-link]: https://github.com/MemPalace/mempalace/releases
 [python-shield]: https://img.shields.io/badge/python-3.9+-7dd8f8?style=flat-square&labelColor=0a0e14&logo=python&logoColor=7dd8f8
 [python-link]: https://www.python.org/

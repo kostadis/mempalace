@@ -139,6 +139,159 @@ def test_sqlite_exact_get_preserves_requested_id_order_and_duplicates(tmp_path):
     assert result.documents == ["doc b", "doc a", "doc b"]
 
 
+def _doc_select_sql(col, action):
+    """Run ``action`` while tracing SQL; return (result, [documents SELECTs]).
+
+    The documents-table scan in ``_rows`` is the only statement that is both
+    ``FROM documents`` and ``ORDER BY rowid`` (``count`` lacks the ORDER BY),
+    so filtering on both isolates it from collection-id lookups and commits.
+    """
+    statements = []
+    conn = col._handle.conn
+    conn.set_trace_callback(statements.append)
+    try:
+        result = action()
+    finally:
+        conn.set_trace_callback(None)
+    selects = [s for s in statements if "FROM documents" in s and "ORDER BY rowid" in s]
+    return result, selects
+
+
+def _seed(col, n):
+    col.add(
+        ids=[f"d{i}" for i in range(n)],
+        documents=[f"doc {i}" for i in range(n)],
+        metadatas=[{"wing": "w", "n": i} for i in range(n)],
+        embeddings=[[float(i), 1.0] for i in range(n)],
+    )
+
+
+def test_sqlite_exact_get_unfiltered_page_pushes_limit_offset(tmp_path):
+    _backend, col = _collection(tmp_path)
+    _seed(col, 10)
+
+    result, selects = _doc_select_sql(
+        col, lambda: col.get(limit=3, offset=2, include=["documents"])
+    )
+
+    assert result.ids == ["d2", "d3", "d4"]
+    assert result.documents == ["doc 2", "doc 3", "doc 4"]
+    assert len(selects) == 1
+    assert "LIMIT" in selects[0]
+    assert "OFFSET" in selects[0]
+
+
+def test_sqlite_exact_get_filtered_page_stays_on_full_scan(tmp_path):
+    _backend, col = _collection(tmp_path)
+    _seed(col, 6)
+
+    # With a filter the rows are dropped after the scan, so LIMIT/OFFSET must
+    # not reach SQL; the page is taken in Python over the filtered rows.
+    result, selects = _doc_select_sql(
+        col,
+        lambda: col.get(where={"wing": "w"}, limit=2, offset=1, include=["metadatas"]),
+    )
+
+    assert result.ids == ["d1", "d2"]
+    assert len(selects) == 1
+    assert "LIMIT" not in selects[0]
+    assert "OFFSET" not in selects[0]
+
+
+def test_sqlite_exact_get_offset_only_and_limit_only_push(tmp_path):
+    _backend, col = _collection(tmp_path)
+    _seed(col, 5)
+
+    limit_only, limit_sql = _doc_select_sql(col, lambda: col.get(limit=2))
+    assert limit_only.ids == ["d0", "d1"]
+    assert len(limit_sql) == 1
+    assert "LIMIT" in limit_sql[0]
+    assert "OFFSET" not in limit_sql[0]
+
+    offset_only, offset_sql = _doc_select_sql(col, lambda: col.get(offset=3))
+    assert offset_only.ids == ["d3", "d4"]
+    assert len(offset_sql) == 1
+    assert "OFFSET" in offset_sql[0]
+    # SQLite requires a LIMIT before OFFSET; an offset-only page uses LIMIT -1.
+    assert "LIMIT" in offset_sql[0]
+
+
+def test_sqlite_exact_get_negative_bounds_use_python_slice(tmp_path):
+    _backend, col = _collection(tmp_path)
+    _seed(col, 5)
+
+    # Negative limit means Python "all but last", which a SQL LIMIT (negative ==
+    # unbounded in SQLite) cannot express, so it must stay on the slice path.
+    neg_limit, neg_limit_sql = _doc_select_sql(col, lambda: col.get(limit=-1))
+    assert neg_limit.ids == ["d0", "d1", "d2", "d3"]
+    assert len(neg_limit_sql) == 1
+    assert "LIMIT" not in neg_limit_sql[0]
+
+    # Negative offset means Python "last N"; it must not reach SQL either.
+    neg_offset, neg_offset_sql = _doc_select_sql(col, lambda: col.get(offset=-2))
+    assert neg_offset.ids == ["d3", "d4"]
+    assert len(neg_offset_sql) == 1
+    assert "OFFSET" not in neg_offset_sql[0]
+
+
+def test_sqlite_exact_get_pages_tile_without_overlap(tmp_path):
+    _backend, col = _collection(tmp_path)
+    _seed(col, 10)
+
+    seen = []
+    offset = 0
+    while True:
+        page = col.get(limit=4, offset=offset)
+        if not page.ids:
+            break
+        seen.extend(page.ids)
+        offset += len(page.ids)
+
+    assert seen == [f"d{i}" for i in range(10)]
+    # The same set, same rowid order, as a single unfiltered scan.
+    assert col.get().ids == seen
+
+
+def test_sqlite_exact_get_limit_zero_pushes_empty_page(tmp_path):
+    _backend, col = _collection(tmp_path)
+    _seed(col, 3)
+
+    # limit=0 is a real bound, not "no limit": it pushes LIMIT 0 and returns
+    # nothing, matching the old rows[:0] slice. Guards the `is not None` check
+    # against an `if limit:` regression that would treat 0 as unbounded.
+    result, selects = _doc_select_sql(col, lambda: col.get(limit=0))
+    assert result.ids == []
+    assert len(selects) == 1
+    assert "LIMIT" in selects[0]
+
+
+def test_sqlite_exact_get_offset_zero_is_a_full_scan(tmp_path):
+    _backend, col = _collection(tmp_path)
+    _seed(col, 3)
+
+    # offset=0 with no limit is not a page request, so it stays on the full scan.
+    result, selects = _doc_select_sql(col, lambda: col.get(offset=0))
+    assert result.ids == ["d0", "d1", "d2"]
+    assert len(selects) == 1
+    assert "LIMIT" not in selects[0]
+    assert "OFFSET" not in selects[0]
+
+
+def test_sqlite_exact_get_ids_with_page_slices_in_python(tmp_path):
+    _backend, col = _collection(tmp_path)
+    _seed(col, 5)
+
+    # ids force the Python path even with a page: the requested order is kept,
+    # then offset/limit slice the reordered list with no SQL LIMIT/OFFSET.
+    result, selects = _doc_select_sql(
+        col, lambda: col.get(ids=["d4", "d3", "d2", "d1"], offset=1, limit=2)
+    )
+    assert result.ids == ["d3", "d2"]
+    assert len(selects) == 1
+    assert "LIMIT" not in selects[0]
+    assert "OFFSET" not in selects[0]
+
+
 def test_sqlite_exact_upsert_delete_and_multi_collection_isolation(tmp_path):
     backend, drawers = _collection(tmp_path, "drawers")
     palace = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))

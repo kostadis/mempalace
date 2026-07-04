@@ -251,3 +251,43 @@ class TestClosetContentDoesNotRankPrimary:
             "Primary ordering must not change when a closet is added. "
             f"baseline={baseline_ids} after={after_ids}"
         )
+
+
+# ── source_file filter scopes both drawer and closet queries (#1815) ──────
+
+
+class TestSourceFileFilter:
+    def test_source_file_filter_excludes_other_sources(self, tmp_path):
+        palace = str(tmp_path / "palace")
+        _seed_drawers(palace)
+        result = search_memories(
+            "Kafka consumer rebalance timeout",
+            palace,
+            n_results=5,
+            source_file="fixture_D4.md",
+        )
+        ids = [h["source_file"] for h in result["results"]]
+        assert ids, "the matching source_file drawer should be returned"
+        assert set(ids) == {"fixture_D4.md"}
+
+    def test_source_file_filter_overrides_closet_boost_for_other_source(self, tmp_path):
+        # A strong closet pointing at D1 must NOT leak D1 in when the search
+        # is scoped to a different source_file — the where clause is applied
+        # to the closet query too, not just the drawer query.
+        palace = str(tmp_path / "palace")
+        _seed_drawers(palace)
+        _seed_strong_closet_for(
+            palace,
+            drawer_id="D1",
+            source_file="fixture_D1.md",
+            topics=["Kafka queue tuning", "consumer rebalance config"],
+        )
+        result = search_memories(
+            "Kafka consumer rebalance",
+            palace,
+            n_results=5,
+            source_file="fixture_D4.md",
+        )
+        ids = [h["source_file"] for h in result["results"]]
+        assert "fixture_D1.md" not in ids
+        assert set(ids) <= {"fixture_D4.md"}

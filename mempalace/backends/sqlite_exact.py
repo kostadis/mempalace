@@ -496,19 +496,32 @@ class SQLiteExactCollection(BaseCollection):
                 )
                 self._replace_fts(cur, collection_id, doc_id, doc)
 
-    def _rows(self, cur, *, where=None, where_document=None) -> list[dict]:
+    def _rows(self, cur, *, where=None, where_document=None, limit=None, offset=None) -> list[dict]:
         _validate_where(where)
         _validate_where(where_document)
         collection_id = self._collection_id(cur)
-        rows = cur.execute(
-            """
-            SELECT id, document, metadata_json, embedding
-            FROM documents
-            WHERE collection_id = ?
-            ORDER BY rowid
-            """,
-            (collection_id,),
-        ).fetchall()
+        sql = (
+            "SELECT id, document, metadata_json, embedding\n"
+            "FROM documents\n"
+            "WHERE collection_id = ?\n"
+            "ORDER BY rowid"
+        )
+        params = [collection_id]
+        # Emit SQL LIMIT/OFFSET only on an unfiltered page. With a
+        # where/where_document the post-filter loop below drops rows *after*
+        # this scan, so a SQL LIMIT/OFFSET would cut the wrong rows; those
+        # callers scan in full and paginate in Python. SQLite requires a LIMIT
+        # before OFFSET, so an offset-only page uses "LIMIT -1" (unbounded).
+        if where is None and where_document is None and (limit is not None or offset):
+            if limit is not None:
+                sql += "\nLIMIT ?"
+                params.append(int(limit))
+            elif offset:
+                sql += "\nLIMIT -1"
+            if offset:
+                sql += "\nOFFSET ?"
+                params.append(int(offset))
+        rows = cur.execute(sql, params).fetchall()
         out = []
         for doc_id, doc, meta_json, emb_blob in rows:
             meta = _json_loads(meta_json)
@@ -603,15 +616,33 @@ class SQLiteExactCollection(BaseCollection):
         include=None,
     ) -> GetResult:
         spec = _IncludeSpec.resolve(include, default_distances=False)
+        # Fast path for the common unfiltered page (e.g. the prefetch_mined_set
+        # and status sweeps): push LIMIT/OFFSET into the scan instead of
+        # materializing the whole collection and slicing in Python. Safe only
+        # with no post-filter (ids/where/where_document drop rows after the
+        # scan) and non-negative bounds: SQLite does not honor a negative LIMIT
+        # or OFFSET the way a Python slice does, so those keep the slice path.
+        push_page = (
+            ids is None
+            and where is None
+            and where_document is None
+            and (limit is None or limit >= 0)
+            and (offset is None or offset >= 0)
+            and (limit is not None or offset)
+        )
         with self._cursor() as cur:
-            rows = self._rows(cur, where=where, where_document=where_document)
-        if ids is not None:
-            by_id = {row["id"]: row for row in rows}
-            rows = [by_id[doc_id] for doc_id in ids if doc_id in by_id]
-        if offset:
-            rows = rows[offset:]
-        if limit is not None:
-            rows = rows[:limit]
+            if push_page:
+                rows = self._rows(cur, limit=limit, offset=offset)
+            else:
+                rows = self._rows(cur, where=where, where_document=where_document)
+        if not push_page:
+            if ids is not None:
+                by_id = {row["id"]: row for row in rows}
+                rows = [by_id[doc_id] for doc_id in ids if doc_id in by_id]
+            if offset:
+                rows = rows[offset:]
+            if limit is not None:
+                rows = rows[:limit]
         return GetResult(
             ids=[row["id"] for row in rows],
             documents=[row["document"] for row in rows] if spec.documents else [],
