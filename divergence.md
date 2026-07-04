@@ -1,14 +1,16 @@
-# Divergence: `kostadis-dev` vs upstream `v3.3.5`
+# Divergence: `kostadis-dev` vs upstream `v3.5.0`
 
-Context: `kostadis-dev` is a personal fork of MemPalace that started as a downstream branch of upstream `v3.3.4`. It accumulated 39 local commits before v3.3.5 was tagged upstream. PR #15 (`merge/v3.3.5-into-kostadis-dev`) brings v3.3.5 in. This document explains, for offline review and potential discussion with the upstream maintainers, where the two branches diverge and why.
+Context: `kostadis-dev` is a personal fork of MemPalace carrying **67 local commits** on top of upstream. It was brought current with upstream `v3.5.0` through a chain of five per-release merges on `merge/v3.5.0-into-kostadis-dev` — v3.3.6 (#25), v3.4.0 (#26), v3.4.1 (#27), v3.5.0 (#28) — tracked under issue #23. `version.py` = 3.5.0. This document explains, for offline review and potential discussion with the upstream maintainers, where the two branches diverge and why. (An earlier revision described the fork against v3.3.5; the seven structural divergences below originated there and **held unchanged through v3.5.0** — the local design absorbed each release's bugfixes without moving off its own shape. Sections 8–12 are new tensions that surfaced during the v3.4.0–v3.5.0 merges.)
 
-The divergence is not the merge — most of v3.3.5's 41 commits applied cleanly. The divergence is **structural**: a handful of v3.3.5 features were dropped, restructured, or replaced because the local branch had already moved in a different direction on the same surface area. This document enumerates those tensions.
+The divergence is not the merge — the bulk of upstream's 525-commit v3.3.5→v3.5.0 delta applied cleanly. The divergence is **structural**: a set of upstream features were dropped, restructured, or replaced because the local branch had already moved in a different direction on the same surface area. This document enumerates those tensions.
+
+> **A note on silent auto-merge defects.** Across all five merges, `git merge` repeatedly produced a *clean* (conflict-free) blend of a local-diverged file that was nonetheless *broken* — a dropped constant in `backends/chroma.py` (NameError, 15 failing tests), a poisoned `mcp_server.tool_reconnect`, dropped `_metadata_cache` scalar writes, a `tool_delete_by_source` writing a nonexistent global. Every one was caught only by running the full test suite plus a grep for references to removed symbols — never by the absence of conflict markers. Anyone repeating this kind of long-lived-fork merge should treat "no conflicts" as unproven, not safe.
 
 ---
 
 ## Local features that have no upstream counterpart
 
-These were built on `kostadis-dev` between v3.3.4 and the merge. None are upstream as of v3.3.5.
+These were built on `kostadis-dev` and had no upstream equivalent when they landed. By v3.5.0, three grew a parallel upstream implementation and are now reconciled rather than purely local — the **pluggable backend** (see §8, converged onto upstream), **Cursor integration** (§9, coexisting duplication), and **remote/multilingual embedding** (§10, unified); the table entries below are kept for provenance. The rest remain local-only through v3.5.0.
 
 | Area | Local feature | Why it was added |
 |---|---|---|
@@ -37,7 +39,7 @@ These were built on `kostadis-dev` between v3.3.4 and the merge. None are upstre
 
 ## Where the two branches structurally diverge
 
-These are the load-bearing differences — places where the same surface area has incompatible designs. The merge resolved each by keeping the local design and adapting v3.3.5's bugfixes into it. Re-aligning with upstream would require an architectural conversation, not a code change.
+These are the load-bearing differences — places where the same surface area has incompatible designs. Each merge (v3.3.6 → v3.5.0) resolved these by keeping the local design and adapting that release's bugfixes into it. Re-aligning with upstream would require an architectural conversation, not a code change. (Per-site "Upstream v3.3.5" descriptions below name the version where the divergence originated; each held through v3.5.0.)
 
 ### 1. Closet boosting on primary hits
 
@@ -104,30 +106,65 @@ The merge kept the local structure and ported v3.3.5's retry helper on top (`_ca
 
 **Open question for upstream**: convergence here is mostly tractable — both designs solve the same problem. Mainly a question of which monkeypatch contract to preserve for existing tests.
 
+### 8. Pluggable backend layer — CONVERGED on upstream (v3.4.0)
+
+Both branches independently built a pluggable backend layer on the shared v3.3.5 `backends/{base,chroma}.py`. Upstream shipped a full framework in v3.4.0 (`registry` + `pgvector`/`qdrant`/`sqlite_exact`/`embedding_wrapper`, RFC 001); the fork had added `turbovec` + `MEMPALACE_BACKEND` routing. **Resolution (user decision, the upstream RFC-001 work was done with the user's input): adopt upstream's framework.** This is the one place the fork deliberately gave up its own design. It was easy: `turbovec.py` already subclassed upstream's `BaseBackend`/`BaseCollection` and registered via a pyproject **entry point**, so almost no re-homing was needed. The only local retentions: chroma is registered **best-effort / imported lazily** (PEP 562 `__getattr__`) so a turbovec-only deploy never imports `chromadb` (fork #20); the new backends register eagerly (their heavy client deps import lazily inside methods). Not a standing divergence — the fork now tracks upstream here.
+
+### 9. Cursor / IDE integration: Python harness vs bash hooks (semantic duplication, not a conflict)
+
+The fork added Cursor support as a `cursor` harness inside `mempalace.hooks_cli` (Python) plus `hooks/mempal_cursor_*.sh`. Upstream added its own Cursor support in v3.4.1 under `hooks/cursor/*` (bash + `lib/common.sh`) and a `.cursor-plugin/`, plus Antigravity in the same release. These live on **different paths**, so they coexist without a git conflict — but the surface is duplicated and the design philosophy clashes (§5 all over again: Python module vs bash). Both were kept. **Open question for upstream**: fold the fork's Python multi-harness cursor path and upstream's bash `hooks/cursor/` into one.
+
+### 10. Embedding selection: provider-first vs model-first — UNIFIED (v3.3.6)
+
+The fork added **remote embedding providers** (`embedding_provider` = onnx/ollama/openai-compat — the DGX-Spark / LAN embedding path); upstream v3.3.6 added a **multilingual model selector** (`embedding_model` = minilm/embeddinggemma + `EmbeddinggemmaONNX`). Both reused the `embedding_model` config key with incompatible meaning. **Resolution (user decision): unify.** `embedding_provider` is the top-level switch; under `onnx`, `embedding_model` (case-insensitive) selects minilm vs embeddinggemma; under a remote provider it is the remote model name. Both capabilities preserved. The v3.4.1 embeddinggemma OOM sub-batching fix folded into the kept `EmbeddinggemmaONNX`. **Open question for upstream**: would a `embedding_provider` switch (onnx default) be acceptable, with the model selector nested under onnx?
+
+### 11. HNSW segment quarantine — CONVERGED on upstream (v3.4.0)
+
+The fork had diverged on chroma HNSW-segment health checks (fork #0991677 "don't quarantine unflushed metadata", #1532 tolerance). Upstream v3.4.0 refined the same logic to distinguish *never-persisted* (sub-threshold → healthy) from *partially-flushed-crashed* (→ quarantine) via `link_lists.bin` — which **subsumes** the fork's tolerance intent. Adopted upstream; local's blanket "missing pickle → healthy" early-return became redundant dead code and was dropped. Not a standing divergence.
+
+### 12. `mine --limit` semantics — OPEN divergence (deferred)
+
+Upstream v3.4.1 (#1535) defines `--limit N` as "stop after N files that produced **new** drawers." The fork's parallel miner applies `--limit N` as a **pre-slice** of the scanned file list. Concretely, `--limit 5` over a directory where 8 of 10 files are already mined yields 0 new drawers locally where upstream yields 2. The `#1535` limit tests are skipped (they patch the monolithic `process_file`, which the parallel consumer bypasses — §2). **This behavior difference is real and unresolved** — porting #1535 into the parallel consumer (as the chunk-cap #1455 port was done) is the fix. Tracked as a follow-up.
+
 ---
 
 ## Test impact
 
-After the merge, 2002 tests pass, 14 are skipped with documented reasons, 1 is deselected. The skips break down as:
+After the full v3.5.0 merge: **3366 pass, 65 skipped, 1 pre-existing failure**. Of the skips, ~48 are explicit `@pytest.mark.skip` (divergence-driven, below); the rest are environmental (`pytest.importorskip("turbovec")` — `turbovecdb` is an optional backend not installed in the merge venv — and similar `skipif`s). The divergence skips, by site:
 
-- **`test_hybrid_candidate_union.py` (11)** — entire file; tests v3.3.5's `candidate_strategy="union"` (§1).
-- **`test_searcher::test_effective_distance_clamped_to_valid_cosine_range` (1)** — v3.3.5's inline closet boost (§1).
-- **`test_miner::test_mine_arbitrary_exception_prints_summary_and_reraises` (1)** — patches `process_file` (§2).
-- **`test_save_hook_mines::test_mempal_dir_default_not_empty` (1)** — bash hook transcript fallback (§5).
-- **`test_sync::test_metadata_cache_cleared_on_exception` (1, deselected)** — patches removed `_metadata_cache` global (§3).
+- **`test_mcp_server.py` (~21)** — upstream-only MCP internals: KG-cache scalars `_kg_by_path` / `_canonicalize_kg_path` (§7), removed `_collection_cache` / `_metadata_cache` scalars and the SQLite status fast-path's default-only assumptions (§3), and palace-less-import tests that trip the `PalaceNotDeclared` loud-fail (§3).
+- **`test_miner.py` (~9)** + **`test_convo_miner*.py` (~4)** — tests that patch the monolithic `process_file` (§2), plus the v3.4.1 `#1535` `--limit` tests (§2 / §12).
+- **`test_hybrid_candidate_union.py` + `test_searcher`/`test_sqlite_exact_backend` union tests (~8)** — `candidate_strategy="union"`, `effective_distance`, inline closet-boost, multi-backend lexical capability reporting (§1).
+- **`test_sync.py` (~4)** — patch the removed `_metadata_cache` global (§3). (`test_metadata_cache_cleared_on_exception`, formerly a deselected/failing baseline, is now a clean `skip`.)
+- **`test_save_hook_mines.py` (2)** — bash-hook transcript fallback that now lives in the Python module (§5).
 
-None of these are "the code is broken" failures. They're "the test asserts an implementation that no longer exists" failures. Each skip has an inline `@pytest.mark.skip(reason=…)` annotation describing what the test asserted and what would be needed to restore it.
+The **1 remaining failure** is pre-existing (present at the pre-merge baseline, not introduced by any merge): `test_hook_chat_palace::test_every_mempalace_mine_call_targets_chat_palace` — it greps the bash hook for a literal `mempalace mine`, but the save logic lives in `mempalace.hooks_cli` (§5). Fixing it means updating the assertion to the Python code path.
+
+None of the skips are "the code is broken." They're "the test asserts an implementation that no longer exists." Each has an inline `@pytest.mark.skip(reason=…)` describing what it asserted and what restoring it would need.
 
 ---
 
 ## What this means for upstream collaboration
 
-Of the seven structural divergences:
+Of the divergences:
 
-- **§4 (lock reentrance)** is a candidate for an upstream PR with no architectural ask — it's a defensible bugfix even in a single-threaded mine, and it's needed by anyone who later wants parallel mining.
+- **§4 (lock reentrance)** is a candidate for an upstream PR with no architectural ask — a defensible bugfix even in a single-threaded mine, needed by anyone who later wants parallel mining.
 - **§7 (KG lazy cache)** is mostly converged; mainly a naming question.
 - **§6 (`.mempalaceignore`)** is small surface, additive, defensible upstream.
-- **§3 (palace addressability)** and **§1 (closet/primary split)** are the load-bearing local changes; they're the reason this fork exists in the first place. Worth a design conversation before any backport.
+- **§3 (palace addressability)** and **§1 (closet/primary split)** are the load-bearing local changes; they're the reason this fork exists. Worth a design conversation before any backport.
 - **§2 (parallel mine)** and **§5 (hooks architecture)** are pragmatic local choices that may or may not match upstream's roadmap.
+- **§8 (backends)** and **§11 (HNSW quarantine)** already converged onto upstream — no longer tensions.
+- **§9 (Cursor)** and **§10 (embedding)** are duplications/unifications, not backport candidates.
 
 Net suggestion for the upstream conversation: lead with §4 and §6 (small, mergeable, valuable), then propose §3 and §1 as design RFCs. The rest follows from those.
+
+---
+
+## Deferred follow-ups (open work, tracked here so nothing is silently dropped)
+
+None of these are regressions; each is a conscious "keep local / defer" from the v3.5.0 merge.
+
+1. **§12 `--limit` semantics** — port upstream #1535 ("stop after N *new*") into the parallel mine consumer; today's local `files[:limit]` pre-slice under-mines a partially-mined directory. Highest-value follow-up.
+2. **#1383 KG cache canonicalization** — upstream now keys the KG cache by `realpath`+`normcase` (collapses symlinked / case-variant palace paths); local `_kg_cache` still keys by `abspath`+`expanduser`. Port the canonicalization into the local dual-cache (§7).
+3. **§3 `is_default` status fast-path gating** — v3.5.0's SQLite status/overview fast-path reads the global `_config.palace_path`, so it is gated to the default palace; a cross-palace `palace=` query falls through to the client path. Revisit if the fast-path should be made palace-parameterized.
+4. **Turbovec MCP path — unverified end-to-end.** `mcp_server._get_collection` stays chroma-centric (§3); turbovec palaces are served through `palace.get_collection` (backend-routed) via the searcher / CLI-mine paths, not that MCP helper. The turbovec MCP status/search path could not be exercised here (`turbovecdb` not installed; `test_turbovec_backend.py` skips via `importorskip`). Since the chat palace runs on turbovec, verify direct MCP tools against a turbovec palace before relying on them.
