@@ -307,8 +307,11 @@ def cmd_init(args):
     # flag and always used ~/.mempalace. Mirror the env-var pattern used by
     # mcp_server.py so every downstream read of ``cfg.palace_path`` (Pass 0,
     # cfg.init(), the post-init mine) routes to the user-specified location.
+    # Route through ``_resolve_cli_palace`` so a palace *alias* resolves via
+    # the config alias map: treating it as a raw path silently created a new
+    # empty palace at ``$CWD/<alias>`` and initialized that instead.
     if getattr(args, "palace", None):
-        os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(os.path.expanduser(args.palace))
+        os.environ["MEMPALACE_PALACE_PATH"] = _resolve_cli_palace(args)
 
     cfg = MempalaceConfig()
 
@@ -1040,9 +1043,11 @@ def cmd_palace_set_embedder(args):
     from .palace import set_palace_embedder_identity
 
     config = MempalaceConfig()
-    palace_path = os.path.abspath(
-        os.path.expanduser(args.palace) if args.palace else config.palace_path
-    )
+    # ``_resolve_cli_palace`` (not a raw abspath) so a palace *alias* resolves
+    # via the config alias map. Reading --palace as a filesystem path silently
+    # created a new empty palace at ``$CWD/<alias>`` and recorded the identity
+    # there, leaving the real palace untouched and still reporting success.
+    palace_path = _resolve_cli_palace(args)
     model = getattr(args, "model", None)
     try:
         old, new = set_palace_embedder_identity(

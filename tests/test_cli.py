@@ -342,6 +342,74 @@ def test_cmd_init_honors_palace_flag(tmp_path, monkeypatch):
     assert os.environ.get("MEMPALACE_PALACE_PATH") == os.path.abspath(expected)
 
 
+def test_cmd_init_resolves_named_palace_alias(tmp_path, monkeypatch):
+    """``mempalace --palace <alias> init`` must resolve the alias through the
+    config alias map. ``cmd_init`` read ``--palace`` as a raw filesystem path,
+    so an alias created a brand-new empty palace at ``$CWD/<alias>`` and
+    initialized *that*, leaving the real palace untouched. Mirrors the fix
+    ``sync`` and ``repair-status`` already got — route through
+    ``_resolve_cli_palace``.
+    """
+    import json as _json
+
+    project = tmp_path / "project"
+    project.mkdir()
+    palace = tmp_path / "aliased_palace"
+    palace.mkdir()
+
+    # See test_cmd_init_honors_palace_flag for why setenv precedes delenv.
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", "")
+    monkeypatch.setenv("MEMPAL_PALACE_PATH", "")
+    monkeypatch.delenv("MEMPALACE_PALACE_PATH")
+    monkeypatch.delenv("MEMPAL_PALACE_PATH")
+
+    cfg_path = os.path.join(os.environ["HOME"], ".mempalace", "config.json")
+    os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+    original = open(cfg_path).read() if os.path.isfile(cfg_path) else None
+    cfg = _json.loads(original) if original else {}
+    cfg.setdefault("palaces", {})["init_test_alias"] = str(palace)
+    with open(cfg_path, "w") as f:
+        _json.dump(cfg, f)
+
+    # Run from a scratch CWD so a regression's ``$CWD/<alias>`` dir is visible.
+    workdir = tmp_path / "cwd"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+
+    args = argparse.Namespace(
+        dir=str(project),
+        palace="init_test_alias",
+        yes=True,
+        auto_mine=False,
+    )
+
+    captured = {}
+
+    def fake_pass_zero(project_dir, palace_dir, llm_provider):
+        captured["pass_zero_palace_dir"] = palace_dir
+        return None
+
+    try:
+        with (
+            patch("mempalace.entity_detector.scan_for_detection", return_value=[]),
+            patch("mempalace.room_detector_local.detect_rooms_local"),
+            patch("mempalace.cli._run_pass_zero", side_effect=fake_pass_zero),
+            patch("mempalace.cli._maybe_run_mine_after_init"),
+        ):
+            cmd_init(args)
+    finally:
+        if original is None:
+            os.remove(cfg_path)
+        else:
+            with open(cfg_path, "w") as f:
+                f.write(original)
+
+    assert captured["pass_zero_palace_dir"] == str(palace)
+    assert os.environ.get("MEMPALACE_PALACE_PATH") == str(palace)
+    # The smoking gun: pre-fix, the alias was treated as a relative path.
+    assert not (workdir / "init_test_alias").exists()
+
+
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_init_with_entities_zero_total(mock_config_cls, tmp_path, capsys):
     """When entities detected but total is 0, prints 'No entities' message."""
@@ -1736,6 +1804,63 @@ def test_cmd_repair_status_resolves_named_palace_alias(monkeypatch, tmp_path, ca
     finally:
         with open(cfg_path, "w") as f:
             f.write(original)
+
+
+def test_cmd_palace_set_embedder_resolves_named_palace_alias(tmp_path, monkeypatch):
+    """``mempalace --palace <alias> palace set-embedder`` must resolve the alias.
+
+    ``cmd_palace_set_embedder`` read ``--palace`` as a raw filesystem path, so
+    an alias created a brand-new empty palace at ``$CWD/<alias>``, recorded the
+    identity *there*, and still printed "recorded embedder identity" — a false
+    success that left the real palace unrecorded.
+    """
+    import json as _json
+
+    from mempalace import cli
+    from mempalace.backends.base import EmbedderIdentity
+
+    palace = tmp_path / "aliased_palace"
+    palace.mkdir()
+
+    cfg_path = os.path.join(os.environ["HOME"], ".mempalace", "config.json")
+    os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+    original = open(cfg_path).read() if os.path.isfile(cfg_path) else None
+    cfg = _json.loads(original) if original else {}
+    cfg.setdefault("palaces", {})["set_embedder_test_alias"] = str(palace)
+    with open(cfg_path, "w") as f:
+        _json.dump(cfg, f)
+
+    workdir = tmp_path / "cwd"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+
+    captured = {}
+
+    def fake_set(palace_path, model=None, *, force=False, backend=None, collection_name=None):
+        captured["palace_path"] = palace_path
+        return None, EmbedderIdentity(model_name="minilm", dimension=384)
+
+    monkeypatch.setattr("mempalace.palace.set_palace_embedder_identity", fake_set)
+
+    args = argparse.Namespace(
+        palace="set_embedder_test_alias",
+        model="minilm",
+        force=False,
+        backend=None,
+        global_backend=None,
+    )
+    try:
+        cli.cmd_palace_set_embedder(args)
+    finally:
+        if original is None:
+            os.remove(cfg_path)
+        else:
+            with open(cfg_path, "w") as f:
+                f.write(original)
+
+    assert captured["palace_path"] == str(palace)
+    # The smoking gun: pre-fix, the alias was treated as a relative path.
+    assert not (workdir / "set_embedder_test_alias").exists()
 
 
 # ── stdio reconfigure on Windows ─────────────────────────────────────
