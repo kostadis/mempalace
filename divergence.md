@@ -1,16 +1,16 @@
-# Divergence: `kostadis-dev` vs upstream `v3.5.0`
+# Divergence: `kostadis-dev` vs upstream `v3.6.0`
 
-Context: `kostadis-dev` is a personal fork of MemPalace carrying **67 local commits** on top of upstream. It was brought current with upstream `v3.5.0` through a chain of five per-release merges on `merge/v3.5.0-into-kostadis-dev` — v3.3.6 (#25), v3.4.0 (#26), v3.4.1 (#27), v3.5.0 (#28) — tracked under issue #23. `version.py` = 3.5.0. This document explains, for offline review and potential discussion with the upstream maintainers, where the two branches diverge and why. (An earlier revision described the fork against v3.3.5; the seven structural divergences below originated there and **held unchanged through v3.5.0** — the local design absorbed each release's bugfixes without moving off its own shape. Sections 8–12 are new tensions that surfaced during the v3.4.0–v3.5.0 merges.)
+Context: `kostadis-dev` is a personal fork of MemPalace carrying local commits on top of upstream (67 as of the v3.5.0 sync, per the previous revision of this document; more have landed since). It was brought current with upstream `v3.5.0` through a chain of five per-release merges tracked under issue #23, then with `v3.6.0` through a single direct merge (`v3.5.0` → `v3.6.0` has no intermediate tags) on `merge/v3.6.0-into-kostadis-dev`, tracked under issue #35. `version.py` = 3.6.0. This document explains, for offline review and potential discussion with the upstream maintainers, where the two branches diverge and why. (An earlier revision described the fork against v3.3.5; the seven structural divergences below originated there and **held unchanged through v3.6.0** — the local design absorbed each release's bugfixes without moving off its own shape. Sections 8–12 are tensions that surfaced during the v3.4.0–v3.5.0 merges; §13 covers what changed during the v3.6.0 merge.)
 
-The divergence is not the merge — the bulk of upstream's 525-commit v3.3.5→v3.5.0 delta applied cleanly. The divergence is **structural**: a set of upstream features were dropped, restructured, or replaced because the local branch had already moved in a different direction on the same surface area. This document enumerates those tensions.
+The divergence is not the merge — the bulk of upstream's v3.3.5→v3.6.0 delta (525 commits through v3.5.0, another 50 for v3.5.0→v3.6.0) applied cleanly. The divergence is **structural**: a set of upstream features were dropped, restructured, or replaced because the local branch had already moved in a different direction on the same surface area. This document enumerates those tensions.
 
-> **A note on silent auto-merge defects.** Across all five merges, `git merge` repeatedly produced a *clean* (conflict-free) blend of a local-diverged file that was nonetheless *broken* — a dropped constant in `backends/chroma.py` (NameError, 15 failing tests), a poisoned `mcp_server.tool_reconnect`, dropped `_metadata_cache` scalar writes, a `tool_delete_by_source` writing a nonexistent global. Every one was caught only by running the full test suite plus a grep for references to removed symbols — never by the absence of conflict markers. Anyone repeating this kind of long-lived-fork merge should treat "no conflicts" as unproven, not safe.
+> **A note on silent auto-merge defects.** Across all six merges to date, `git merge` repeatedly produced a *clean* (conflict-free) blend of a local-diverged file that was nonetheless *broken* — a dropped constant in `backends/chroma.py` (NameError, 15 failing tests), a poisoned `mcp_server.tool_reconnect`, dropped `_metadata_cache` scalar writes, a `tool_delete_by_source` writing a nonexistent global (all v3.5.0-era). The v3.6.0 merge added two more instances of the same pattern: `miner.py` calls added by upstream's new `exclude_patterns` feature referenced `GitignoreMatcher` (upstream's class name) when local had renamed the class to `IgnoreMatcher` back at §6's origin — `ruff check`'s `F821 Undefined name` caught it, not the test suite (nothing exercised those call paths). Same for `searcher.py`'s new CLI-level HNSW-divergence-aware `search()` (#2016), which referenced `resolve_backend_name`/`BackendMismatchError` that were never imported into that file. Every one of these six was caught only by running `ruff check` plus the full test suite plus a grep for references to removed/renamed symbols — never by the absence of conflict markers. Anyone repeating this kind of long-lived-fork merge should treat "no conflicts" as unproven, not safe, and should not skip the lint pass — two of six defects here were lint-only, invisible to tests because nothing called the broken code path.
 
 ---
 
 ## Local features that have no upstream counterpart
 
-These were built on `kostadis-dev` and had no upstream equivalent when they landed. By v3.5.0, three grew a parallel upstream implementation and are now reconciled rather than purely local — the **pluggable backend** (see §8, converged onto upstream), **Cursor integration** (§9, coexisting duplication), and **remote/multilingual embedding** (§10, unified); the table entries below are kept for provenance. The rest remain local-only through v3.5.0.
+These were built on `kostadis-dev` and had no upstream equivalent when they landed. By v3.6.0, three grew a parallel upstream implementation and are now reconciled rather than purely local — the **pluggable backend** (see §8, converged onto upstream), **Cursor integration** (§9, coexisting duplication), and **remote/multilingual embedding** (§10, unified); the table entries below are kept for provenance. The rest remain local-only through v3.6.0.
 
 | Area | Local feature | Why it was added |
 |---|---|---|
@@ -46,7 +46,7 @@ These are the load-bearing differences — places where the same surface area ha
 - **Upstream v3.3.5**: closets boost primary hits in a single rerank pool. `effective_distance = max(0, min(2, dist − boost))` with rank-based boosts (0.40, 0.25, 0.15, 0.08, 0.04). `candidate_strategy="union"` widens that pool by also pulling top-K BM25 candidates from sqlite.
 - **Local**: closets surface in a separate `themes` list. Primary is never boosted by closet rank ("Closet content does not influence `primary` ranking"). The rationale is that closets are an LLM-judgment layer, and a weak closet match shouldn't reshape the verbatim answer.
 
-The local design makes `candidate_strategy="union"` moot (there's no merged pool to apply it to) and removes the `effective_distance` / `closet_boost` / `matched_via` fields from primary hits.
+The local design makes `candidate_strategy="union"` moot (there's no merged pool to apply it to) and removes the `effective_distance` / `closet_boost` / `matched_via` fields from primary hits. **As of the v3.6.0 merge, the divergence went further**: the `_merge_bm25_union_candidates` / `_CANDIDATE_MERGERS` / `_validate_candidate_strategy` / `_apply_candidate_strategy` / `_finalize_candidate_hits` / `_vector_disabled_search` / `_open_search_collection` dispatch machinery that used to sit dormant-but-present in `searcher.py` (as of v3.5.0) has been fully removed from local — it doesn't exist at all anymore, not even as unreachable code. Upstream's v3.6.0 `search_memories` still carries and extends all of it (plus the new `authored_at` field, ported separately into local's `search_within`/`_bm25_only_via_sqlite` since that part is orthogonal to the boost-vs-split disagreement).
 
 **Open question for upstream**: would there be appetite for a `themes` list as an alternative output shape — preserving the v3.3.5 boost path as the default but offering the two-list split for callers (notably hierarchical search) that want clean separation?
 
@@ -57,6 +57,8 @@ The local design makes `candidate_strategy="union"` moot (there's no merged pool
 
 This forced one real impl change (§4 below). It also breaks any v3.3.5 test that patches `process_file` to inject behavior mid-mine.
 
+**v3.6.0 merge note**: upstream's serial `process_file` (project miner) and `_file_chunks_locked` (convo miner) gained real features this release — a symlink/size-safe `_read_text_no_follow`, `exclude_patterns` support, and the new `authored_at`/`entities_metadata()` conversation-chronology fields — that don't exist as functions in local anymore (fully replaced by `_prepare_file`/`_prepare_convo` + `_write_prepared*`). Each was ported into the local shape rather than dropped: `_read_text_no_follow` now backs `_prepare_file`'s read; `exclude_patterns` filtering was added to `_apply_exclude_patterns_to_prescanned_files` call sites; `_extract_authored_at` + `entities_metadata()` now feed `_prepare_convo`'s per-chunk metadata, including `source_mtime` (upstream's `_file_chunks_locked` stamps it too — without it, the new mtime-aware `file_already_mined(check_mtime=True)` gate would treat every conversation as changed on every run, since it couldn't find a stored mtime to compare against). Also ported: upstream's bulk `prefetch_mined_set()` pre-filter, wired into the producer closure as an in-memory short-circuit before `_prepare_convo`'s per-file DB check.
+
 **Open question for upstream**: parallelism is going to keep coming up as remote-embedding setups proliferate. Is there an appetite for adopting a pipeline harness upstream, or for at least extracting `process_file` into prep/embed/write stages so both serial and parallel callers can reuse them?
 
 ### 3. Palace addressability: implicit global vs explicit argument
@@ -66,18 +68,20 @@ This forced one real impl change (§4 below). It also breaks any v3.3.5 test tha
 
 The merge had to adapt v3.3.5's `_force_chroma_cache_reset()` and `tool_sync`'s `_metadata_cache = None` to write through `_invalidate_metadata_cache()` instead — the globals they targeted no longer exist.
 
+**v3.6.0 merge note**: two more upstream features landed on top of the dict-cache shape rather than replacing it — the new `_READ_ONLY` flag (`mempalace serve --read-only`) and Qdrant-facet-count fast path (`_supports_metadata_facets`) are orthogonal to palace addressability and applied cleanly. Separately, this merge found and fixed a real gap of the same *kind* as upstream's #1128 (Windows chromadb-handle leak): local's `_get_client`/`_get_collection` replaced a stale or errored cache entry's client with a fresh one without closing the old one first — same bug, just against the per-palace dict instead of upstream's scalar. Added `_close_cached_client()` and wired it into both invalidation sites plus the `_reset_mcp_cache` test fixture. Also extended the addressability principle one layer further: `miner._run_post_mine_analytics`/`convo_miner._compute_hallways_for_wing_safe` (topic tunnels, hallways, entity tunnels) now take a palace-scoped `config`/`palace_path` instead of building an ambient default `MempalaceConfig()`, matching upstream's own v3.6.0 fix for the same functions.
+
 **Open question for upstream**: this is the heaviest single divergence and the foundation of palace isolation. Upstream may have a different read on how to scope ChromaDB connection state across palaces. Worth a design conversation before any of this comes back upstream.
 
-### 4. `mine_palace_lock` reentrance: per-thread vs per-process
+### 4. `mine_palace_lock` reentrance: per-thread vs per-process — CONVERGED on upstream (v3.6.0)
 
 - **Upstream v3.3.5**: `_palace_lock_holders = threading.local()`. Re-entrance is per-thread.
-- **Local (post-merge)**: process-wide holder set under `threading.RLock`, refreshed on PID change. Re-entrance is per-process.
+- **Local (v3.5.0-era)**: process-wide holder set under `threading.RLock`, refreshed on PID change. Re-entrance is per-process.
 
-Necessary fix: v3.3.5 added `ChromaCollection._write_lock()` which acquires `mine_palace_lock` to protect MCP/direct callers against concurrent mines. In the local parallel pipeline, the consumer thread (which calls `collection.upsert` from inside `_write_prepared`) is NOT the orchestrator thread that took the outer `mine_palace_lock` from `mine()`. A per-thread reentrant set sends it down the `fcntl.flock` path, which fails because the same process already holds the lock on a different fd. Result: self-deadlock raised as `MineAlreadyRunning` mid-mine.
+Necessary fix (v3.5.0-era): v3.3.5 added `ChromaCollection._write_lock()` which acquires `mine_palace_lock` to protect MCP/direct callers against concurrent mines. In the local parallel pipeline, the consumer thread (which calls `collection.upsert` from inside `_write_prepared`) is NOT the orchestrator thread that took the outer `mine_palace_lock` from `mine()`. A per-thread reentrant set sends it down the `fcntl.flock` path, which fails because the same process already holds the lock on a different fd. Result: self-deadlock raised as `MineAlreadyRunning` mid-mine.
 
-The process-wide holder set is consistent with `fcntl.flock`'s actual scope (per-process, not per-thread).
+**v3.6.0**: upstream independently arrived at the same process-wide-not-per-thread fix, for a different trigger — the new MCP HTTP transport (`ThreadingHTTPServer`) dispatches each write request on a different worker thread than the one that acquired the writer lease, hitting the identical per-thread-credit bug. Upstream's version also adds a real fix local's v3.5.0-era holder set was missing: an `os.register_at_fork` handler that resets lock state in a forked child, closing a fork-inherited-locked-mutex deadlock window (a child forked while another thread held the guard would otherwise inherit it locked, with no thread able to release it). Adopted upstream's implementation wholesale (`_held_by_this_process`, `_palace_lock_guard`, `_palace_lock_keys`, the fork hook) — a new upstream test (`test_palace_locks.py`) already assumes this exact shape. Not a standing divergence anymore; the fork tracks upstream here.
 
-**Open question for upstream**: should `ChromaCollection._write_lock()` be a no-op when the current process already holds the outer mine lock, regardless of which thread acquired it? The "guard MCP against mine" contract still holds either way; the per-thread restriction was incidental.
+**Open question for upstream**: none — converged.
 
 ### 5. Hook architecture: bash script vs Python module
 
@@ -94,6 +98,8 @@ The v3.3.5 test `test_mempal_dir_default_not_empty` asserts the bash script has 
 - **Local**: `is_ignored(...)`, `load_ignore_matcher(...)`, parameter `respect_ignore=True`. The matcher reads `.mempalaceignore` if present, falls back to `.gitignore`.
 
 Aliased in the merge (`from .miner import is_ignored as is_gitignored, …`) so v3.3.5's new `sync.py` keeps working. The naming is the structural divergence — local says "what should mining ignore?" is its own question, not "what does git ignore?".
+
+**v3.6.0 merge note**: upstream extracted its inline gitignore-style parsing into a shared `_parse_rules()` staticmethod plus a new `from_patterns()` classmethod, to back the new `exclude_patterns` (`mempalace.yaml`) mining-exclusion feature. Ported the same extraction onto local's `IgnoreMatcher` (parameterized `from_dir(cls, dir_path, filename=MEMPALACEIGNORE)` now calls the shared `_parse_rules`), so `exclude_patterns` works under either ignore-filename convention. This is unrelated to §12 (`--limit`) — `exclude_patterns` filters the scanned file list before any per-file counting happens.
 
 **Open question for upstream**: would `.mempalaceignore` (with `.gitignore` fallback) be acceptable as the documented mining filter? It's a one-line config change for users who don't care, and a foothold for users who do.
 
@@ -126,21 +132,30 @@ The fork had diverged on chroma HNSW-segment health checks (fork #0991677 "don't
 
 Upstream v3.4.1 (#1535) defines `--limit N` as "stop after N files that produced **new** drawers." The fork's parallel miner applies `--limit N` as a **pre-slice** of the scanned file list. Concretely, `--limit 5` over a directory where 8 of 10 files are already mined yields 0 new drawers locally where upstream yields 2. The `#1535` limit tests are skipped (they patch the monolithic `process_file`, which the parallel consumer bypasses — §2). **This behavior difference is real and unresolved** — porting #1535 into the parallel consumer (as the chunk-cap #1455 port was done) is the fix. Tracked as a follow-up.
 
+### 13. v3.6.0 additive features — no new tension
+
+Landed cleanly on top of the existing 7 divergences, no structural conflict:
+
+- **Milvus storage backend** (`backends/milvus.py`) — registered eagerly alongside `turbovec`/`pgvector`/`qdrant` on upstream's registry (§8, still converged); `pymilvus` imports lazily inside methods, same pattern as the other non-chroma backends.
+- **KG `supersede()` / half-open interval semantics** — additive to `knowledge_graph.py`; no interaction with §7's cache-shape divergence.
+- **`mempalace serve` / HTTP transport / `write_routing.py`** — entirely new subsystem (remote/team server, bearer tokens, writer-lease recovery); additive, no local equivalent to reconcile against.
+- **Conversation `authored_at` + `entities_metadata()`** — see §1 and §2 notes above for how this was ported into local's already-diverged search/mining shapes.
+- **`exclude_patterns` mining exclusions** — see §6 note above.
+- **LaTeX (`.tex`/`.bib`) project file coverage** — additive to `READABLE_EXTENSIONS`; picked up automatically by both the serial and local parallel scanners since that set isn't part of any divergence.
+
 ---
 
 ## Test impact
 
-After the full v3.5.0 merge: **3366 pass, 65 skipped, 1 pre-existing failure**. Of the skips, ~48 are explicit `@pytest.mark.skip` (divergence-driven, below); the rest are environmental (`pytest.importorskip("turbovec")` — `turbovecdb` is an optional backend not installed in the merge venv — and similar `skipif`s). The divergence skips, by site:
+After the full v3.5.0 merge: 3366 pass, 65 skipped, 1 pre-existing failure. After the v3.6.0 merge (this document): **3620 pass, 76 skipped, 1 pre-existing failure** (`env -u MEMPALACE_BACKEND uv run pytest tests/ --ignore=tests/benchmarks`; the venv doesn't have `turbovecdb` installed and `MEMPALACE_BACKEND` must be unset or the process-wide `_DEFAULT_BACKEND` resolution at `palace.py` import time fails loudly instead of falling back). The skip categories are unchanged in kind from the v3.5.0 accounting above — same divergence sites (§1, §2/§12, §3, §5, §7), same `pytest.importorskip("turbovec")` environmental skips — the v3.6.0 merge did not re-run the per-file skip count in this pass; the file-by-file breakdown above is the last verified accounting and should be treated as illustrative, not current to the exact count.
 
-- **`test_mcp_server.py` (~21)** — upstream-only MCP internals: KG-cache scalars `_kg_by_path` / `_canonicalize_kg_path` (§7), removed `_collection_cache` / `_metadata_cache` scalars and the SQLite status fast-path's default-only assumptions (§3), and palace-less-import tests that trip the `PalaceNotDeclared` loud-fail (§3).
-- **`test_miner.py` (~9)** + **`test_convo_miner*.py` (~4)** — tests that patch the monolithic `process_file` (§2), plus the v3.4.1 `#1535` `--limit` tests (§2 / §12).
-- **`test_hybrid_candidate_union.py` + `test_searcher`/`test_sqlite_exact_backend` union tests (~8)** — `candidate_strategy="union"`, `effective_distance`, inline closet-boost, multi-backend lexical capability reporting (§1).
-- **`test_sync.py` (~4)** — patch the removed `_metadata_cache` global (§3). (`test_metadata_cache_cleared_on_exception`, formerly a deselected/failing baseline, is now a clean `skip`.)
-- **`test_save_hook_mines.py` (2)** — bash-hook transcript fallback that now lives in the Python module (§5).
+Two previously-failing tests were **new** in v3.6.0, not pre-existing regressions, and needed adapting to local's architecture rather than reverting anything: `test_mcp_server.py::TestMetadataFacets::test_tool_status_uses_metadata_facets` and `test_status_tool_does_not_acquire_peer_writer_lock` mocked `_get_collection`/`_tool_status_via_sqlite` with upstream's no-`palace_path`-arg signatures; updated the mocks to accept the local per-palace-arg signature (§3). `test_cli.py::test_cmd_repair_rebuild_index_alias_uses_sqlite_archive` (new) didn't configure `MempalaceConfig().resolve_palace()` on its mock, so `cmd_repair`'s local-only `_resolve_cli_palace` → `resolve_palace(alias-or-path)` step (§3) returned an unconfigured `MagicMock` instead of the test's real path; configured it, following the same pattern already established by a neighboring test's comment ("Local palace-isolation: cmd_repair resolves via `_resolve_cli_palace` → ...; configure it so the mocked config points at the test palace").
 
 The **1 remaining failure** is pre-existing (present at the pre-merge baseline, not introduced by any merge): `test_hook_chat_palace::test_every_mempalace_mine_call_targets_chat_palace` — it greps the bash hook for a literal `mempalace mine`, but the save logic lives in `mempalace.hooks_cli` (§5). Fixing it means updating the assertion to the Python code path.
 
 None of the skips are "the code is broken." They're "the test asserts an implementation that no longer exists." Each has an inline `@pytest.mark.skip(reason=…)` describing what it asserted and what restoring it would need.
+
+**Coverage regression, root-caused to upstream's new `milvus.py`, not this merge.** `--cov-fail-under` (CI runs 80%, `pyproject.toml`'s own default is 85%) is **not met** under a `pip install -e ".[dev]"`-only install (exactly what CI's three OS jobs run — none of them install `.[milvus]`, `.[pgvector]`, or `.[turbovec]`): total coverage measured **79.39%** (21822 stmts, 4497 missed). Root cause: `mempalace/backends/milvus.py` (new, 800 stmts) sits at **22%** covered in a `dev`-only venv — 623 of the 4497 total missed statements, ~14% of every miss in the whole codebase, come from this one new file. Installing the `milvus` extra to get a true reading hit a real environment snag, not a code issue: `uv sync --extra dev --extra milvus` installs cleanly (`pymilvus`, `milvus-lite`, `faiss-cpu`, `pandas`, `pyarrow`), but importing `mempalace.backends.milvus` then fails with `ImportError: cannot load module more than once per process` from numpy — a native-library load conflict from `faiss-cpu` (milvus-lite's vector search engine) fighting numpy's own native extension, unrelated to anything in this merge. Local's own `turbovec.py` (127 stmts, 4% covered — pre-existing, documented every cycle since v3.3.5, needs a sibling `../turbovecdb` checkout) makes it marginally worse, but is not the primary driver: removing turbovec.py's contribution from the sums entirely still leaves total coverage at ≈79.8%, still under the 80% CI gate. **This means CI's own `pip install -e ".[dev]"` matrix likely already sits under 80% on pure upstream v3.6.0**, independent of this fork — worth flagging upstream rather than chasing with new local tests for a file this fork doesn't own. Not treated as a merge-blocking regression here.
 
 ---
 
@@ -148,15 +163,15 @@ None of the skips are "the code is broken." They're "the test asserts an impleme
 
 Of the divergences:
 
-- **§4 (lock reentrance)** is a candidate for an upstream PR with no architectural ask — a defensible bugfix even in a single-threaded mine, needed by anyone who later wants parallel mining.
 - **§7 (KG lazy cache)** is mostly converged; mainly a naming question.
 - **§6 (`.mempalaceignore`)** is small surface, additive, defensible upstream.
 - **§3 (palace addressability)** and **§1 (closet/primary split)** are the load-bearing local changes; they're the reason this fork exists. Worth a design conversation before any backport.
 - **§2 (parallel mine)** and **§5 (hooks architecture)** are pragmatic local choices that may or may not match upstream's roadmap.
-- **§8 (backends)** and **§11 (HNSW quarantine)** already converged onto upstream — no longer tensions.
+- **§4 (lock reentrance)**, **§8 (backends)**, and **§11 (HNSW quarantine)** already converged onto upstream — no longer tensions.
 - **§9 (Cursor)** and **§10 (embedding)** are duplications/unifications, not backport candidates.
+- **§13 (v3.6.0 additive features)** — no local design to reconcile; adopted as-is.
 
-Net suggestion for the upstream conversation: lead with §4 and §6 (small, mergeable, valuable), then propose §3 and §1 as design RFCs. The rest follows from those.
+Net suggestion for the upstream conversation: lead with §6 (small, mergeable, valuable — §4 already converged), then propose §3 and §1 as design RFCs. The rest follows from those.
 
 ---
 

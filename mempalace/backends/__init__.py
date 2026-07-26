@@ -36,8 +36,9 @@ from .base import (
     UnsupportedMaintenanceKindError,
 )
 # Chroma is imported lazily below (PEP 562 __getattr__) so it stays optional.
-# pgvector/qdrant/sqlite_exact import their heavy client deps lazily inside
-# methods, so importing their classes here is cheap and safe on any deploy.
+# pgvector/qdrant/sqlite_exact/milvus import their heavy client deps lazily
+# inside methods, so importing their classes here is cheap and safe on any deploy.
+from .milvus import MilvusBackend, MilvusCollection
 from .pgvector import PgVectorBackend, PgVectorCollection
 from .qdrant import QdrantBackend, QdrantCollection
 from .sqlite_exact import SQLiteExactBackend, SQLiteExactCollection
@@ -82,6 +83,8 @@ __all__ = [
     "LexicalHit",
     "LexicalResult",
     "MaintenanceResult",
+    "MilvusBackend",
+    "MilvusCollection",
     "PalaceNotFoundError",
     "PalaceRef",
     "PgVectorBackend",
