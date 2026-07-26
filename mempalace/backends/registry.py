@@ -210,19 +210,22 @@ def resolve_backend_for_palace(
 def _register_builtins() -> None:
     """Register the in-tree backends. Chroma is best-effort.
 
-    pgvector/qdrant/sqlite_exact import their heavy client deps lazily (inside
-    methods), so importing their backend classes here is safe even when those
-    deps are absent. Chroma is the exception: a turbovec-only deployment neither
-    needs nor installs a working ``chromadb``, and its import can fail on broken
-    transitive deps — so it is registered best-effort and its failure must not
-    take down the whole registry (other backends, incl. turbovec via entry
-    points, still resolve).
+    pgvector/qdrant/sqlite_exact/milvus import their heavy client deps lazily
+    (inside methods), so importing their backend classes here is safe even
+    when those deps are absent. Chroma is the exception: a turbovec-only
+    deployment neither needs nor installs a working ``chromadb``, and its
+    import can fail on broken transitive deps — so it is registered
+    best-effort and its failure must not take down the whole registry (other
+    backends, incl. turbovec via entry points, still resolve).
     """
+    from .milvus import MilvusBackend
     from .pgvector import PgVectorBackend
     from .qdrant import QdrantBackend
     from .sqlite_exact import SQLiteExactBackend
 
     # Use setdefault semantics so a caller that pre-registered for tests wins.
+    if "milvus" not in _registry:
+        _registry["milvus"] = MilvusBackend
     if "qdrant" not in _registry:
         _registry["qdrant"] = QdrantBackend
     if "sqlite_exact" not in _registry:
