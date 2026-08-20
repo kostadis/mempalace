@@ -11,11 +11,35 @@ These tests pin the load-bearing invariants of the two-tier shape:
 """
 
 from mempalace.palace import (
+    get_backend_for_palace,
     get_closets_collection,
     get_collection,
     upsert_closet_lines,
 )
 from mempalace.searcher import _hybrid_rank, search_memories
+
+
+def _close_palace(palace_path: str) -> None:
+    """Release chromadb client handles so the next open rebuilds from disk.
+
+    Windows CI intermittently returns zero hybrid hits right after a fast
+    seed write (same class of flake as "Nothing found on disk" on tiny
+    closet collections). Closing the cached client forces the next
+    ``search_memories`` open to re-read segments that have been flushed.
+    """
+    try:
+        get_backend_for_palace(palace_path).close_palace(palace_path)
+    except Exception:
+        pass
+
+
+def _search(query: str, palace: str, **kwargs):
+    """Search, retrying once after a client reopen if results are empty."""
+    result = search_memories(query, palace, **kwargs)
+    if result.get("results"):
+        return result
+    _close_palace(palace)
+    return search_memories(query, palace, **kwargs)
 
 
 def _seed_drawers(palace_path):
@@ -36,6 +60,7 @@ def _seed_drawers(palace_path):
             {"wing": "backend", "room": "queue", "source_file": "fixture_D4.md"},
         ],
     )
+    _close_palace(palace_path)
 
 
 def _seed_strong_closet_for(palace_path, drawer_id, source_file, topics):
@@ -53,6 +78,22 @@ def _seed_strong_closet_for(palace_path, drawer_id, source_file, topics):
             "generated_by": "test",
         },
     )
+    # Keep this fixture above Chroma's batch_size=2 persistence floor. A
+    # single-row closet collection can intermittently query as "Nothing found on
+    # disk" on Windows when the deterministic test embedder makes writes fast.
+    col.upsert(
+        ids=[f"closet_{drawer_id}_sentinel"],
+        documents=["test sentinel unrelated stabilization topic"],
+        metadatas=[
+            {
+                "wing": "backend",
+                "room": "auth",
+                "source_file": f"{source_file}#sentinel",
+                "generated_by": "test",
+            }
+        ],
+    )
+    _close_palace(palace_path)
 
 
 # ── primary is closet-immune ──────────────────────────────────────────────
@@ -62,7 +103,8 @@ class TestPrimaryIsClosetImmune:
     def test_no_closets_returns_pure_drawer_ranking(self, tmp_path):
         palace = str(tmp_path / "palace")
         _seed_drawers(palace)
-        result = search_memories("Kafka rebalance timeout", palace, n_results=3)
+        # No closets created.
+        result = _search("Kafka rebalance timeout", palace, n_results=3)
         ids = [h["source_file"] for h in result["primary"]]
         assert ids, "primary should return drawer hits"
         assert "fixture_D4.md" in ids, "Kafka drawer must surface in primary"
@@ -129,12 +171,39 @@ class TestThemesLayer:
         assert "generated_by" in top
         assert "drawer_ids" in top
 
+
+# ── closet_boost metadata ────────────────────────────────────────────────
+
+
+class TestClosetMetadata:
+    def test_closet_preview_exposed_when_boosted(self, tmp_path):
+        """Same invariant as test_themes_present_when_closets_exist, pinned
+        under its own class/name for #1580-era callers that look it up here.
+        """
+        palace = str(tmp_path / "palace")
+        _seed_drawers(palace)
+        _seed_strong_closet_for(
+            palace,
+            drawer_id="D1",
+            source_file="fixture_D1.md",
+            topics=["JWT auth tokens", "session expiry", "authentication service"],
+        )
+        result = _search("JWT auth tokens expiry", palace, n_results=2)
+        assert result["themes"], "themes block should be populated"
+        top = result["themes"][0]
+        assert top["source_file"] == "fixture_D1.md"
+        assert "closet_text" in top
+        assert "similarity" in top
+        assert "generated_by" in top
+        assert "drawer_ids" in top
+
     def test_themes_empty_when_no_closets(self, tmp_path):
         """A palace with zero closet rows returns ``themes: []`` (not an error).
 
         Required by docs/design/two-tier-retrieval.md."""
         palace = str(tmp_path / "palace")
         _seed_drawers(palace)
+        # No closets
         result = search_memories("TanStack Query", palace, n_results=2)
         assert result["primary"], "primary should still have hits"
         assert result["themes"] == []
@@ -260,7 +329,7 @@ class TestSourceFileFilter:
     def test_source_file_filter_excludes_other_sources(self, tmp_path):
         palace = str(tmp_path / "palace")
         _seed_drawers(palace)
-        result = search_memories(
+        result = _search(
             "Kafka consumer rebalance timeout",
             palace,
             n_results=5,
@@ -282,7 +351,7 @@ class TestSourceFileFilter:
             source_file="fixture_D1.md",
             topics=["Kafka queue tuning", "consumer rebalance config"],
         )
-        result = search_memories(
+        result = _search(
             "Kafka consumer rebalance",
             palace,
             n_results=5,

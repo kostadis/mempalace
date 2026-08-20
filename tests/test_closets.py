@@ -1495,9 +1495,10 @@ class TestDrawerGrepExpansion:
         ``source_file + chunk_index`` pulls chunks from both groups as if
         they were sequential neighbors, corrupting the enriched text.
         Scoping by ``parent_drawer_id`` when present keeps each logical
-        group isolated. (``tool_diary_write`` chunks tag a different key
-        (``parent_entry_id``) and are written without ``source_file``, so
-        they never reach this enrichment path.)
+        group isolated. (``tool_diary_write`` chunks are written without
+        ``source_file``, so they never reach this enrichment path at all --
+        it returns early on the missing key -- regardless of which
+        parent-id key they carry.)
         """
         col = get_collection(palace_path)
         source = "shared.log"
@@ -1591,6 +1592,128 @@ class TestDrawerGrepExpansion:
         assert "chunk_1" in text
         assert "chunk_2" in text
         assert "chunk_3" in text
+
+    @pytest.mark.skip(
+        reason="Tests upstream's closet-boosted primary hits (matched_via == "
+        "'drawer+closet' on result['results']). The local search_within design "
+        "(divergence.md's closet-boosting divergence) keeps closets in a "
+        "separate `themes` list, never "
+        "boosts `primary` by closet rank, and search_memories returns that "
+        "primary/themes shape rather than a flat `results` list — so this "
+        "scenario cannot be reproduced against the local implementation."
+    )
+    def test_hybrid_search_enrichment_isolates_chunks_across_drawers_sharing_source_file(
+        self, palace_path
+    ):
+        """End-to-end for #1580. Two oversized add_drawer-shape groups
+        share a ``source_file``, a closet boosts that source, and the
+        ranked hit lands on group A. The enrichment step in
+        ``search_memories`` must return only group A's text, not a mix
+        of A and B chunks stitched as if they were sequential context.
+        """
+        col = get_collection(palace_path)
+        source = "/proj/shared_log.md"
+        # Group A: 2 chunks under parent_drawer_id "drawer_proj_log_aaa".
+        col.upsert(
+            ids=[
+                "drawer_proj_log_aaa_chunk_000000",
+                "drawer_proj_log_aaa_chunk_000001",
+            ],
+            documents=[
+                "alpha JWT authentication flow",
+                "alpha continues the auth narrative",
+            ],
+            metadatas=[
+                {
+                    "wing": "proj",
+                    "room": "log",
+                    "source_file": source,
+                    "chunk_index": 0,
+                    "parent_drawer_id": "drawer_proj_log_aaa",
+                    "filed_at": "2026-04-13T00:00:00",
+                },
+                {
+                    "wing": "proj",
+                    "room": "log",
+                    "source_file": source,
+                    "chunk_index": 1,
+                    "parent_drawer_id": "drawer_proj_log_aaa",
+                    "filed_at": "2026-04-13T00:00:00",
+                },
+            ],
+        )
+        # Group B: 2 chunks under the SAME source_file but a different
+        # parent_drawer_id, with content unrelated to the JWT query.
+        col.upsert(
+            ids=[
+                "drawer_proj_log_bbb_chunk_000000",
+                "drawer_proj_log_bbb_chunk_000001",
+            ],
+            documents=[
+                "bravo unrelated topic about database migrations",
+                "bravo continues with PostgreSQL specifics",
+            ],
+            metadatas=[
+                {
+                    "wing": "proj",
+                    "room": "log",
+                    "source_file": source,
+                    "chunk_index": 0,
+                    "parent_drawer_id": "drawer_proj_log_bbb",
+                    "filed_at": "2026-04-13T00:00:00",
+                },
+                {
+                    "wing": "proj",
+                    "room": "log",
+                    "source_file": source,
+                    "chunk_index": 1,
+                    "parent_drawer_id": "drawer_proj_log_bbb",
+                    "filed_at": "2026-04-13T00:00:00",
+                },
+            ],
+        )
+        # Closet pointing at group A's first chunk for this source.
+        closets = get_closets_collection(palace_path)
+        closets.upsert(
+            ids=["closet_proj_log_aaa_01"],
+            documents=["JWT auth|;|→drawer_proj_log_aaa_chunk_000000"],
+            metadatas=[{"wing": "proj", "room": "log", "source_file": source}],
+        )
+
+        result = search_memories("JWT authentication", palace_path)
+        # Surface the full envelope when search fails (Windows CI has flaked
+        # with KeyError on a bare ``result["results"]`` after a mid-query
+        # error dict that lacked the key).
+        assert "results" in result, f"search envelope missing results: {result!r}"
+        assert result["results"], f"hybrid search returned no hits: {result!r}"
+        assert "error" not in result, f"hybrid search failed: {result!r}"
+        boosted = [h for h in result["results"] if h["matched_via"] == "drawer+closet"]
+        assert boosted, "hybrid search should mark the closet-agreeing source"
+        top = boosted[0]
+        text = top["text"]
+        # Group A's content is present.
+        assert "alpha" in text
+        # Group B's content must not leak in through the shared source_file
+        # key. The enrichment loop fetches sibling chunks for the matched
+        # source, and prior to #1580 that fetch ignored parent_drawer_id.
+        assert "bravo" not in text, (
+            "neighbor enrichment leaked group B's chunks through the shared "
+            "source_file key (see #1580)"
+        )
+        # total_drawers on the enriched hit is scoped to the matched
+        # parent group (2 chunks in group A), not the full source_file
+        # row count (4 across both groups). Pins the scoping contract on
+        # the live enrichment path, not just the helper.
+        assert top["total_drawers"] == 2
+        # Internal scoring-loop keys must be scrubbed before results are
+        # returned to MCP callers. ``_parent_drawer_id`` is added during
+        # the #1580 fix and popped in the final cleanup loop alongside
+        # the existing internal keys.
+        for h in result["results"]:
+            assert "_parent_drawer_id" not in h
+            assert "_source_file_full" not in h
+            assert "_chunk_index" not in h
+            assert "_sort_key" not in h
 
     def test_expand_isolates_asymmetric_groups_under_shared_source_file(self, palace_path):
         """Asymmetric coverage: group A has 1 chunk, group B has 3 chunks
