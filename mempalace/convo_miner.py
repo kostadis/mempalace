@@ -8,6 +8,8 @@ Normalizes format, chunks by exchange pair (Q+A = one unit), files to palace.
 Same palace as project mining. Different ingest strategy.
 """
 
+import errno
+import hashlib
 import os
 import sys
 import json
@@ -19,9 +21,15 @@ from datetime import datetime
 from collections import defaultdict
 from typing import Optional
 
+from .backends import PalaceNotFoundError
 from .collision_scan import assert_no_collisions
 from .config import MempalaceConfig
-from .ids import ID_RECIPE, make_convo_drawer_id, make_convo_sentinel_id
+from .ids import (
+    ID_RECIPE,
+    make_convo_drawer_id,
+    make_convo_sentinel_id,
+    make_exchange_drawer_id,
+)
 from .normalize import normalize
 from .entities import entities_metadata
 from .palace import (
@@ -33,6 +41,7 @@ from .palace import (
     get_collection,
     mine_lock,
     mine_palace_lock,
+    prefetch_content_hashes,
     prefetch_mined_set,
 )
 from .parallel import ParallelPipeline, WorkerResult
@@ -58,6 +67,82 @@ def _detect_hall_cached(content: str) -> str:
         if score > 0:
             scores[hall] = score
     return max(scores, key=scores.get) if scores else "general"
+
+
+def file_conversation_exchange(
+    collection,
+    *,
+    wing: str,
+    room: str,
+    text: str,
+    source_file: str,
+    agent: str,
+    authored_at: Optional[str] = None,
+    extra_metadata: Optional[dict] = None,
+) -> Optional[str]:
+    """File one verbatim conversation exchange as a single drawer.
+
+    Canonical write path for live agent integrations (e.g. Hermes) and
+    their backfills — both must route here so routing, normalization,
+    and metadata conventions stay identical between live and historical
+    ingest. Builds the same metadata the convo miner writes so hallway
+    traversal, entity search, and since/before date filters see
+    integration drawers exactly like mined ones.
+
+    ``wing`` and ``room`` are validated with the same ``sanitize_name``
+    rules the MCP write tools apply, but a failed name falls back
+    (``wing_general`` / ``conversations``) instead of erroring: this
+    path files *live* turns, and dropping a turn over a config typo
+    would break the verbatim / 100%-recall promise. The fallback is
+    logged at warning level so the misconfiguration is visible.
+
+    ``extra_metadata`` lets callers append integration-specific fields
+    (e.g. ``source`` / ``session_id``); keys that collide with the
+    canonical fields are ignored, so it cannot be used to overwrite or
+    drop them. Returns the drawer id, or None when ``text`` is empty
+    after stripping.
+    """
+    from .config import sanitize_name
+
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        wing = sanitize_name(wing, "wing")
+    except ValueError:
+        logger.warning(
+            "file_conversation_exchange: invalid wing %r — filing under wing_general", wing
+        )
+        wing = "wing_general"
+    try:
+        room = sanitize_name(room, "room")
+    except ValueError:
+        logger.warning(
+            "file_conversation_exchange: invalid room %r — filing under conversations", room
+        )
+        room = "conversations"
+    filed_at = datetime.now().isoformat()
+    drawer_id = make_exchange_drawer_id(wing, room, source_file, filed_at, text)
+    metadata = {
+        "wing": wing,
+        "room": room,
+        "hall": _detect_hall_cached(text),
+        "source_file": source_file,
+        "chunk_index": 0,
+        "added_by": agent,
+        "filed_at": filed_at,
+        "entities": entities_metadata(text),
+        "authored_at": authored_at if authored_at is not None else filed_at,
+        "ingest_mode": "convos",
+        "extract_mode": "exchange",
+        "normalize_version": NORMALIZE_VERSION,
+        "id_recipe": ID_RECIPE,
+    }
+    if extra_metadata:
+        for key, value in extra_metadata.items():
+            metadata.setdefault(key, value)
+    collection.upsert(ids=[drawer_id], documents=[text], metadatas=[metadata])
+    return drawer_id
 
 
 # File types that might contain conversations
@@ -106,10 +191,20 @@ def _path_within_root(path: Path, root: Path) -> bool:
 def _is_regular_source_file(filepath: Path, root: Path) -> bool:
     if not _path_within_root(filepath, root):
         return False
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # O_NONBLOCK keeps the S_ISREG verdict below reachable: a blocking open
+    # of a FIFO waits in the kernel for a writer, so a named pipe called
+    # ``session.jsonl`` would hang this check instead of failing it. See the
+    # matching comment in ``miner._read_text_no_follow``, including why the
+    # EAGAIN branch re-checks the type and then opens without the flag.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     fd = -1
     try:
-        fd = os.open(filepath, flags)
+        try:
+            fd = os.open(filepath, flags)
+        except OSError as exc:
+            if exc.errno != errno.EAGAIN or not stat.S_ISREG(os.lstat(filepath).st_mode):
+                raise
+            fd = os.open(filepath, flags & ~getattr(os, "O_NONBLOCK", 0))
         st = os.fstat(fd)
         return stat.S_ISREG(st.st_mode) and st.st_size <= MAX_FILE_SIZE
     except OSError:
@@ -122,7 +217,14 @@ def _is_regular_source_file(filepath: Path, root: Path) -> bool:
                 pass
 
 
-def _register_file(collection, source_file: str, wing: str, agent: str, extract_mode: str):
+def _register_file(
+    collection,
+    source_file: str,
+    wing: str,
+    agent: str,
+    extract_mode: str,
+    content_hash: Optional[str] = None,
+):
     """Write a sentinel so file_already_mined() returns True for 0-chunk files.
 
     Without this, files that normalize to nothing or produce zero chunks are
@@ -135,6 +237,11 @@ def _register_file(collection, source_file: str, wing: str, agent: str, extract_
     grows past the min-chunk-size floor (e.g. a short session that gets
     extended) is correctly detected as changed on the next mine instead of
     being skipped forever by this sentinel.
+
+    Also used to register a file recognized as a content-duplicate of an
+    already-mined transcript under a different path (see
+    ``prefetch_content_hashes``) — stamping it here means the next run skips
+    it via the cheap mtime check instead of re-normalizing and re-hashing it.
     """
     try:
         source_mtime = os.path.getmtime(source_file)
@@ -154,6 +261,8 @@ def _register_file(collection, source_file: str, wing: str, agent: str, extract_
     }
     if source_mtime is not None:
         meta["source_mtime"] = source_mtime
+    if content_hash is not None:
+        meta["content_hash"] = content_hash
     collection.upsert(
         documents=[f"[registry] {source_file}"],
         ids=[sentinel_id],
@@ -474,12 +583,37 @@ def detect_convo_room(content: str) -> str:
 # =============================================================================
 
 
-def scan_convos(convo_dir: str) -> list:
-    """Find all potential conversation files."""
-    convo_path = Path(convo_dir).expanduser().resolve()
+def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
+    """Find all potential conversation files.
+
+    Skips symlinks and oversized files. Each skipped symlink is logged to
+    ``sys.stderr`` with a ``  SKIP: <relative-path> (symlink)`` line so the
+    caller can tell why an apparent conversation directory yielded no files.
+
+    By default, directories named ``subagents`` are skipped: Claude Code
+    records Explore/Plan/Grep subagent transcripts there, and on typical
+    workspaces they outnumber main session files by one to two orders of
+    magnitude. Pass ``include_subagents=True`` to mine them anyway.
+
+    The match is case-insensitive on the directory name only (``subagents``
+    or ``Subagents``), so directories like ``mysubagents`` or
+    ``subagentsbackup`` are not affected.
+    """
+    # A direct conversation file is a valid source. For a file, feed only
+    # its basename through the existing directory validation loop.
+    requested_path = Path(convo_dir).expanduser()
+    single_file = requested_path.is_file()
+    convo_path = (requested_path.parent if single_file else requested_path).resolve()
+    scan_entries = (
+        [(str(convo_path), [], [requested_path.name])] if single_file else os.walk(convo_path)
+    )
     files = []
-    for root, dirs, filenames in os.walk(convo_path):
-        dirs[:] = [d for d in dirs if d not in CONVO_SKIP_DIRS]
+    for root, dirs, filenames in scan_entries:
+        dirs[:] = [
+            d
+            for d in dirs
+            if d not in CONVO_SKIP_DIRS and (include_subagents or d.lower() != "subagents")
+        ]
         for filename in filenames:
             if filename.endswith(".meta.json"):
                 continue
@@ -499,7 +633,17 @@ def scan_convos(convo_dir: str) -> list:
                 # to stderr to match the SKIP: (symlink) line above; silent
                 # drops at this gate were the original #923 complaint.
                 try:
-                    file_size = filepath.stat().st_size
+                    file_stat = filepath.stat()
+                    # Drop non-regular entries (FIFO, socket, device node)
+                    # before any reader touches them — see the matching
+                    # gate in ``miner.scan_project``.
+                    if not stat.S_ISREG(file_stat.st_mode):
+                        print(
+                            f"  SKIP: {filepath.name} (not a regular file)",
+                            file=sys.stderr,
+                        )
+                        continue
+                    file_size = file_stat.st_size
                     if file_size > MAX_FILE_SIZE:
                         print(
                             f"  SKIP: {filepath.name} ({file_size / (1024 * 1024):.1f} MB)"
@@ -590,14 +734,21 @@ def _prepare_convo(
     collection,
     chunk_size: int = None,
     min_chunk_size: int = None,
+    content_hashes: Optional[dict] = None,
 ):
     """Read + normalize + chunk + build per-batch documents/ids/metadata.
 
     Returns one of:
       * ``None`` — file is already mined (pure skip).
-      * ``("register", source_file)`` — readable but yields no chunks; the
-        consumer must write the sentinel via _register_file so it's marked
-        seen on the next run.
+      * ``("register", source_file, content_hash, is_duplicate)`` — readable
+        but yields no chunks, or a content-hash duplicate of an
+        already-mined transcript under a different path; the consumer must
+        write the sentinel via _register_file (passing content_hash
+        through) so it's marked seen on the next run. ``content_hash`` is
+        ``None`` when normalize() failed before a hash could be computed.
+        ``is_duplicate`` distinguishes a real content-hash skip (counted
+        under files_skipped) from a readable-but-empty file (counted as
+        processed, matching the serial mine's pre-existing behavior).
       * ``_PreparedConvo(...)`` — ready for embed + write.
 
     Idempotency and drawer IDs are scoped to ``extract_mode`` so exchange-
@@ -624,10 +775,25 @@ def _prepare_convo(
     try:
         content = normalize(str(filepath))
     except (OSError, ValueError):
-        return ("register", source_file)
+        return ("register", source_file, None, False)
 
     if not content or len(content.strip()) < effective_min:
-        return ("register", source_file)
+        return ("register", source_file, None, False)
+
+    # Content-hash dedup: the same conversation re-exported under a new
+    # filename (fresh export bundle, regenerated slug) must not create a
+    # duplicate set of drawers. Hashed on the whole normalized file, so
+    # this only catches a duplicate whole file — a bundle that re-exports
+    # several conversations together, one of them new, needs per-conversation
+    # hashing (palace.prefetch_content_hashes already supports the
+    # comma-joined multi-hash shape for that); wiring per-conversation
+    # splitting here is a separate, not-yet-ported follow-up.
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    if content_hashes:
+        original = content_hashes.get((wing, content_hash))
+        if original and original != source_file:
+            print(f"    [dup] {filepath.name} -- duplicate of {Path(original).name}, skipping")
+            return ("register", source_file, content_hash, True)
 
     if extract_mode == "general":
         from .general_extractor import extract_memories
@@ -641,7 +807,7 @@ def _prepare_convo(
         )
 
     if not chunks:
-        return ("register", source_file)
+        return ("register", source_file, content_hash, False)
 
     if extract_mode != "general":
         room = detect_convo_room(content)
@@ -659,6 +825,12 @@ def _prepare_convo(
         source_mtime = os.path.getmtime(source_file)
     except OSError:
         source_mtime = None
+    # Every drawer of this pass carries chunk_total so file_already_mined /
+    # prefetch_mined_set can tell a complete multi-batch mine from one that
+    # crashed mid-file (#2183). Without it a stable mtime + any surviving
+    # drawer permanently skips the file and the missing exchanges never
+    # come back.
+    chunk_total = len(chunks)
     batches: list = []
     for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
         batch_docs: list = []
@@ -686,6 +858,8 @@ def _prepare_convo(
                 "extract_mode": extract_mode,
                 "normalize_version": NORMALIZE_VERSION,
                 "id_recipe": ID_RECIPE,
+                "chunk_total": chunk_total,
+                "content_hash": content_hash,
             }
             if source_mtime is not None:
                 meta["source_mtime"] = source_mtime
@@ -748,12 +922,28 @@ def _write_prepared_convo(
         # scoped to this extract_mode so a general-mode re-mine doesn't wipe
         # the transcript's exchange-mode drawers (and vice versa) — the two
         # modes coexist for the same source file.
+        #
+        # A failed purge must abort this file's mine attempt rather than
+        # fall through to upsert: proceeding on top of an unpurged (or
+        # partially purged) set produces duplicate/stale drawers under
+        # mixed schema versions, with no operator-visible signal beyond a
+        # debug log (#105 — convo_miner's own instance of the same swallow
+        # already fixed for miner.py at #23). Returning here leaves the old
+        # drawers' stored mtime untouched, so the next mine still sees a
+        # mismatch and retries.
         try:
             delete_ids = _source_file_delete_ids(collection, source_file, prepared.extract_mode)
             if delete_ids:
                 collection.delete(ids=delete_ids)
-        except Exception:
+        except Exception as exc:
+            print(
+                f"  ! [skip] stale-drawer purge failed for {source_file!r} "
+                f"({exc!r}); leaving existing drawers untouched, will retry "
+                f"on the next mine",
+                file=sys.stderr,
+            )
             logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
+            return 0, room_counts_delta, True
 
         for batch, batch_embeddings in zip(prepared.batches, embeddings_batches):
             assert_no_collisions(list(zip(batch.ids, batch.metadatas)), collection)
@@ -770,6 +960,22 @@ def _write_prepared_convo(
                         room_counts_delta[r] += 1
             except Exception as e:
                 if "already exists" not in str(e).lower():
+                    # A successful earlier batch has the source's current
+                    # mtime and chunk_total. Leaving those drawers behind
+                    # would make the next run treat the incomplete set as
+                    # fully filed (#2183 / #2122).
+                    try:
+                        cleanup_ids = _source_file_delete_ids(
+                            collection, source_file, prepared.extract_mode
+                        )
+                        if cleanup_ids:
+                            collection.delete(ids=cleanup_ids)
+                    except Exception:
+                        logger.warning(
+                            "Failed to clean partial convo drawers after upsert error for %s",
+                            source_file,
+                            exc_info=True,
+                        )
                     raise
     return drawers_added, room_counts_delta, False
 
@@ -783,12 +989,16 @@ def mine_convos(
     dry_run: bool = False,
     extract_mode: str = "exchange",
     workers: Optional[int] = None,
+    include_subagents: bool = False,
 ):
     """Mine a directory of conversation files into the palace.
 
     extract_mode:
         "exchange" — default exchange-pair chunking (Q+A = one unit)
         "general"  — general extractor: decisions, preferences, milestones, problems, emotions
+    include_subagents:
+        False (default) — skip Claude Code ``subagents/`` directories
+        True            — also mine subagent transcripts
 
     workers: producer-thread fan-out for the parallel embed path. ``None``
     (default) resolves to :attr:`MempalaceConfig.workers` — 1 onnx /
@@ -810,6 +1020,7 @@ def mine_convos(
             dry_run=dry_run,
             extract_mode=extract_mode,
             workers=workers,
+            include_subagents=include_subagents,
         )
 
     with mine_palace_lock(palace_path):
@@ -822,6 +1033,7 @@ def mine_convos(
             dry_run=dry_run,
             extract_mode=extract_mode,
             workers=workers,
+            include_subagents=include_subagents,
         )
 
 
@@ -841,6 +1053,27 @@ def _compute_hallways_for_wing_safe(wing, collection, drawers_filed, config=None
         print(f"  (hallways skipped: {exc})")
 
 
+def _open_convo_collection(
+    palace_path: str,
+    *,
+    dry_run: bool,
+):
+    """Open the conversation collection without creating it during dry-run."""
+    if not dry_run:
+        return get_collection(palace_path)
+
+    try:
+        return get_collection(
+            palace_path,
+            create=False,
+            read_only=True,
+        )
+    except PalaceNotFoundError:
+        # A missing palace or uninitialized collection represents empty
+        # prior state to a dry-run. Do not create either one.
+        return None
+
+
 def _mine_convos_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run/parallel branch plus per-file extract-mode routing are intrinsically branchy
     convo_dir: str,
     palace_path: str,
@@ -850,6 +1083,7 @@ def _mine_convos_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run
     dry_run: bool = False,
     extract_mode: str = "exchange",
     workers: Optional[int] = None,
+    include_subagents: bool = False,
 ):
     palace_config = MempalaceConfig(palace_path=palace_path)
     cfg_chunk_size = palace_config.chunk_size
@@ -862,14 +1096,14 @@ def _mine_convos_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run
     convo_path = Path(convo_dir).expanduser().resolve()
     wing = _resolve_wing(convo_path, wing)
 
-    files = scan_convos(convo_dir)
+    files = scan_convos(convo_dir, include_subagents=include_subagents)
 
     # Resolve workers from arg → config (asymmetric default: 1 onnx, 8 remote).
     if workers is None:
         workers = palace_config.workers
 
     print(f"\n{'=' * 55}")
-    print("  MemPalace Mine — Conversations")
+    print("  MemPalace Mine -- Conversations")
     print(f"{'=' * 55}")
     print(f"  Wing:    {wing}")
     print(f"  Source:  {convo_path}")
@@ -879,10 +1113,13 @@ def _mine_convos_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run
     if not dry_run:
         print(f"  Workers: {workers}")
     if dry_run:
-        print("  DRY RUN — nothing will be filed")
+        print("  DRY RUN -- nothing will be filed")
     print(f"{'-' * 55}\n")
 
-    collection = get_collection(palace_path) if not dry_run else None
+    collection = _open_convo_collection(
+        palace_path,
+        dry_run=dry_run,
+    )
 
     # Bulk pre-fetch already-mined source_file -> stored mtime in one
     # paginated pass instead of `len(files)` separate WHERE-source_file
@@ -892,9 +1129,15 @@ def _mine_convos_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run
     # producer below becomes an O(1) dict lookup + a cheap local mtime
     # comparison instead of a DB round trip per file.
     mined_mtimes: dict = (
-        prefetch_mined_set(collection, extract_mode=extract_mode) if not dry_run else {}
+        prefetch_mined_set(collection, extract_mode=extract_mode) if collection is not None else {}
     )
-
+    # Same bulk pre-fetch for content-hash dedup (a re-export of the same
+    # conversation under a new filename) — see _prepare_convo.
+    content_hashes: dict = (
+        prefetch_content_hashes(collection, extract_mode=extract_mode)
+        if collection is not None
+        else {}
+    )
     total_drawers = 0
     files_skipped = 0
     files_failed = 0
@@ -904,6 +1147,13 @@ def _mine_convos_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run
         # Dry-run keeps the serial path — no point parallelizing prints,
         # and there's no collection writer to coordinate around anyway.
         for i, filepath in enumerate(files, 1):
+            # Same in-memory skip the real producer uses (below) — a dry
+            # run must preview what a real mine would actually do, not
+            # reprocess every file as if it were new work every time.
+            if _is_unchanged_since_last_mine(str(filepath), mined_mtimes):
+                files_skipped += 1
+                continue
+
             try:
                 content = normalize(str(filepath))
             except (OSError, ValueError):
@@ -911,6 +1161,18 @@ def _mine_convos_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run
 
             if not content or len(content.strip()) < cfg_min_chunk_size:
                 continue
+
+            # Same content-hash dedup as _prepare_convo (below) — a re-export
+            # under a new filename must preview as a skip, not as new work.
+            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            if content_hashes:
+                original = content_hashes.get((wing, content_hash))
+                if original and original != str(filepath):
+                    print(
+                        f"    [dup] {filepath.name} -- duplicate of {Path(original).name}, skipping"
+                    )
+                    files_skipped += 1
+                    continue
 
             if extract_mode == "general":
                 from .general_extractor import extract_memories
@@ -969,6 +1231,7 @@ def _mine_convos_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run
                 collection,
                 chunk_size=cfg_chunk_size,
                 min_chunk_size=cfg_min_chunk_size,
+                content_hashes=content_hashes,
             )
             if result is None:
                 return WorkerResult(
@@ -977,8 +1240,9 @@ def _mine_convos_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run
                     extra={"idx": idx, "total": len(files)},
                 )
             if isinstance(result, tuple) and result[0] == "register":
+                _, reg_source_file, reg_content_hash, reg_is_duplicate = result
                 return WorkerResult(
-                    payload=("register", result[1]),
+                    payload=("register", reg_source_file, reg_content_hash, reg_is_duplicate),
                     item_id=filepath.name,
                     extra={"idx": idx, "total": len(files)},
                 )
@@ -1008,8 +1272,14 @@ def _mine_convos_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run
                 # inflates the skip line (e.g. re-mining a transcript in a
                 # different extract_mode). Matches the serial mine, which
                 # registers-and-continues without incrementing the skip count.
-                source_file = result.payload[1]
-                _register_file(collection, source_file, wing, agent, extract_mode)
+                # A content-hash duplicate is the opposite: nothing new was
+                # filed, so it IS a skip.
+                _, source_file, content_hash, is_duplicate = result.payload
+                _register_file(
+                    collection, source_file, wing, agent, extract_mode, content_hash=content_hash
+                )
+                if is_duplicate:
+                    files_skipped += 1
                 return
 
             # drawers

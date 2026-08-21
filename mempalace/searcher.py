@@ -11,15 +11,20 @@ corrupt the primary answer. The two lists answer different questions:
 conceptual neighbors to drill into.
 """
 
+import functools
 import logging
 import math
 import os
 import re
 import sqlite3
+from datetime import timedelta
 from pathlib import Path
+from typing import Optional
 
 from .backends import BackendError, BackendMismatchError
-from .config import sqlite_read_uri
+from .config import MempalaceConfig, sqlite_read_uri
+from .date_window import filed_at_in_window, parse_window
+from .i18n import _canonical_lang, get_stopwords
 from .palace import (
     _open_collection_or_explain,
     get_closets_collection,
@@ -56,16 +61,102 @@ def _first_or_empty(results, key: str) -> list:
     return outer[0] or []
 
 
-def _tokenize(text: str) -> list:
+def _aligned_query_ids(results, document_count: int) -> list:
+    """Return query IDs padded to match the document result column.
+
+    Production backends return an ID for every document. Some legacy test
+    mocks omit IDs, so pad with ``None`` instead of letting ``zip`` discard
+    otherwise valid mocked results.
+    """
+    ids = list(_first_or_empty(results, "ids"))
+    if len(ids) < document_count:
+        ids.extend([None] * (document_count - len(ids)))
+    return ids[:document_count]
+
+
+def _result_drawer_id(meta, stored_drawer_id):
+    """Return the ID that round-trips through ``mempalace_get_drawer``.
+
+    Chunk metadata carries the logical-group id under ``parent_drawer_id``
+    (``tool_add_drawer``) or ``parent_entry_id`` (``tool_diary_write``);
+    resolving both means a hit on a chunked diary entry reports the id that
+    fetches the WHOLE entry rather than the one chunk that matched (#2185).
+    Kept in sync with ``mcp_server._PARENT_ID_KEYS``.
+    """
+    meta = meta or {}
+    return meta.get("parent_drawer_id") or meta.get("parent_entry_id") or stored_drawer_id
+
+
+def _tokenize(text: str, stop_words: frozenset = frozenset()) -> list:
     """Lowercase + strip to alphanumeric tokens of length ≥ 2.
 
     Tolerates ``None`` documents — Chroma can return ``None`` in the
     ``documents`` field for drawers without text content, which would
     otherwise raise ``AttributeError`` mid-rerank.
+
+    When ``stop_words`` is non-empty, filters tokens that match any entry.
+    The set is expected to already be lowercased so callers can share one
+    instance across query + document tokenization.
     """
     if not text:
         return []
-    return _TOKEN_RE.findall(text.lower())
+    tokens = _TOKEN_RE.findall(text.lower())
+    if stop_words:
+        return [t for t in tokens if t not in stop_words]
+    return tokens
+
+
+@functools.lru_cache(maxsize=16)
+def _stopwords_for_canonical(canonical_lang: str) -> frozenset:
+    """Cached stop-word set keyed by a canonical locale code.
+
+    Splitting canonicalization out of the cache key avoids thrashing when
+    callers pass equivalent variants (``"EN"``, ``"en"``, ``"en-US"``) —
+    they all hit the same cache slot.
+    """
+    return frozenset(get_stopwords(canonical_lang))
+
+
+def _stopwords_for_lang(lang: str) -> frozenset:
+    """Resolve raw ``lang`` to its canonical form before cache lookup.
+
+    Kept as the public-shaped helper (callers and tests reach for this
+    name) while the lru_cache lives on ``_stopwords_for_canonical`` to
+    keep the cache key normalized.
+    """
+    canonical = _canonical_lang(lang) or lang.lower()
+    return _stopwords_for_canonical(canonical)
+
+
+def _resolve_stop_words(lang: Optional[str]) -> frozenset:
+    """Return the BM25 stop-word set for ``lang`` as an opt-in feature.
+
+    When ``lang`` is an explicit string, loads that locale's stop words.
+    When ``lang`` is ``None``, resolution order is:
+
+    1. ``MEMPALACE_LANG`` / ``MEMPAL_LANG`` environment variable.
+    2. ``MempalaceConfig().lang_explicit`` (which itself reads the env vars
+       first, then ``config.json["lang"]``).
+
+    The env-var fast path avoids constructing ``MempalaceConfig`` (which
+    reads ``config.json`` from disk) on the hot search path when the user
+    has set the env var — the common case for explicit-locale palaces.
+    Palaces that never configured a language get an empty set, preserving
+    pre-PR scoring byte-for-byte.
+    """
+    if lang is None:
+        env_val = os.environ.get("MEMPALACE_LANG") or os.environ.get("MEMPAL_LANG")
+        if env_val and env_val.strip():
+            lang = env_val.strip()
+        else:
+            try:
+                lang = MempalaceConfig().lang_explicit
+            except Exception:
+                logger.debug("lang resolution failed, skipping stop-word filter", exc_info=True)
+                return frozenset()
+        if lang is None:
+            return frozenset()
+    return _stopwords_for_lang(lang)
 
 
 def _bm25_scores(
@@ -73,6 +164,7 @@ def _bm25_scores(
     documents: list,
     k1: float = 1.5,
     b: float = 0.75,
+    stop_words: frozenset = frozenset(),
 ) -> list:
     """Compute Okapi-BM25 scores for ``query`` against each document.
 
@@ -90,11 +182,11 @@ def _bm25_scores(
     Returns a list of scores in the same order as ``documents``.
     """
     n_docs = len(documents)
-    query_terms = set(_tokenize(query))
+    query_terms = set(_tokenize(query, stop_words))
     if not query_terms or n_docs == 0:
         return [0.0] * n_docs
 
-    tokenized = [_tokenize(d) for d in documents]
+    tokenized = [_tokenize(d, stop_words) for d in documents]
     doc_lens = [len(toks) for toks in tokenized]
     if not any(doc_lens):
         return [0.0] * n_docs
@@ -183,6 +275,7 @@ def _hybrid_rank(
     vector_weight: float = 0.6,
     bm25_weight: float = 0.4,
     metric: str = "cosine",
+    stop_words: frozenset = frozenset(),
 ) -> list:
     """Re-rank ``results`` by a convex combination of vector similarity and BM25.
 
@@ -207,7 +300,7 @@ def _hybrid_rank(
         return results
 
     docs = [r.get("text", "") for r in results]
-    bm25_raw = _bm25_scores(query, docs)
+    bm25_raw = _bm25_scores(query, docs, stop_words=stop_words)
     max_bm25 = max(bm25_raw) if bm25_raw else 0.0
     bm25_norm = [s / max_bm25 for s in bm25_raw] if max_bm25 > 0 else [0.0] * len(bm25_raw)
 
@@ -467,7 +560,14 @@ def _hnsw_capacity_diverged(palace_path: str) -> bool:
 
 
 def _print_search_results_bm25_only(
-    query: str, palace_path: str, wing: str, room: str, n_results: int
+    query: str,
+    palace_path: str,
+    wing: str,
+    room: str,
+    n_results: int,
+    stop_words: frozenset = frozenset(),
+    since_dt=None,
+    before_dt=None,
 ) -> None:
     """CLI fallback printer for when HNSW divergence fences off vector search.
 
@@ -475,6 +575,16 @@ def _print_search_results_bm25_only(
     the format they expect, plus a clear notice pointing at
     ``mempalace repair``. Replaces the silent SIGBUS users otherwise hit
     when the CLI called ``col.query()`` against a diverged segment.
+
+    ``stop_words`` reaches the BM25 scorer here for the same reason
+    :func:`_vector_disabled_search` forwards it on the MCP side: this path
+    still ranks by BM25, so dropping the filter would rank a diverged
+    palace by different rules than a healthy one.
+
+    An active ``[since_dt, before_dt)`` window is forwarded to the BM25
+    reader, which post-filters on it. A diverged index degrades the
+    ranking; it must never widen the result set past the window the
+    caller asked for.
     """
     result = _bm25_only_via_sqlite(
         query=query,
@@ -482,6 +592,9 @@ def _print_search_results_bm25_only(
         wing=wing,
         room=room,
         n_results=n_results,
+        stop_words=stop_words,
+        since_dt=since_dt,
+        before_dt=before_dt,
     )
     hits = result.get("results", [])
 
@@ -515,16 +628,58 @@ def _print_search_results_bm25_only(
         for line in (hit.get("text", "") or "").strip().split("\n"):
             print(f"      {line}")
         print()
-        print(f"  {'─' * 56}")
+        print(f"  {'-' * 56}")
 
     print()
 
 
-def search(query: str, palace_path: str, wing: str = None, room: str = None, n_results: int = 5):
+def _candidate_pool_size(n_results: int, date_window_active: bool) -> int:
+    """Rerank-pool size for the drawer vector query.
+
+    Without a date window this is the historical ``n_results * 3``
+    over-fetch. With one, the window filters the pool AFTER retrieval
+    (ChromaDB rejects string operands for ``$gte``/``$lt``, so ``filed_at``
+    can't be range-filtered server-side), and a narrow window over a large
+    palace would starve a 3x pool even though matching drawers exist —
+    recall is the design requirement. Widen to ``n_results * 15``, capped
+    at 500 (the ceiling the filter-fallback path already uses) — except
+    the pool never drops below ``n_results`` itself, or an oversized
+    request could return fewer rows than an unfiltered query would.
+    """
+    if not date_window_active:
+        return n_results * 3
+    return max(min(n_results * 15, 500), n_results)
+
+
+def search(
+    query: str,
+    palace_path: str,
+    wing: str = None,
+    room: str = None,
+    n_results: int = 5,
+    since: str = None,
+    before: str = None,
+):
     """
     Search the palace. Returns verbatim drawer content.
-    Optionally filter by wing (project) or room (aspect).
+    Optionally filter by wing (project) or room (aspect), and/or narrow to
+    drawers whose ``filed_at`` falls in the ``[since, before)`` window —
+    same semantics as ``search_memories``/``list_drawers`` (#1128/#463).
     """
+    # Resolved before the fence below: both exits from this function rank by
+    # BM25, so the filter has to be in hand on either branch.
+    stop_words = _resolve_stop_words(None)
+
+    # Parse the window before probing the palace: an inverted or malformed
+    # bound is a caller error and must raise identically whether or not the
+    # index turns out to be diverged.
+    try:
+        since_dt, before_dt = parse_window(since, before)
+    except ValueError as e:
+        print(f"\n  {e}")
+        raise SearchError(str(e)) from e
+    date_window_active = since_dt is not None or before_dt is not None
+
     # Probe a Chroma palace before get_collection(). Opening the client can
     # load native index state, and embedder-identity enforcement may call
     # collection.count(); both happen before the old query-only guard and can
@@ -540,7 +695,16 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         backend_name = None
 
     if backend_name == "chroma" and _hnsw_capacity_diverged(palace_path):
-        return _print_search_results_bm25_only(query, palace_path, wing, room, n_results)
+        return _print_search_results_bm25_only(
+            query,
+            palace_path,
+            wing,
+            room,
+            n_results,
+            stop_words=stop_words,
+            since_dt=since_dt,
+            before_dt=before_dt,
+        )
 
     col = _open_collection_or_explain(palace_path, opener=get_collection)
     if col is None:
@@ -557,7 +721,12 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     try:
         kwargs = {
             "query_texts": [query],
-            "n_results": n_results,
+            # The window is a post-filter (ChromaDB can't range-compare
+            # string metadata), so widen the fetch the same way the
+            # programmatic path does and trim back after filtering.
+            "n_results": _candidate_pool_size(n_results, date_window_active)
+            if date_window_active
+            else n_results,
             "include": ["documents", "metadatas", "distances"],
         }
         if where:
@@ -572,6 +741,19 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     docs = _first_or_empty(results, "documents")
     metas = _first_or_empty(results, "metadatas")
     dists = _first_or_empty(results, "distances")
+
+    if date_window_active:
+        kept = [
+            (doc, meta, dist)
+            for doc, meta, dist in zip(docs, metas, dists)
+            if filed_at_in_window((meta or {}).get("filed_at"), since_dt, before_dt)
+        ]
+        # Keep the whole in-window pool here; the hybrid re-rank below must
+        # see every survivor before the display cut to n_results, or a
+        # BM25-strong drawer deep in the pool could never surface.
+        docs = [k[0] for k in kept]
+        metas = [k[1] for k in kept]
+        dists = [k[2] for k in kept]
 
     if not docs:
         print(f'\n  No results found for: "{query}"')
@@ -590,7 +772,11 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         {"text": doc or "", "distance": float(dist), "metadata": meta or {}}
         for doc, meta, dist in zip(docs, metas, dists)
     ]
-    hits = _hybrid_rank(hits, query, metric=metric)
+    hits = _hybrid_rank(hits, query, metric=metric, stop_words=stop_words)
+    if date_window_active:
+        # The widened fetch exists only to survive the window filter; the
+        # display contract stays "top n_results", now cut AFTER the re-rank.
+        hits = hits[:n_results]
 
     print(f"\n{'=' * 60}")
     print(f'  Results for: "{query}"')
@@ -598,6 +784,10 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         print(f"  Wing: {wing}")
     if room:
         print(f"  Room: {room}")
+    if since:
+        print(f"  Since: {since}")
+    if before:
+        print(f"  Before: {before}")
     print(f"{'=' * 60}\n")
 
     for i, hit in enumerate(hits, 1):
@@ -616,7 +806,7 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
         for line in hit["text"].strip().split("\n"):
             print(f"      {line}")
         print()
-        print(f"  {'─' * 56}")
+        print(f"  {'-' * 56}")
 
     print()
 
@@ -699,6 +889,49 @@ def _themes_for_cli(query: str, palace_path: str, where: dict, n_results: int) -
     return [c[1] for c in candidates[:n_results]]
 
 
+def _window_sql_prefilters(since_dt, before_dt) -> list:
+    """(operator, bound-string) pairs for the SQL date-window narrowing.
+
+    A SQL-side *narrowing* on the ISO ``filed_at`` string, kept at
+    whole-DAY granularity so it is provably wider than the window for
+    every ISO-8601 spelling that shares the YYYY-MM-DD prefix (bare date,
+    space separator, minute precision, Z/offset suffixes) — a
+    full-isoformat bound would sort after some of those on the boundary
+    day and drop an in-window row at the SQL layer, where the
+    authoritative Python re-filter (offset drop, unparseable exclusion —
+    mirroring the wing/room double-check) can't recover it. Day
+    granularity costs at most one extra day of candidates per bound;
+    Python decides the exact window.
+    """
+    prefilters = []
+    if since_dt is not None:
+        prefilters.append((">=", since_dt.date().isoformat()))
+    if before_dt is not None:
+        try:
+            upper = (before_dt + timedelta(days=1)).date().isoformat()
+        except OverflowError:
+            # before at the calendar ceiling ("9999-12-31" as an open-ended
+            # sentinel): there is no next day to bound by, so skip the SQL
+            # narrowing entirely — the Python re-filter stays authoritative
+            # and such a window is effectively unbounded above anyway.
+            upper = None
+        if upper is not None:
+            prefilters.append(("<", upper))
+    return prefilters
+
+
+def _search_error_result(error: str, **extra) -> dict:
+    """Error envelope for programmatic search callers.
+
+    Always includes ``results: []`` so callers can safely index
+    ``result["results"]`` without a KeyError when the palace failed to
+    open or the query raised mid-flight (Windows CI flake surface).
+    """
+    out = {"error": error, "results": []}
+    out.update(extra)
+    return out
+
+
 def _bm25_only_via_sqlite(
     query: str,
     palace_path: str,
@@ -709,6 +942,9 @@ def _bm25_only_via_sqlite(
     max_candidates: int = 500,
     _include_internal: bool = False,
     collection_name: str = None,
+    stop_words: frozenset = frozenset(),
+    since_dt=None,
+    before_dt=None,
 ) -> dict:
     """BM25-only search reading drawers directly from chroma.sqlite3.
 
@@ -728,10 +964,10 @@ def _bm25_only_via_sqlite(
     """
     db_path = os.path.join(palace_path, "chroma.sqlite3")
     if not os.path.isfile(db_path):
-        return {
-            "error": "No palace found",
-            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
-        }
+        return _search_error_result(
+            "No palace found",
+            hint="Run: mempalace init <dir> && mempalace mine <dir>",
+        )
     if collection_name is None:
         from .config import get_configured_collection_name
 
@@ -760,13 +996,27 @@ def _bm25_only_via_sqlite(
                 """
             )
             params.extend([key, value])
+        for op, sql_bound in _window_sql_prefilters(since_dt, before_dt):
+            clauses.append(
+                f"""
+                AND EXISTS (
+                    SELECT 1
+                    FROM embedding_metadata mf
+                    WHERE mf.id = {row_id_expr}
+                      AND mf.key = 'filed_at'
+                      AND mf.string_value {op} ?
+                )
+                """
+            )
+            params.append(sql_bound)
         return "".join(clauses), params
 
     try:
         conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
     except sqlite3.Error as e:
-        return {"error": f"sqlite open failed: {e}"}
+        return _search_error_result(f"sqlite open failed: {e}")
 
+    window_active = since_dt is not None or before_dt is not None
     try:
         # FTS5 MATCH expects whitespace-separated tokens. Drop tokens
         # shorter than 3 chars (trigram tokenizer can't match them).
@@ -850,6 +1100,11 @@ def _bm25_only_via_sqlite(
                     logger.debug("id-ordered fallback also failed", exc_info=True)
                     candidate_ids = []
 
+        # A full candidate page means rows beyond it never got a chance to
+        # match the window — mirror the vector path's truncation honesty
+        # (``date_filter_pool_truncated``) instead of a silently thin result.
+        window_pool_truncated = window_active and len(candidate_ids) >= max_candidates
+
         if not candidate_ids:
             return {
                 "query": query,
@@ -864,9 +1119,10 @@ def _bm25_only_via_sqlite(
         placeholders = ",".join(["?"] * len(candidate_ids))
         meta_rows = conn.execute(
             f"""
-            SELECT id, key, string_value, int_value
-            FROM embedding_metadata
-            WHERE id IN ({placeholders})
+            SELECT m.id, e.embedding_id, m.key, m.string_value, m.int_value
+            FROM embedding_metadata AS m
+            JOIN embeddings AS e ON e.id = m.id
+            WHERE m.id IN ({placeholders})
             """,
             candidate_ids,
         ).fetchall()
@@ -875,8 +1131,16 @@ def _bm25_only_via_sqlite(
 
     # Group metadata rows into per-drawer dicts.
     drawers: dict[int, dict] = {}
-    for emb_id, key, sval, ival in meta_rows:
-        d = drawers.setdefault(emb_id, {"_id": emb_id, "metadata": {}, "text": ""})
+    for emb_id, stored_drawer_id, key, sval, ival in meta_rows:
+        d = drawers.setdefault(
+            emb_id,
+            {
+                "_id": emb_id,
+                "_stored_drawer_id": stored_drawer_id,
+                "metadata": {},
+                "text": "",
+            },
+        )
         if key == "chroma:document":
             d["text"] = sval or ""
         else:
@@ -893,9 +1157,12 @@ def _bm25_only_via_sqlite(
             continue
         if source_file and meta.get("source_file") != source_file:
             continue
+        if window_active and not filed_at_in_window(meta.get("filed_at"), since_dt, before_dt):
+            continue
         full_source = meta.get("source_file", "") or ""
         candidates.append(
             {
+                "drawer_id": _result_drawer_id(meta, d["_stored_drawer_id"]),
                 "text": d["text"],
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
@@ -919,7 +1186,7 @@ def _bm25_only_via_sqlite(
 
     # Local BM25 over the candidate set.
     docs = [c["text"] for c in candidates]
-    bm25_raw = _bm25_scores(query, docs)
+    bm25_raw = _bm25_scores(query, docs, stop_words=stop_words)
     max_bm25 = max(bm25_raw) if bm25_raw else 0.0
     for c, raw in zip(candidates, bm25_raw):
         c["bm25_score"] = round(raw, 3)
@@ -935,7 +1202,7 @@ def _bm25_only_via_sqlite(
             h.pop("_source_file_full", None)
             h.pop("_chunk_index", None)
 
-    return {
+    result = {
         "query": query,
         "filters": {"wing": wing, "room": room, "source_file": source_file},
         "total_before_filter": len(candidates),
@@ -948,6 +1215,9 @@ def _bm25_only_via_sqlite(
         "fallback": "bm25_only_via_sqlite",
         "fallback_reason": "vector_search_disabled",
     }
+    if window_pool_truncated:
+        result["date_filter_pool_truncated"] = True
+    return result
 
 
 def _taxonomy_penalty() -> float:
@@ -997,11 +1267,14 @@ def _query_drawers_with_filter_fallback(
             n_results=min(n_results * 15, 500),
             include=["documents", "metadatas", "distances"],
         )
+        raw_docs = _first_or_empty(raw, "documents")
+        raw_ids = _aligned_query_ids(raw, len(raw_docs))
         wing_set = set(wing_list or [])
         room_set = set(room_list or [])
-        fdocs, fmetas, fdists = [], [], []
-        for doc, meta, dist in zip(
-            _first_or_empty(raw, "documents"),
+        fids, fdocs, fmetas, fdists = [], [], [], []
+        for stored_drawer_id, doc, meta, dist in zip(
+            raw_ids,
+            raw_docs,
             _first_or_empty(raw, "metadatas"),
             _first_or_empty(raw, "distances"),
         ):
@@ -1012,10 +1285,61 @@ def _query_drawers_with_filter_fallback(
                 continue
             if source_file and meta.get("source_file") != source_file:
                 continue
+            fids.append(stored_drawer_id)
             fdocs.append(doc)
             fmetas.append(meta)
             fdists.append(dist)
-        return {"documents": [fdocs], "metadatas": [fmetas], "distances": [fdists]}
+        return {
+            "ids": [fids],
+            "documents": [fdocs],
+            "metadatas": [fmetas],
+            "distances": [fdists],
+        }
+
+
+def _backend_capabilities(col) -> frozenset:
+    backend = getattr(col, "_backend", None)
+    if backend is None:
+        inner = getattr(col, "_inner", None)
+        backend = getattr(inner, "_backend", None) if inner is not None else None
+    caps = getattr(backend, "capabilities", None) if backend is not None else None
+    return caps if isinstance(caps, (set, frozenset)) else frozenset()
+
+
+def _fetch_closet_candidates(closets_col, *, query: str, n_results: int, where: dict):
+    """Return raw ``(documents, metadatas, distances)`` candidate lists for the
+    themes pass, routed by backend capability.
+
+    sqlite_exact (and any lexical-only backend) has no real cosine index over
+    the closets collection — closets are pointer lines, so BM25 via
+    ``lexical_search`` is the correct signal, not a vector ``.query()`` the
+    backend would otherwise have to fake. A lexical hit's relevance ``score``
+    isn't a distance, so it's converted to a rank-order pseudo-distance
+    (``1 - 1/(rank+2)``: 0.5, 0.667, 0.75, ...) that sorts the same way
+    downstream as the cosine-distance branch below, without claiming a
+    magnitude the backend never reported.
+    """
+    if "supports_lexical_search" in _backend_capabilities(closets_col):
+        result = closets_col.lexical_search(query=query, n_results=n_results, where=where or None)
+        hits = getattr(result, "hits", None) or []
+        docs = [h.document for h in hits]
+        metas = [h.metadata for h in hits]
+        dists = [1.0 - (1.0 / (rank + 2)) for rank in range(len(hits))]
+        return docs, metas, dists
+
+    ckwargs = {
+        "query_texts": [query],
+        "n_results": n_results,
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if where:
+        ckwargs["where"] = where
+    closet_results = closets_col.query(**ckwargs)
+    return (
+        _first_or_empty(closet_results, "documents"),
+        _first_or_empty(closet_results, "metadatas"),
+        _first_or_empty(closet_results, "distances"),
+    )
 
 
 def search_within(
@@ -1030,6 +1354,7 @@ def search_within(
     n_themes: int = None,
     max_distance: float = 0.0,
     collection_name: str = None,
+    lang: Optional[str] = None,
 ) -> dict:
     """Generic scoped search primitive — the leaf of hierarchical descent.
 
@@ -1101,7 +1426,10 @@ def search_within(
             drawers_col, dkwargs, query, n_results, wing_list, room_list, source_file
         )
     except Exception as e:
-        return {"error": f"Search error: {e}"}
+        # Callers index result["results"] unconditionally, error or not
+        # (Windows KeyError flake) — never omit it, even on a mid-query
+        # exception.
+        return {"error": f"Search error: {e}", "results": [], "primary": [], "themes": []}
 
     scored: list = []
     for drawer_id, doc, meta, dist in zip(
@@ -1118,7 +1446,10 @@ def search_within(
         source = meta.get("source_file", "") or ""
         scored.append(
             {
-                "drawer_id": drawer_id,
+                # Resolve chunk ids to their logical parent (#2080/#2185) so a
+                # hit on one chunk reports the id that round-trips the whole
+                # drawer through mempalace_get_drawer, not just that chunk.
+                "drawer_id": _result_drawer_id(meta, drawer_id),
                 "text": doc,
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
@@ -1136,7 +1467,7 @@ def search_within(
 
     scored.sort(key=lambda h: h["_sort_key"])
     primary = scored[:n_results]
-    primary = _hybrid_rank(primary, query)
+    primary = _hybrid_rank(primary, query, stop_words=_resolve_stop_words(lang))
     for h in primary:
         h.pop("_sort_key", None)
 
@@ -1148,23 +1479,14 @@ def search_within(
     themes: list = []
     try:
         closets_col = get_closets_collection(palace_path, create=False)
-        ckwargs = {
-            "query_texts": [query],
-            "n_results": max(theme_limit * 4, 10),
-            "include": ["documents", "metadatas", "distances"],
-        }
-        if where:
-            ckwargs["where"] = where
-        closet_results = closets_col.query(**ckwargs)
+        closet_docs, closet_metas, closet_dists = _fetch_closet_candidates(
+            closets_col, query=query, n_results=max(theme_limit * 4, 10), where=where
+        )
 
         taxonomy_pen = _taxonomy_penalty()
         seen_sources: set = set()
         candidate_themes: list = []
-        for cdoc, cmeta, cdist in zip(
-            _first_or_empty(closet_results, "documents"),
-            _first_or_empty(closet_results, "metadatas"),
-            _first_or_empty(closet_results, "distances"),
-        ):
+        for cdoc, cmeta, cdist in zip(closet_docs, closet_metas, closet_dists):
             cmeta = cmeta or {}
             source = cmeta.get("source_file", "") or ""
             if not source or source in seen_sources:
@@ -1220,10 +1542,13 @@ def search_memories(
     wing: str = None,
     room: str = None,
     source_file: str = None,
+    since: str = None,
+    before: str = None,
     n_results: int = 5,
     max_distance: float = 0.0,
     vector_disabled: bool = False,
     collection_name: str = None,
+    lang: Optional[str] = None,
 ) -> dict:
     """Programmatic search — single-wing, single-room convenience wrapper.
 
@@ -1236,8 +1561,20 @@ def search_memories(
     when the HNSW capacity probe detects a divergence that would segfault
     chromadb on segment load (#1222).
 
+    ``lang`` selects the BM25 stop-word locale (opt-in; see
+    :func:`_resolve_stop_words`) and is threaded through to
+    :func:`search_within`.
+
+    ``since`` / ``before`` are accepted for call-signature compatibility
+    with upstream but are **not yet implemented** on this branch — passing
+    them is currently a no-op. Upstream's date-window filtering
+    (``_window_and_fallback_gate``, ``_candidate_pool_size``-driven pool
+    widening, ``date_filter_pool_truncated`` reporting) has not been ported
+    into the local ``search_within`` two-list shape. Tracked as a follow-up.
+
     Used by the MCP server and other callers that need data rather than
     printed output.
+
     """
     if vector_disabled:
         return _bm25_only_via_sqlite(
@@ -1248,6 +1585,7 @@ def search_memories(
             source_file=source_file,
             n_results=n_results,
             collection_name=collection_name,
+            stop_words=_resolve_stop_words(lang),
         )
     result = search_within(
         query,
@@ -1258,6 +1596,7 @@ def search_memories(
         n_results=n_results,
         max_distance=max_distance,
         collection_name=collection_name,
+        lang=lang,
     )
     # Preserve the pre-search_within return shape for existing consumers.
     if "filters" in result:

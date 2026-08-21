@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import threading
+import time
 from typing import Optional
 
 from .backends import (
@@ -27,7 +28,11 @@ from .backends import (
 )
 from .backends.embedding_wrapper import EmbeddingCollection
 from .config import check_palace_storage
-from .entity_detector import _apply_known_systems_prepass, _get_coca_filter
+from .entity_detector import (
+    _apply_known_systems_prepass,
+    _collapse_long_ascii_runs,
+    _get_coca_filter,
+)
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -83,6 +88,23 @@ NORMALIZE_VERSION = 2
 # process, so the identity check (one metadata read) runs at most once per
 # collection per run — keeps the hot get_collection path cheap.
 _VALIDATED_IDENTITY: set = set()
+
+
+def clear_validated_embedder_identity(palace_path: Optional[str] = None) -> None:
+    """Drop cached embedder-identity verdicts so the next open re-checks.
+
+    Read-only opens of an empty collection can mark a key as validated without
+    recording identity on disk (``create=False``). When MCP later promotes that
+    reader to a writable owner, the writable open must re-run enforcement so
+    the first drawers still get labelled with the active model.
+    """
+    if palace_path is None:
+        _VALIDATED_IDENTITY.clear()
+        return
+    palace_key = str(palace_path)
+    stale = [key for key in _VALIDATED_IDENTITY if key and key[0] == palace_key]
+    for key in stale:
+        _VALIDATED_IDENTITY.discard(key)
 
 
 def _enforce_embedder_identity(collection, palace_path, collection_name, *, create) -> None:
@@ -147,10 +169,29 @@ def _enforce_embedder_identity(collection, palace_path, collection_name, *, crea
         return
 
     if state == "unknown" and stored is None:
+        # Preflight HNSW divergence before touching count(): this is the
+        # universal chokepoint every tool passes through via
+        # get_collection(), and count() on a diverged segment can raise
+        # chromadb's rust-level pyo3_runtime.PanicException or hard-segfault
+        # (#1222) -- neither of which the except Exception below can catch,
+        # since a native crash takes the whole process down regardless of
+        # any Python try/except. A diverged palace must never reach count()
+        # here; this bookkeeping-only identity check simply skips itself
+        # (count treated as unknown, matching the except-Exception fallback
+        # already below) rather than risk the read.
         try:
-            count = collection.count()
+            from .backends.chroma import hnsw_capacity_status
+
+            diverged = hnsw_capacity_status(str(palace_path), str(collection_name)).get("diverged")
         except Exception:
+            diverged = False
+        if diverged:
             count = None
+        else:
+            try:
+                count = collection.count()
+            except Exception:
+                count = None
         if count == 0:
             if create:
                 try:
@@ -174,9 +215,14 @@ def get_collection(
     collection_name: Optional[str] = None,
     create: bool = True,
     backend: Optional[str] = None,
+    read_only: bool = False,
     _skip_identity_check: bool = False,
 ):
     """Get the palace collection through the backend layer.
+
+    ``read_only=True`` asks local backends to open storage without schema
+    initialization, migrations, or metadata writes. Backends that support a
+    genuine read-only mode receive it through the backend ``options`` mapping.
 
     ``_skip_identity_check`` bypasses the embedder-identity enforcement so the
     ``set-embedder`` override path can open a palace whose recorded model
@@ -193,20 +239,52 @@ def get_collection(
         collection_name = get_configured_collection_name()
     backend_obj = get_backend_for_palace(palace_path, explicit=backend)
     palace_ref = PalaceRef(id=palace_path, local_path=palace_path)
+    backend_options = {"read_only": True} if read_only else None
+    preferred_kwargs = {
+        "palace": palace_ref,
+        "collection_name": collection_name,
+        "create": create,
+    }
+    if backend_options is not None:
+        preferred_kwargs["options"] = backend_options
     try:
-        collection = backend_obj.get_collection(
-            palace=palace_ref,
-            collection_name=collection_name,
-            create=create,
-        )
+        collection = backend_obj.get_collection(**preferred_kwargs)
     except TypeError as exc:
-        if "unexpected keyword argument 'palace'" not in str(exc):
+        msg = str(exc)
+        # Plugin backends may still use the pre-options signature. Drop
+        # ``options`` first so read_only degrades gracefully instead of
+        # hard-failing TypeError on third-party entry points.
+        if backend_options is not None and "options" in msg:
+            preferred_kwargs.pop("options", None)
+            try:
+                collection = backend_obj.get_collection(**preferred_kwargs)
+            except TypeError as nested:
+                if "unexpected keyword argument 'palace'" not in str(nested):
+                    raise
+                collection = backend_obj.get_collection(
+                    palace_path,
+                    collection_name=collection_name,
+                    create=create,
+                )
+        elif "unexpected keyword argument 'palace'" not in msg:
             raise
-        collection = backend_obj.get_collection(
-            palace_path,
-            collection_name=collection_name,
-            create=create,
-        )
+        else:
+            legacy_kwargs = {
+                "collection_name": collection_name,
+                "create": create,
+            }
+            if backend_options is not None:
+                legacy_kwargs["options"] = backend_options
+            try:
+                collection = backend_obj.get_collection(palace_path, **legacy_kwargs)
+            except TypeError as nested:
+                if backend_options is None or "options" not in str(nested):
+                    raise
+                collection = backend_obj.get_collection(
+                    palace_path,
+                    collection_name=collection_name,
+                    create=create,
+                )
     if "requires_explicit_embeddings" in getattr(backend_obj, "capabilities", frozenset()):
         collection = EmbeddingCollection(collection)
     if not _skip_identity_check:
@@ -344,6 +422,29 @@ def resolve_backend_name(palace_path: str, explicit: Optional[str] = None) -> st
             f"but {selected!r} was selected"
         )
     return selected
+
+
+_MULTI_PROCESS_WRITER_BACKENDS = frozenset({"pgvector", "qdrant"})
+
+
+def backend_requires_single_writer(backend_name: str) -> bool:
+    """Return whether a backend needs one process-lifetime writer owner.
+
+    Local file-backed backends cannot safely coordinate independent long-lived
+    clients by serializing only individual calls: each process may retain
+    SQLite/WAL, FTS, or vector-index state across operations. Unknown and
+    plugin backends are treated conservatively. Only backends whose storage
+    service is explicitly responsible for cross-process concurrency opt out.
+    """
+    normalized = backend_name.strip().lower()
+    if normalized == "milvus":
+        # Only embedded Milvus Lite is local single-writer storage. A remote
+        # Milvus server or Zilliz Cloud coordinates concurrent clients itself.
+        from .backends.milvus import milvus_uri_is_server
+        from .config import MempalaceConfig
+
+        return not milvus_uri_is_server(MempalaceConfig().milvus_uri)
+    return normalized not in _MULTI_PROCESS_WRITER_BACKENDS
 
 
 def get_backend_for_palace(palace_path: str, explicit: Optional[str] = None):
@@ -700,9 +801,12 @@ def _candidate_entity_words(text: str) -> list:
             except re.error:
                 continue
         _CANDIDATE_RX_CACHE = rxs
+    # Defuse ReDoS on long ASCII blobs before matching (#2063); see
+    # entity_detector._collapse_long_ascii_runs.
+    stripped = _collapse_long_ascii_runs(text)
     words = []
     for rx in _CANDIDATE_RX_CACHE:
-        words.extend(rx.findall(text))
+        words.extend(rx.findall(stripped))
     return words
 
 
@@ -895,6 +999,7 @@ def mine_lock(source_file: str):
     Prevents multiple agents from mining the same file simultaneously,
     which causes duplicate drawers when the delete+insert cycle interleaves.
     """
+    _maybe_reap_stale_mine_locks()
     lock_path = _mine_lock_path(source_file)
     lf = _acquire_mine_lock_file(lock_path)
     try:
@@ -1072,6 +1177,92 @@ def _cleanup_mine_lock_file(lock_path: str) -> None:
                 except Exception:
                     logger.debug("Mine-lock cleanup release failed", exc_info=True)
             lf.close()
+
+
+def reap_stale_mine_locks(*, min_age_seconds: int = 3600) -> tuple[int, int]:
+    """Best-effort garbage collection for orphaned per-source-file mine locks.
+
+    ``_cleanup_mine_lock_file`` reclaims a lock file correctly on the happy
+    path (see its docstring) — but only for the *specific* lock a
+    :func:`mine_lock` context manager just released. A process that dies
+    before reaching its own ``finally`` block (killed, crashed, force-quit,
+    host reboot) never runs that cleanup, and nothing else in this codebase
+    later revisits that lock file. Locks in ``~/.mempalace/locks/`` can
+    accumulate unboundedly over time as a result — one long-lived
+    installation was found with 5,636 stale entries, the oldest several
+    months old, none held by any live process (confirmed via ``lsof``).
+
+    This reuses :func:`_cleanup_mine_lock_file` itself for the actual
+    removal — same nonblocking-flock-reacquire safety mechanism, same
+    Windows/POSIX handling, no duplicated locking logic. A lock is only
+    ever removed after *this* process re-acquires it, so anything
+    genuinely held by a live process is left untouched regardless of
+    ``min_age_seconds``. ``min_age_seconds`` is a courtesy throttle only —
+    it avoids racing a lock that was *just* released and may still be
+    mid-rendezvous with a waiter on the same pathname; it is not a
+    substitute for the flock check, which is what actually makes removal
+    safe.
+
+    Skips ``mine_palace_*.lock`` files — those belong to the newer
+    palace-level :func:`mine_palace_lock` and have their own
+    lifecycle/holder tracking; this targets only the per-source-file locks
+    :func:`mine_lock` creates via :func:`_mine_lock_path`.
+
+    Returns ``(reaped, skipped)`` counts, for logging/testing — callers
+    don't need to act on them.
+    """
+    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
+    try:
+        entries = os.listdir(lock_dir)
+    except OSError:
+        return 0, 0
+
+    now = time.time()
+    reaped = 0
+    skipped = 0
+    for name in entries:
+        if not name.endswith(".lock") or name.startswith("mine_palace_"):
+            continue
+        lock_path = os.path.join(lock_dir, name)
+        try:
+            if now - os.path.getmtime(lock_path) < min_age_seconds:
+                continue
+        except OSError:
+            continue
+        _cleanup_mine_lock_file(lock_path)
+        if os.path.exists(lock_path):
+            skipped += 1
+        else:
+            reaped += 1
+    return reaped, skipped
+
+
+_LOCK_REAP_INTERVAL_SECONDS = 900  # 15 minutes between opportunistic sweeps
+
+
+def _maybe_reap_stale_mine_locks() -> None:
+    """Throttled, opportunistic call site for :func:`reap_stale_mine_locks`.
+
+    Runs at most once per ``_LOCK_REAP_INTERVAL_SECONDS``, piggybacking on
+    the natural cadence of mine operations rather than requiring a
+    background thread, a scheduled task, or any new CLI surface. Failures
+    are swallowed — lock maintenance must never be allowed to break an
+    actual mine.
+    """
+    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
+    marker = os.path.join(lock_dir, ".last_reap")
+    try:
+        if (
+            os.path.exists(marker)
+            and time.time() - os.path.getmtime(marker) < _LOCK_REAP_INTERVAL_SECONDS
+        ):
+            return
+        os.makedirs(lock_dir, exist_ok=True)
+        open(marker, "a").close()
+        os.utime(marker, None)
+        reap_stale_mine_locks()
+    except Exception:
+        logger.debug("Opportunistic mine-lock reap failed", exc_info=True)
 
 
 class MineAlreadyRunning(RuntimeError):
@@ -1386,10 +1577,26 @@ mine_global_lock = mine_palace_lock
 
 
 def _metadata_matches_extract_mode(meta: dict, extract_mode: Optional[str]) -> bool:
+    """Scope a drawer to a convo-miner extraction mode.
+
+    A missing ``extract_mode`` is treated as a legacy exchange-mode row
+    ONLY when the drawer is otherwise convo_miner's own (no ``ingest_mode``
+    at all -- pre-``ingest_mode``-schema convo drawers -- or the convo
+    miner's own ``"convos"`` tag). A drawer from a different producer that
+    never set ``extract_mode`` because it was never meant to carry one --
+    e.g. the sweeper's ``ingest_mode="sweep"`` rows -- must not match: the
+    legacy-compat rule otherwise scoops every sweeper drawer for a shared
+    transcript into convo_miner's default "exchange" purge/idempotency
+    scope and silently deletes them on the very next re-mine (#104).
+    """
     if extract_mode is None:
         return True
     stored_mode = meta.get("extract_mode")
-    return stored_mode == extract_mode or (extract_mode == "exchange" and stored_mode is None)
+    if stored_mode == extract_mode:
+        return True
+    if stored_mode is not None:
+        return False
+    return extract_mode == "exchange" and meta.get("ingest_mode") in (None, "convos")
 
 
 def file_already_mined(
@@ -1420,6 +1627,15 @@ def file_already_mined(
     that extraction mode so exchange-mode and general-mode drawers can coexist
     for the same source transcript. Legacy drawers without extract_mode are
     treated as exchange-mode drawers.
+
+    A drawer whose metadata carries ``chunk_total`` (see #21) is only
+    counted toward a match once its stored_mtime group has accumulated at
+    least that many drawers -- guarding against a mid-file crash between
+    upsert batches, where the surviving drawers share the current mtime
+    (the file itself was never touched) but are short of the full set. A
+    drawer with no ``chunk_total`` (legacy rows, or a single-shot
+    ``add_drawer()`` call with no partial-batch risk) is trusted on its own,
+    exactly as before.
     """
     try:
         # Under the additive-mining model, a single ``source_file`` can have
@@ -1436,6 +1652,9 @@ def file_already_mined(
         # first matching group regardless of ordering.
         current_mtime = os.path.getmtime(source_file) if check_mtime else None
         offset = 0
+        # Tracks, per matching stored_mtime group, how many drawers have
+        # been seen so far toward that group's own chunk_total (#21).
+        group_counts: dict = {}
         while True:
             results = collection.get(
                 where={"source_file": source_file},
@@ -1461,7 +1680,16 @@ def file_already_mined(
                 stored_mtime = meta.get("source_mtime")
                 if stored_mtime is None:
                     continue
-                if abs(float(stored_mtime) - current_mtime) < 0.001:
+                if abs(float(stored_mtime) - current_mtime) >= 0.001:
+                    continue
+                chunk_total = meta.get("chunk_total")
+                if chunk_total is None:
+                    # No completion marker on this drawer — can't verify
+                    # completeness for its group, trust the match as before.
+                    return True
+                seen = group_counts.get(stored_mtime, 0) + 1
+                group_counts[stored_mtime] = seen
+                if seen >= chunk_total:
                     return True
             if not ids:
                 break
@@ -1494,12 +1722,21 @@ def prefetch_mined_set(
     When extract_mode is set, mirrors file_already_mined(..., extract_mode=...)
     so conversation mines skip per extraction mode rather than per source file.
 
+    Completeness mirrors :func:`file_already_mined`'s ``chunk_total`` rule
+    (#2183): a source that only has a mid-file partial (surviving drawers
+    share the current mtime but are short of ``chunk_total``) is **omitted**
+    from the result so the bulk skip path re-mines instead of permanently
+    stranding the missing exchanges. Drawers with no ``chunk_total``
+    (legacy rows, registry sentinels) are trusted on their own, as before.
+
     The convo miner walks thousands of transcript files; per-file
     `collection.get(where={"source_file": X})` costs ~2s on a 150k-drawer
     palace, making a 2000-file sweep take >1h of pure skip-checking. This
     helper drops that to a single paginated scan plus O(1) lookups.
     """
-    mined: dict[str, Optional[float]] = {}
+    # Per source_file: per stored_mtime group → count + optional chunk_total.
+    # A source is only "mined" once some group is complete.
+    groups: dict[str, dict] = {}
     try:
         total = collection.count()
         offset = 0
@@ -1514,12 +1751,93 @@ def prefetch_mined_set(
                     continue
                 # Same default as file_already_mined: missing version == 1
                 version = meta.get("normalize_version", 1)
-                if version >= NORMALIZE_VERSION:
-                    stored_mtime = meta.get("source_mtime")
-                    mined[src] = float(stored_mtime) if stored_mtime is not None else None
+                if version < NORMALIZE_VERSION:
+                    continue
+                stored_mtime = meta.get("source_mtime")
+                mtime_key = float(stored_mtime) if stored_mtime is not None else None
+                entry = groups.setdefault(src, {}).setdefault(
+                    mtime_key, {"count": 0, "chunk_total": None}
+                )
+                entry["count"] += 1
+                chunk_total = meta.get("chunk_total")
+                if chunk_total is not None:
+                    try:
+                        entry["chunk_total"] = int(chunk_total)
+                    except (TypeError, ValueError):
+                        pass
             if not batch["ids"]:
                 break
             offset += len(batch["ids"])
     except Exception:
-        logger.warning("prefetch_mined_set: partial fetch, %d files loaded", len(mined))
+        logger.warning("prefetch_mined_set: partial fetch, %d source groups loaded", len(groups))
+
+    mined: dict[str, Optional[float]] = {}
+    for src, by_mtime in groups.items():
+        for mtime_key, entry in by_mtime.items():
+            chunk_total = entry["chunk_total"]
+            if chunk_total is None:
+                # Legacy / registry: no completion marker — trust membership.
+                mined[src] = mtime_key
+                break
+            if entry["count"] >= chunk_total:
+                mined[src] = mtime_key
+                break
     return mined
+
+
+def prefetch_content_hashes(
+    collection, extract_mode: Optional[str] = None
+) -> dict[tuple[str, str], str]:
+    """Pre-fetch (wing, content_hash) -> source_file for drawers already
+    filed at the current NORMALIZE_VERSION, in one bulk pass.
+
+    Repeated exports from Claude/ChatGPT land under a new filename each run
+    (timestamped bundle, regenerated slug, etc.) even when the conversation
+    itself hasn't changed. `prefetch_mined_set` only recognizes a file as
+    already-mined by its exact path, so the same conversation re-exported
+    under a new path always looked "new" and got re-mined as a duplicate
+    drawer. This does the same bulk scan but keyed on the SHA-256 of the
+    normalized transcript text, so the convo miner can recognize "this exact
+    conversation is already filed under a different path" and skip it.
+
+    Keyed by (wing, content_hash) rather than content_hash alone — mining
+    the same transcript into a second wing is a deliberate re-file, not a
+    duplicate, and should produce real drawers in that wing rather than
+    just the registry sentinel.
+
+    A drawer's ``content_hash`` metadata may hold several comma-joined
+    SHA-256 hashes: a privacy-export bundle normalizes to one conversation
+    per drawer set, but the hash is computed per conversation so that a
+    re-export with one new conversation added doesn't change the hash of
+    the ones that didn't. Only the first source_file seen for a given
+    (wing, hash) pair is kept — good enough to detect and skip a repeat,
+    the point is not to track every alias.
+    """
+    hashes: dict[tuple[str, str], str] = {}
+    try:
+        total = collection.count()
+        offset = 0
+        while offset < total:
+            batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
+            for meta in batch["metadatas"]:
+                meta = meta or {}
+                content_hash_field = meta.get("content_hash")
+                src = meta.get("source_file")
+                wing = meta.get("wing")
+                if not content_hash_field or not src or not wing:
+                    continue
+                if not _metadata_matches_extract_mode(meta, extract_mode):
+                    continue
+                version = meta.get("normalize_version", 1)
+                if version < NORMALIZE_VERSION:
+                    continue
+                for content_hash in content_hash_field.split(","):
+                    key = (wing, content_hash)
+                    if content_hash and key not in hashes:
+                        hashes[key] = src
+            if not batch["ids"]:
+                break
+            offset += len(batch["ids"])
+    except Exception:
+        logger.warning("prefetch_content_hashes: partial fetch, %d hashes loaded", len(hashes))
+    return hashes

@@ -1020,6 +1020,31 @@ def test_status_palace_dir_without_db_reports_uninitialized(tmp_path, capsys):
     assert list(palace_path.iterdir()) == []
 
 
+def test_status_aborts_on_hnsw_divergence(tmp_path, capsys):
+    """count() on a diverged HNSW segment can hard-crash the process
+    (#1222); status()'s ChromaDB-client fallback (used when the direct
+    sqlite read is unavailable) must preflight divergence before ever
+    calling count(), not just wrap it in except Exception (#93)."""
+    from unittest.mock import patch
+
+    class FakeCol:
+        def count(self):
+            raise AssertionError("count() must not be called when diverged")
+
+    with (
+        patch("mempalace.miner._open_collection_or_explain", return_value=FakeCol()),
+        patch(
+            "mempalace.backends.chroma.hnsw_capacity_status",
+            return_value={"diverged": True, "message": "test divergence"},
+        ),
+    ):
+        status(str(tmp_path))
+
+    out = capsys.readouterr().out
+    assert "HNSW index is diverged" in out
+    assert "MemPalace Status" not in out
+
+
 def test_status_handles_none_metadata_without_crash(tmp_path, capsys):
     """status must not crash when col.get returns a None entry in metadatas.
 
@@ -1068,7 +1093,7 @@ def test_status_does_not_cold_load_vector_index(palace_path, seeded_collection, 
 
     sentinel.assert_not_called()
     out = capsys.readouterr().out
-    assert "MemPalace Status — 4 drawers" in out
+    assert "MemPalace Status -- 4 drawers" in out
     assert "WING: project" in out
     assert "WING: notes" in out
 
@@ -1103,7 +1128,7 @@ def test_status_falls_back_to_chroma_when_sqlite_unreadable(palace_path, seeded_
         status(palace_path)
 
     out = capsys.readouterr().out
-    assert "MemPalace Status — 4 drawers" in out
+    assert "MemPalace Status -- 4 drawers" in out
     assert "WING: project" in out
 
 
@@ -1231,6 +1256,354 @@ def test_process_file_uses_bounded_upsert_batches(tmp_path, monkeypatch):
     # stage and passed through to chromadb, so the per-batch embeddings
     # list has the same length as the per-batch documents list.
     assert col.embedding_batch_sizes == [2, 2, 1]
+
+
+def test_process_file_stamps_chunk_total_for_completion_check(tmp_path, monkeypatch):
+    """Every chunk across every batch of one mining pass must carry the
+    same ``chunk_total`` so ``file_already_mined`` can tell a complete
+    multi-batch mine from one that crashed partway through (#21)."""
+    from mempalace import miner
+
+    class FakeCol:
+        def __init__(self):
+            self.metadatas: list = []
+
+        def get(self, *args, **kwargs):
+            return {"ids": []}
+
+        def delete(self, *args, **kwargs):
+            pass
+
+        def upsert(self, documents, ids, metadatas, embeddings=None):
+            self.metadatas.extend(metadatas)
+
+    source = tmp_path / "src.py"
+    source.write_text("print('hello')\n" * 20, encoding="utf-8")
+    chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(5)]
+    col = FakeCol()
+    monkeypatch.setattr(miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
+    monkeypatch.setattr(miner, "chunk_text", lambda content, source_file, **kwargs: chunks)
+    monkeypatch.setattr(miner, "detect_hall", lambda content: "code")
+    monkeypatch.setattr(miner, "_extract_entities_for_metadata", lambda content: "")
+
+    miner.process_file(
+        source,
+        tmp_path,
+        col,
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+    )
+
+    assert len(col.metadatas) == 5
+    assert all(m["chunk_total"] == 5 for m in col.metadatas), (
+        "not every chunk carries the pass's chunk_total — "
+        "file_already_mined can't verify completeness without it on every row"
+    )
+
+
+def test_process_file_stamps_metadata_with_read_time_mtime_not_a_later_restat(
+    tmp_path, monkeypatch
+):
+    """The stored source_mtime must be the one paired with the content
+    that was actually read and chunked, not a fresh os.path.getmtime()
+    call later in the function (#22). Otherwise a file appended to
+    between the read and the old re-stat point gets stamped with an
+    mtime that matches its (now newer) on-disk state, so the next
+    mine's freshness check thinks nothing changed and the appended tail
+    is silently, permanently skipped."""
+    from mempalace import miner
+
+    class FakeCol:
+        def __init__(self):
+            self.metadatas: list = []
+
+        def get(self, *args, **kwargs):
+            return {"ids": []}
+
+        def delete(self, *args, **kwargs):
+            pass
+
+        def upsert(self, documents, ids, metadatas, embeddings=None):
+            self.metadatas.extend(metadatas)
+
+    source = tmp_path / "src.py"
+    source.write_text("print('hello')\n" * 20, encoding="utf-8")
+
+    read_time_mtime = 1_700_000_000.0
+    later_disk_mtime = 1_700_000_999.0  # simulates an append landing after the read
+
+    monkeypatch.setattr(
+        miner,
+        "_read_text_no_follow",
+        lambda filepath, root: ("print('hello')\n" * 20, read_time_mtime),
+    )
+    monkeypatch.setattr(os.path, "getmtime", lambda path: later_disk_mtime)
+    chunks = [{"content": "chunk 0 " * 20, "chunk_index": 0}]
+    col = FakeCol()
+    monkeypatch.setattr(miner, "chunk_text", lambda content, source_file, **kwargs: chunks)
+    monkeypatch.setattr(miner, "detect_hall", lambda content: "code")
+    monkeypatch.setattr(miner, "_extract_entities_for_metadata", lambda content: "")
+
+    miner.process_file(
+        source,
+        tmp_path,
+        col,
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+    )
+
+    assert len(col.metadatas) == 1
+    assert col.metadatas[0]["source_mtime"] == read_time_mtime, (
+        "drawer was stamped with a re-stat'd mtime instead of the one "
+        "paired with the content actually read/chunked"
+    )
+
+
+def test_process_file_aborts_when_stale_drawer_purge_fails(tmp_path, monkeypatch):
+    """A failed stale-drawer purge must abort this file's mine attempt,
+    not silently proceed to upsert on top of it (#23). Proceeding either
+    orphans old tail entries beyond the new chunk count, or overwrites
+    only the overlapping chunk_index positions — not a real re-mine —
+    with zero operator-visible signal unless DEBUG logging happens to be
+    enabled."""
+    from mempalace import miner
+
+    class FailingPurgeCol:
+        def __init__(self):
+            self.upsert_called = False
+
+        def get(self, *args, **kwargs):
+            return {"ids": []}
+
+        def delete(self, *args, **kwargs):
+            raise RuntimeError("simulated transient backend error")
+
+        def upsert(self, documents, ids, metadatas, embeddings=None):
+            self.upsert_called = True
+
+    source = tmp_path / "src.py"
+    source.write_text("print('hello')\n" * 20, encoding="utf-8")
+    chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(3)]
+    col = FailingPurgeCol()
+    monkeypatch.setattr(miner, "chunk_text", lambda content, source_file, **kwargs: chunks)
+    monkeypatch.setattr(miner, "detect_hall", lambda content: "code")
+    monkeypatch.setattr(miner, "_extract_entities_for_metadata", lambda content: "")
+
+    drawers, room, skip_reason = miner.process_file(
+        source,
+        tmp_path,
+        col,
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+    )
+
+    assert col.upsert_called is False, (
+        "process_file inserted new chunks even though the stale-drawer "
+        "purge raised — old and new rows can now coexist as duplicates/orphans"
+    )
+    assert drawers == 0
+
+
+def test_process_file_purges_closets_even_when_all_chunks_filtered_out(tmp_path, monkeypatch):
+    """Old closets must be purged whenever the old drawers were deleted,
+    even if the new content ends up producing zero filed drawers (#24).
+    Otherwise the stale closet entries point at drawer IDs that were
+    just deleted, permanently misdirecting search until the file
+    changes again in a way that produces at least one filed chunk."""
+    from mempalace import miner
+
+    class FakeCol:
+        def get(self, *args, **kwargs):
+            return {"ids": []}
+
+        def delete(self, *args, **kwargs):
+            pass
+
+        def upsert(self, documents, ids, metadatas, embeddings=None):
+            raise AssertionError("no chunks should be upserted in this scenario")
+
+    purged: list = []
+
+    source = tmp_path / "src.py"
+    source.write_text("x" * 200, encoding="utf-8")
+    col = FakeCol()
+    # Content passes the file-level min-length gate, but every individual
+    # chunk gets filtered out downstream (e.g. each fragment falls below
+    # min_chunk_size after boundary-splitting) -- modeled directly here.
+    monkeypatch.setattr(miner, "chunk_text", lambda content, source_file, **kwargs: [])
+    monkeypatch.setattr(
+        miner, "purge_file_closets", lambda closets_col, source_file: purged.append(source_file)
+    )
+    monkeypatch.setattr(
+        miner,
+        "upsert_closet_lines",
+        lambda *a, **kw: pytest.fail("should not rebuild closets with zero drawers"),
+    )
+
+    drawers, room, skip_reason = miner.process_file(
+        source,
+        tmp_path,
+        col,
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+        closets_col=object(),
+    )
+
+    assert drawers == 0
+    assert purged == [str(source)], (
+        "old closets for this source_file were left dangling — they point "
+        "at drawer IDs that collection.delete() already removed"
+    )
+
+
+def test_file_already_mined_detects_incomplete_multi_batch_remine():
+    """A crash between upsert batches must not be mistaken for 'fully
+    mined' (#21). process_file stamps every chunk's metadata with
+    chunk_total (the total chunks expected for this pass). If killed
+    after batch 1 commits but before a later batch, the surviving
+    drawers share the current on-disk mtime (the file itself was never
+    touched) but their count is short of chunk_total — file_already_mined
+    must detect that and report False so the file gets fully re-mined,
+    not silently skipped forever."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        os.makedirs(palace_path)
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+
+        test_file = os.path.join(tmpdir, "big.md")
+        with open(test_file, "w") as f:
+            f.write("content")
+        mtime = os.path.getmtime(test_file)
+
+        # Simulate a crash after only 2 of 3 expected chunks committed.
+        col.add(
+            ids=["d0", "d1"],
+            documents=["chunk 0", "chunk 1"],
+            metadatas=[
+                {
+                    "source_file": test_file,
+                    "source_mtime": mtime,
+                    "normalize_version": NORMALIZE_VERSION,
+                    "chunk_total": 3,
+                },
+                {
+                    "source_file": test_file,
+                    "source_mtime": mtime,
+                    "normalize_version": NORMALIZE_VERSION,
+                    "chunk_total": 3,
+                },
+            ],
+        )
+
+        assert file_already_mined(col, test_file, check_mtime=True) is False, (
+            "2 of 3 expected chunks were treated as a complete mine — the "
+            "missing chunk is now permanently unreachable since the file's "
+            "on-disk mtime never changes again"
+        )
+
+        # The 3rd batch lands (mine resumes/retries and completes the set).
+        col.add(
+            ids=["d2"],
+            documents=["chunk 2"],
+            metadatas=[
+                {
+                    "source_file": test_file,
+                    "source_mtime": mtime,
+                    "normalize_version": NORMALIZE_VERSION,
+                    "chunk_total": 3,
+                }
+            ],
+        )
+        assert file_already_mined(col, test_file, check_mtime=True) is True
+    finally:
+        del col, client
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_process_file_cleans_partial_drawers_after_a_batch_upsert_failure(tmp_path, monkeypatch):
+    """A failed later batch must not leave mtime-stamped drawers that skip retry (#2122)."""
+    from mempalace import miner
+
+    class FailingCollection:
+        def __init__(self):
+            self.records = []
+            self.upsert_calls = 0
+            self.deleted_sources = []
+
+        def get(self, where=None, limit=None, offset=0, include=None):
+            records = self.records
+            if where and "source_file" in where:
+                records = [
+                    record
+                    for record in records
+                    if record["metadata"]["source_file"] == where["source_file"]
+                ]
+            page = records[offset : offset + (limit or len(records))]
+            return {
+                "ids": [record["id"] for record in page],
+                "metadatas": [record["metadata"] for record in page],
+            }
+
+        def delete(self, where=None):
+            source_file = where.get("source_file") if where else None
+            self.deleted_sources.append(source_file)
+            self.records = [
+                record
+                for record in self.records
+                if record["metadata"]["source_file"] != source_file
+            ]
+
+        def upsert(self, documents, ids, metadatas, embeddings=None):
+            self.upsert_calls += 1
+            if self.upsert_calls == 2:
+                raise RuntimeError("simulated second-batch failure")
+            self.records.extend(
+                {"id": drawer_id, "metadata": metadata}
+                for drawer_id, metadata in zip(ids, metadatas)
+            )
+
+    class FakeClosets:
+        def __init__(self):
+            self.deleted_sources = []
+
+        def delete(self, where=None):
+            self.deleted_sources.append(where.get("source_file"))
+
+    source = tmp_path / "src.py"
+    source.write_text("print('hello')\n" * 20, encoding="utf-8")
+    chunks = [{"content": f"chunk {index} " * 20, "chunk_index": index} for index in range(3)]
+    collection = FailingCollection()
+    closets = FakeClosets()
+    monkeypatch.setattr(miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
+    monkeypatch.setattr(miner, "chunk_text", lambda content, source_file, **kwargs: chunks)
+    monkeypatch.setattr(miner, "assert_no_collisions", lambda *args, **kwargs: None)
+
+    with pytest.raises(RuntimeError, match="second-batch failure"):
+        miner.process_file(
+            source,
+            tmp_path,
+            collection,
+            "wing",
+            [{"name": "general", "description": "General"}],
+            "agent",
+            False,
+            closets_col=closets,
+        )
+
+    assert collection.deleted_sources == [str(source), str(source)]
+    assert collection.records == []
+    assert closets.deleted_sources == [str(source)]
+    assert file_already_mined(collection, str(source), check_mtime=True) is False
 
 
 # ── normalize_version schema gate ───────────────────────────────────────
@@ -2081,6 +2454,79 @@ class TestChunkTextLineRanges:
         assert len(chunks) == 1
         assert chunks[0]["line_start"] == 1
         assert chunks[0]["line_end"] == 5
+
+
+def _naive_chunk_line_ranges(content, *, chunk_size, chunk_overlap, min_chunk_size):
+    """Pre-#2054 reference implementation of chunk_text's line locators.
+
+    Same windowing as ``chunk_text`` but recomputes ``(line_start, line_end)``
+    with the original full-prefix ``content.count("\\n", 0, pos)`` form. The
+    incremental-anchor rewrite must stay byte-identical to this on every input,
+    so this is the golden reference the tests below compare against.
+    """
+    content = content.strip()
+    if not content:
+        return []
+    out = []
+    start = 0
+    while start < len(content):
+        end = min(start + chunk_size, len(content))
+        if end < len(content):
+            newline_pos = content.rfind("\n\n", start, end)
+            if newline_pos > start + chunk_size // 2:
+                end = newline_pos
+            else:
+                newline_pos = content.rfind("\n", start, end)
+                if newline_pos > start + chunk_size // 2:
+                    end = newline_pos
+        chunk = content[start:end].strip()
+        if len(chunk) >= min_chunk_size:
+            out.append((content.count("\n", 0, start) + 1, content.count("\n", 0, end) + 1))
+        start = end - chunk_overlap if end < len(content) else end
+    return out
+
+
+class TestChunkTextLineRangesIncremental:
+    """#2054: the O(N) incremental newline tally must match the old O(N*K)
+    full-prefix ``str.count`` form byte-for-byte across varied corpora and
+    configs. Configs stay at ``overlap < size//2`` so ``start``/``end`` advance
+    monotonically (the fast path); the code's from-scratch fallback for a
+    backward step is a defensive guard; a real backward step would also trip a
+    pre-existing infinite loop in the windowing itself, which is out of scope
+    for this locator-perf fix.
+    """
+
+    def test_line_ranges_match_full_prefix_reference(self):
+        import random
+
+        from mempalace.miner import chunk_text
+
+        rng = random.Random(2054)
+        corpora = [
+            "\n".join(f"line {i}" for i in range(1, 501)),  # many short lines
+            "\n\n".join(f"para {i} " + "x" * rng.randint(0, 300) for i in range(60)),
+            "no newlines at all " * 500,  # zero newlines
+            "\n" * 200 + "tail",  # leading blank lines
+            "".join(rng.choice("ab \n\n") for _ in range(5000)),  # random newline density
+            "αβγ\nδεζ\n" * 400,  # non-ASCII
+        ]
+        configs = [
+            (800, 100, 50),  # default config
+            (200, 20, 10),
+            (400, 50, 5),
+            (1000, 200, 30),
+            (2000, 0, 1),  # zero overlap
+        ]
+        for content in corpora:
+            for cs, co, mc in configs:
+                chunks = chunk_text(
+                    content, "/x.md", chunk_size=cs, chunk_overlap=co, min_chunk_size=mc
+                )
+                got = [(c["line_start"], c["line_end"]) for c in chunks]
+                expected = _naive_chunk_line_ranges(
+                    content, chunk_size=cs, chunk_overlap=co, min_chunk_size=mc
+                )
+                assert got == expected, f"cs={cs} co={co} mc={mc}: {got[:6]} != {expected[:6]}"
 
 
 class TestBuildDrawerMetadataLineRange:

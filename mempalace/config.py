@@ -556,9 +556,9 @@ class MempalaceConfig:
 
         if self._config_file.exists():
             try:
-                with open(self._config_file, "r") as f:
+                with open(self._config_file, "r", encoding="utf-8") as f:
                     self._file_config = json.load(f)
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                 self._file_config = {}
 
     @property
@@ -840,9 +840,9 @@ class MempalaceConfig:
         """Mapping of name variants to canonical names."""
         if self._people_map_file.exists():
             try:
-                with open(self._people_map_file, "r") as f:
+                with open(self._people_map_file, "r", encoding="utf-8") as f:
                     return json.load(f)
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                 pass
         return self._file_config.get("people_map", {})
 
@@ -912,7 +912,8 @@ class MempalaceConfig:
 
         Enforces the invariants the miner relies on:
           * ``chunk_size >= 1``
-          * ``0 <= chunk_overlap < chunk_size`` — equality would loop forever
+          * ``0 <= chunk_overlap <= chunk_size // 2``. A larger overlap can
+            loop the miner forever on short-line content (#2056)
           * ``min_chunk_size <= chunk_size`` — otherwise no chunk is ever
             large enough to file, and ingest silently produces 0 drawers
 
@@ -925,12 +926,14 @@ class MempalaceConfig:
             "min_chunk_size", DEFAULT_MIN_CHUNK_SIZE, minimum=0
         )
 
-        if chunk_overlap >= chunk_size:
-            chunk_overlap = (
-                DEFAULT_CHUNK_OVERLAP
-                if DEFAULT_CHUNK_OVERLAP < chunk_size
-                else max(0, chunk_size - 1)
-            )
+        if chunk_overlap > chunk_size // 2:
+            # Overlap past half the chunk size can hang miner.chunk_text's
+            # windowing loop on short-line content (#2056): a boundary pull can
+            # shrink a chunk below chunk_overlap, so
+            # ``start = end - chunk_overlap`` stops advancing. Repair to the
+            # default when it is still at most half, else clamp to the largest
+            # safe overlap.
+            chunk_overlap = min(DEFAULT_CHUNK_OVERLAP, chunk_size // 2)
 
         if min_chunk_size > chunk_size:
             min_chunk_size = (
@@ -946,7 +949,7 @@ class MempalaceConfig:
 
     @property
     def chunk_overlap(self) -> int:
-        """Overlap between adjacent chunks (validated, ``< chunk_size``)."""
+        """Overlap between adjacent chunks (validated, ``<= chunk_size // 2``)."""
         return self._validated_chunk_config()[1]
 
     @property
@@ -1065,7 +1068,9 @@ class MempalaceConfig:
           ``embeddinggemma`` written by onboarding (:meth:`set_embedding_model`);
           the back-compat default is ``"minilm"``.
         * ``provider == "ollama"`` / ``"openai-compat"``: the remote model name
-          (e.g. ``"nomic-embed-text"``), passed verbatim to the endpoint.
+          (e.g. ``"nomic-embed-text"``), passed verbatim to the endpoint. See
+          ``embedding_api_url`` / ``embedding_api_model`` / ``embedding_api_key``
+          for the ``openai-compat`` endpoint's own settings.
 
         Read priority: env ``MEMPALACE_EMBEDDING_MODEL`` first, then the
         ``embedding_model`` key in ``config.json``, then a provider-specific
@@ -1279,6 +1284,52 @@ class MempalaceConfig:
         except (OSError, NotImplementedError):
             pass
 
+    def _resolve_str_setting(self, env_var: str, config_key: str):
+        """Resolve a string setting: env var > ``config.json`` > ``None``.
+
+        Whitespace-only values are treated as unset, so a blank env var or a
+        hand-edited empty config key doesn't mask the value below it. Unlike
+        ``embedding_model`` the result is not lower-cased — URLs, model ids,
+        and API keys are case-sensitive.
+        """
+        env_val = os.environ.get(env_var)
+        if env_val and env_val.strip():
+            return env_val.strip()
+        cfg_val = self._file_config.get(config_key)
+        if isinstance(cfg_val, str) and cfg_val.strip():
+            return cfg_val.strip()
+        return None
+
+    @property
+    def embedding_api_url(self):
+        """Base URL of the OpenAI-compatible ``/v1/embeddings`` endpoint.
+
+        Used only when ``embedding_model == "openai-compat"``. Resolved from
+        env ``MEMPALACE_EMBEDDING_API_URL`` first, then ``embedding_api_url``
+        in ``config.json``; ``None`` when unset. Accepts a bare host, a
+        ``…/v1`` base, or a full endpoint URL.
+        """
+        return self._resolve_str_setting("MEMPALACE_EMBEDDING_API_URL", "embedding_api_url")
+
+    @property
+    def embedding_api_model(self):
+        """Server-side model id for the ``openai-compat`` embeddings endpoint.
+
+        Resolved from env ``MEMPALACE_EMBEDDING_API_MODEL`` first, then
+        ``embedding_api_model`` in ``config.json``; ``None`` when unset.
+        """
+        return self._resolve_str_setting("MEMPALACE_EMBEDDING_API_MODEL", "embedding_api_model")
+
+    @property
+    def embedding_api_key(self):
+        """Optional bearer token / API key for the embeddings endpoint.
+
+        Resolved from env ``MEMPALACE_EMBEDDING_API_KEY`` first, then
+        ``embedding_api_key`` in ``config.json``; ``None`` when unset (for
+        local endpoints that need no auth).
+        """
+        return self._resolve_str_setting("MEMPALACE_EMBEDDING_API_KEY", "embedding_api_key")
+
     @property
     def topic_tunnel_min_count(self):
         """Minimum number of overlapping confirmed topics required to create
@@ -1334,6 +1385,43 @@ class MempalaceConfig:
             self._file_config.get("max_backups", DEFAULT_MAX_BACKUPS), minimum=0
         )
         return DEFAULT_MAX_BACKUPS if coerced is None else coerced
+
+    @property
+    def lang_explicit(self):
+        """Primary language code when explicitly configured, else ``None``.
+
+        Resolution order: ``MEMPALACE_LANG`` / ``MEMPAL_LANG`` env var, then
+        ``config.json["lang"]``. Returns ``None`` if neither is set. Use this
+        when a caller needs to know whether the user has opted in to locale
+        behaviour (e.g. to avoid silently changing search scoring for palaces
+        that have never set a language).
+        """
+        env_val = os.environ.get("MEMPALACE_LANG") or os.environ.get("MEMPAL_LANG")
+        if env_val and env_val.strip():
+            return env_val.strip()
+        cfg = self._file_config.get("lang")
+        if isinstance(cfg, str) and cfg.strip():
+            return cfg.strip()
+        return None
+
+    @property
+    def lang(self):
+        """Primary language code for localized output and display.
+
+        Resolution order: ``lang_explicit`` (env or config.json), first entry
+        of ``entity_languages``, then ``"en"``. Always returns a non-empty
+        string so callers that need a language for display purposes never
+        have to handle ``None``. Code paths that must not silently change
+        behaviour for unconfigured palaces should read ``lang_explicit``
+        instead.
+        """
+        explicit = self.lang_explicit
+        if explicit:
+            return explicit
+        entity_langs = self.entity_languages
+        if entity_langs:
+            return entity_langs[0]
+        return "en"
 
     @property
     def hook_silent_save(self):
@@ -1490,7 +1578,7 @@ class MempalaceConfig:
                 "topic_wings": DEFAULT_TOPIC_WINGS,
                 "hall_keywords": DEFAULT_HALL_KEYWORDS,
             }
-            with open(self._config_file, "w") as f:
+            with open(self._config_file, "w", encoding="utf-8") as f:
                 json.dump(default_config, f, indent=2)
             # Restrict config file to owner read/write only
             try:
@@ -1506,7 +1594,7 @@ class MempalaceConfig:
             people_map: Dict mapping name variants to canonical names.
         """
         self._config_dir.mkdir(parents=True, exist_ok=True)
-        with open(self._people_map_file, "w") as f:
+        with open(self._people_map_file, "w", encoding="utf-8") as f:
             json.dump(people_map, f, indent=2)
         try:
             self._people_map_file.chmod(0o600)
