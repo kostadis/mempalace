@@ -1071,6 +1071,10 @@ class MempalaceConfig:
     def palace_path(self):
         """Path to the memory palace data directory.
 
+        Precedence: constructor override > ``MEMPALACE_PALACE_PATH`` >
+        ``default_palace`` (alias or path) > ``palace_path`` in config.json >
+        the fallback below.
+
         Defaults to the chat palace inside the active config directory
         (``<config dir>/palaces/chat``; ``~/.mempalace/palaces/chat`` unless
         ``MEMPALACE_CONFIG_DIR`` overrides it). Upstream's fallback is
@@ -1085,6 +1089,24 @@ class MempalaceConfig:
             # code path (mcp_server.py:62) and prevent surprise redirection
             # when the env var contains unresolved components.
             return os.path.abspath(os.path.expanduser(env_val))
+        # ``default_palace`` is the declared fallback in palace-isolation.md's
+        # precedence chain; ``palace_path`` is not in that chain. Honour it
+        # first so every reader (MCP server, KG, layers, daemon) agrees with
+        # the CLI's resolved_palace_path() on which palace is the default
+        # (#44). Seeded installs set both to the chat palace, so they see no
+        # change. An unknown alias must not raise inside a property: warn and
+        # fall through to palace_path.
+        default_ref = self._file_config.get("default_palace")
+        if isinstance(default_ref, str) and default_ref.strip():
+            try:
+                return self.resolve_palace(default_ref)
+            except ValueError as exc:
+                logger.warning(
+                    "default_palace %r in %s does not resolve (%s); using palace_path instead",
+                    default_ref,
+                    self._config_file,
+                    exc,
+                )
         return os.path.expanduser(
             self._file_config.get("palace_path", str(self._config_dir / "palaces" / "chat"))
         )
