@@ -14,6 +14,7 @@ import sqlite3
 from types import SimpleNamespace
 import subprocess
 import sys
+import warnings
 from unittest.mock import MagicMock
 
 import pytest
@@ -1376,12 +1377,12 @@ with mine_palace_lock(sys.argv[1]):
         monkeypatch.setattr(mcp_server, "_get_collection", _no_client_open)
 
         stats = mcp_server.tool_graph_stats()
-        # "general" room and the wing-less drawer are excluded, matching
-        # build_graph's per-drawer filter.
-        assert stats["total_rooms"] == 2
+        # "general" is a real room; the wing-less drawer is still excluded.
+        # Existing tripwires above guarantee the collection/HNSW path stays unopened.
+        assert stats["total_rooms"] == 3
         assert stats["tunnel_rooms"] == 1
         assert stats["total_edges"] == 1
-        assert stats["rooms_per_wing"] == {"wing_code": 2, "wing_project": 1}
+        assert stats["rooms_per_wing"] == {"wing_code": 3, "wing_project": 1}
         assert stats["top_tunnels"] == [
             {"room": "chromadb", "wings": ["wing_code", "wing_project"], "count": 2}
         ]
@@ -1908,6 +1909,255 @@ class TestSearchTool:
         result_loose = tool_search(query="JWT", max_distance=0.01, min_similarity=999.0)
         assert len(result_strict["primary"]) <= len(result_loose["primary"])
 
+    @pytest.mark.skip(
+        reason="candidate_strategy='union' is not exposed: local search keeps closets "
+        "out of the primary pool (themes list instead), so search_memories has no "
+        "candidate_strategy parameter and tool_search does not accept one."
+    )
+    def test_search_passes_candidate_strategy(self, monkeypatch, config, kg):
+        """MCP callers can opt into backend BM25/vector union candidate gathering."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        seen = {}
+
+        def fake_search(*args, **kwargs):
+            seen["candidate_strategy"] = kwargs.get("candidate_strategy")
+            return {"results": []}
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+
+        result = mcp_server.tool_search(query="rareterm", candidate_strategy="union")
+
+        assert "error" not in result
+        assert seen["candidate_strategy"] == "union"
+
+    def test_search_preserves_default_max_distance(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        seen = {}
+
+        def fake_search(*args, **kwargs):
+            seen["max_distance"] = kwargs.get("max_distance")
+            return {"results": []}
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+
+        result = mcp_server.tool_search(query="needle")
+
+        assert "error" not in result
+        assert seen["max_distance"] == 1.5
+
+    def test_search_cli_compatible_reuses_hub_collection(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        collection = object()
+        seen = {}
+        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+        monkeypatch.setattr(mcp_server, "_vector_disabled", False)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: collection)
+
+        def fake_cli_search(**kwargs):
+            seen.update(kwargs)
+
+        monkeypatch.setattr(mcp_server, "cli_search", fake_cli_search)
+        monkeypatch.setattr(mcp_server, "_capture_fd_stdout", lambda fn: (fn(), "exact CLI\n"))
+
+        result = mcp_server.tool_search(query="needle", limit=7, cli_compatible=True)
+
+        assert result == {"query": "needle", "cli_output": "exact CLI\n"}
+        assert seen["collection"] is collection
+        assert seen["n_results"] == 7
+
+    def test_search_cli_compatible_rejects_embedder_identity_mismatch(
+        self, monkeypatch, config, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import embedding, mcp_server, palace
+        from mempalace.backends.base import EmbedderIdentity
+
+        collection = MagicMock()
+        collection.effective_embedder_identity.return_value = None
+        collection.get_stored_embedder_identity.return_value = EmbedderIdentity("minilm", 384)
+        monkeypatch.setattr(embedding, "current_model_name", lambda: "embeddinggemma")
+        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+        monkeypatch.setattr(mcp_server, "_vector_disabled", False)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: collection)
+        monkeypatch.setattr(mcp_server, "cli_search", lambda **_kwargs: pytest.fail())
+        palace._VALIDATED_IDENTITY.clear()
+
+        result = mcp_server.tool_search(query="needle", cli_compatible=True)
+
+        assert result["error"] == "Embedder identity mismatch"
+        assert "minilm" in result["details"]
+        assert "embeddinggemma" in result["details"]
+
+    def test_search_cli_compatible_repeats_unknown_embedder_warning(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import embedding, mcp_server, palace
+
+        collection = MagicMock()
+        collection.effective_embedder_identity.return_value = None
+        collection.get_stored_embedder_identity.return_value = None
+        collection.count.return_value = 1
+        monkeypatch.setattr(embedding, "current_model_name", lambda: "minilm")
+        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+        monkeypatch.setattr(mcp_server, "_vector_disabled", False)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: collection)
+        monkeypatch.setattr(mcp_server, "cli_search", lambda **_kwargs: None)
+        monkeypatch.setattr(mcp_server, "_capture_fd_stdout", lambda fn: (fn(), "output\n"))
+        palace._VALIDATED_IDENTITY.clear()
+
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("always")
+                warnings.showwarning = lambda message, *_args, **_kwargs: print(
+                    message, file=sys.stderr
+                )
+                results = [
+                    mcp_server.tool_search(query="needle", cli_compatible=True) for _ in range(2)
+                ]
+        finally:
+            palace._VALIDATED_IDENTITY.clear()
+
+        for result in results:
+            assert result["cli_output"] == "output\n"
+            assert "no recorded embedder identity" in result["cli_error_output"]
+            assert "mempalace palace set-embedder" in result["cli_error_output"]
+
+    def test_search_cli_compatible_serializes_output_capture(self, monkeypatch, config, kg):
+        import threading
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server, palace
+
+        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+        monkeypatch.setattr(mcp_server, "_vector_disabled", False)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: object())
+        monkeypatch.setattr(palace, "_enforce_embedder_identity", lambda *_a, **_kw: None)
+        monkeypatch.setattr(mcp_server, "cli_search", lambda **_kwargs: None)
+
+        state_lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def capture(fn):
+            nonlocal active, max_active
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.1)
+                return fn(), "output\n"
+            finally:
+                with state_lock:
+                    active -= 1
+
+        monkeypatch.setattr(mcp_server, "_capture_fd_stdout", capture)
+        start = threading.Barrier(3)
+
+        def invoke():
+            start.wait()
+            return mcp_server.tool_search(query="needle", cli_compatible=True)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(invoke) for _ in range(2)]
+            start.wait()
+            results = [future.result(timeout=5) for future in futures]
+
+        assert [result["cli_output"] for result in results] == ["output\n", "output\n"]
+        assert max_active == 1
+
+    def test_search_cli_compatible_rejects_non_default_palace(
+        self, monkeypatch, config, kg, tmp_path
+    ):
+        """cli_compatible output is computed against this server's default
+        palace, so a palace= naming another palace must be refused rather
+        than answered from the wrong palace."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        other = str(tmp_path / "other-palace")
+        monkeypatch.setattr(
+            mcp_server,
+            "_resolve_palace_arg",
+            lambda p=None: other if p else os.path.abspath(config.palace_path),
+        )
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda *a, **k: pytest.fail())
+        result = mcp_server.tool_search(query="needle", palace="other", cli_compatible=True)
+
+        assert "default palace" in result["error"]
+
+    def test_search_cli_compatible_rejects_source_file(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: pytest.fail())
+        result = mcp_server.tool_search(query="needle", source_file="notes.md", cli_compatible=True)
+
+        assert "source_file" in result["error"]
+
+    @pytest.mark.parametrize(
+        ("arguments", "control"),
+        [
+            ({"min_similarity": 0.5}, "min_similarity"),
+            ({"max_distance": 0.5}, "max_distance"),
+            ({"context": "background"}, "context"),
+        ],
+    )
+    def test_search_cli_compatible_rejects_ignored_controls(
+        self, monkeypatch, config, kg, arguments, control
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: pytest.fail())
+        result = mcp_server.tool_search(query="needle", cli_compatible=True, **arguments)
+
+        assert control in result["error"]
+
+    def test_search_cli_compatible_returns_stderr(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
+        monkeypatch.setattr(mcp_server, "_vector_disabled", False)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: object())
+
+        def fake_cli_search(**_kwargs):
+            print("legacy metric warning", file=sys.stderr)
+
+        monkeypatch.setattr(mcp_server, "cli_search", fake_cli_search)
+        monkeypatch.setattr(mcp_server, "_capture_fd_stdout", lambda fn: (fn(), "CLI output\n"))
+
+        result = mcp_server.tool_search(query="needle", cli_compatible=True)
+
+        assert result == {
+            "query": "needle",
+            "cli_output": "CLI output\n",
+            "cli_error_output": "legacy metric warning\n",
+        }
+
+    @pytest.mark.skip(
+        reason="candidate_strategy='union' is not exposed: local search keeps closets "
+        "out of the primary pool (themes list instead), so search_memories has no "
+        "candidate_strategy parameter and tool_search does not accept one."
+    )
+    def test_search_rejects_invalid_candidate_strategy(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "search_memories", lambda *a, **kw: pytest.fail())
+
+        result = mcp_server.tool_search(query="rareterm", candidate_strategy="bm25")
+
+        assert "error" in result
+        assert "candidate_strategy" in result["error"]
+
     def test_list_rooms_rejects_invalid_wing(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server
@@ -1969,11 +2219,11 @@ class TestSearchTool:
                 collection_name="custom_drawers",
             ),
         )
-        seen_collection_names = []
+        seen_calls = []
 
         def fake_search(*args, **kwargs):
-            seen_collection_names.append(kwargs.get("collection_name"))
-            if len(seen_collection_names) == 1:
+            seen_calls.append(kwargs.get("collection_name"))
+            if len(seen_calls) == 1:
                 return {
                     "error": "Search error: Error executing plan: Internal error: Error finding id"
                 }
@@ -1983,10 +2233,12 @@ class TestSearchTool:
         monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", lambda: None)
         monkeypatch.setattr(mcp_server.time, "sleep", lambda _: None)
 
+        # Local tool_search has no candidate_strategy (closets stay out of the
+        # primary pool); the collection_name half of this contract still holds.
         result = mcp_server.tool_search(query="anything", wing="wing_api")
 
         assert "results" in result
-        assert seen_collection_names == ["custom_drawers", "custom_drawers"]
+        assert seen_calls == ["custom_drawers", "custom_drawers"]
 
     def test_search_does_not_retry_on_non_transient_error(self, monkeypatch, config, kg):
         """Validation / unrelated errors must not trigger the retry path."""
@@ -2240,6 +2492,31 @@ class TestWriteTools:
 
         result = tool_delete_drawer("nonexistent_drawer")
         assert result["success"] is False
+
+    def test_delete_drawer_purges_matching_closets(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """Deleting a drawer purges its source's closets too, so the AAAK
+        index keeps no stale pointer at the now-deleted drawer (#2325)."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_delete_drawer
+        from mempalace.palace import get_closets_collection
+
+        closets_col = get_closets_collection(palace_path, create=True)
+        closets_col.add(
+            ids=["auth_closet_01"],
+            documents=["topic: JWT session tokens"],
+            metadatas=[{"source_file": "auth.py"}],
+        )
+
+        result = tool_delete_drawer("drawer_proj_backend_aaa")
+        assert result["success"] is True
+        assert result["closets_deleted"] == 1
+
+        # Re-acquire: the staleness reconnect drops chromadb's path-keyed
+        # System cache (#2002), so a handle taken before the call is dead now.
+        closets_col = get_closets_collection(palace_path, create=False)
+        assert closets_col.get(include=[])["ids"] == []
 
     def test_check_duplicate_handles_none_metadata(self, monkeypatch, config, kg):
         """tool_check_duplicate must tolerate None entries in the result lists
@@ -2893,6 +3170,52 @@ class TestWriteTools:
         assert result["success"] is True
         assert result["wing"] == "new_wing"
         assert result["room"] == "new_room"
+
+    def test_update_drawer_content_purges_matching_closets(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """Correcting a drawer's content purges its source's closets, which
+        otherwise keep quoting the pre-correction text indefinitely (#2325)."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_update_drawer
+        from mempalace.palace import get_closets_collection
+
+        closets_col = get_closets_collection(palace_path, create=True)
+        closets_col.add(
+            ids=["auth_closet_01"],
+            documents=["topic: JWT session tokens"],
+            metadatas=[{"source_file": "auth.py"}],
+        )
+
+        result = tool_update_drawer("drawer_proj_backend_aaa", content="[RETRACTED]")
+        assert result["success"] is True
+        assert result["closets_deleted"] == 1
+
+        closets_col = get_closets_collection(palace_path, create=False)
+        assert closets_col.get(include=[])["ids"] == []
+
+    def test_update_drawer_wing_and_room_does_not_purge_closets(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """A wing/room move alone leaves the quoted text correct, so it must
+        not purge closets the way a content edit does (#2325)."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_update_drawer
+        from mempalace.palace import get_closets_collection
+
+        closets_col = get_closets_collection(palace_path, create=True)
+        closets_col.add(
+            ids=["auth_closet_01"],
+            documents=["topic: JWT session tokens"],
+            metadatas=[{"source_file": "auth.py"}],
+        )
+
+        result = tool_update_drawer("drawer_proj_backend_aaa", wing="new_wing", room="new_room")
+        assert result["success"] is True
+        assert result["closets_deleted"] == 0
+
+        closets_col = get_closets_collection(palace_path, create=False)
+        assert len(closets_col.get(include=[])["ids"]) == 1
 
     def test_update_drawer_not_found(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -6153,6 +6476,199 @@ def test_sqlite_integrity_payload_not_applicable_on_non_chroma_backend(monkeypat
     assert payload["errors"] == []
 
 
+def test_sqlite_integrity_payload_reports_no_verdict_when_the_database_is_absent(
+    monkeypatch, tmp_path
+):
+    """A chroma palace with no database file gets the same not-applicable shape.
+
+    #1931 introduced that shape for a backend the check does not apply to, and
+    the gate reaches it by backend name. A chroma palace whose chroma.sqlite3
+    was never created therefore still answered ``checked``/``ok`` true, stating
+    a quick_check that never ran.
+    """
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(
+        type(mcp_server._config), "palace_path", property(lambda self: str(tmp_path))
+    )
+    monkeypatch.setattr(mcp_server, "_selected_backend_name", lambda: "chroma")
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", True)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+    monkeypatch.setattr(
+        mcp_server,
+        "_sqlite_integrity_no_verdict_reason",
+        f"no quick_check ran: {tmp_path / 'chroma.sqlite3'} does not exist",
+    )
+
+    payload = mcp_server._sqlite_integrity_payload()
+
+    assert payload["checked"] is False
+    assert payload["ok"] is None
+    assert "does not exist" in payload["reason"]
+    assert payload["error_count"] == 0
+    assert payload["errors"] == []
+    # The path is still named: it is the file the operator is missing.
+    assert payload["sqlite_path"].endswith("chroma.sqlite3")
+
+
+def test_refresh_sqlite_integrity_status_records_absence_not_a_clean_verdict(monkeypatch, tmp_path):
+    """The palace directory exists and holds no database: no verdict, no errors."""
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(
+        type(mcp_server._config), "palace_path", property(lambda self: str(tmp_path))
+    )
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: True)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_no_verdict_reason", "")
+
+    mcp_server._refresh_sqlite_integrity_status()
+
+    assert mcp_server._sqlite_integrity_errors == []
+    assert "chroma.sqlite3" in mcp_server._sqlite_integrity_no_verdict_reason
+    # The probe attempt is still recorded, so the lazy consumers do not re-run it.
+    assert mcp_server._sqlite_integrity_checked is True
+
+
+def test_refresh_sqlite_integrity_status_clears_absence_once_a_database_exists(
+    monkeypatch, tmp_path
+):
+    """A stale "no database" must not outlive a probe that found one.
+
+    Scoped to the path where the probe ran: the size-limit exit records no
+    reason of its own, and clears the previous one rather than inheriting it.
+
+    The probe is the real one, against a real minimal database, so the clearing
+    is observed rather than arranged.
+    """
+    from mempalace import mcp_server
+
+    make_minimal_chroma_sqlite(tmp_path)
+    # The payload call below resolves the backend for real, and resolution
+    # reads MEMPALACE_BACKEND. A developer machine that sets it would send
+    # this test down the not-applicable branch instead.
+    monkeypatch.delenv("MEMPALACE_BACKEND", raising=False)
+    monkeypatch.delenv("MEMPALACE_BACKEND_EXPLICIT", raising=False)
+    monkeypatch.setattr(
+        type(mcp_server._config), "palace_path", property(lambda self: str(tmp_path))
+    )
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: True)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+    monkeypatch.setattr(
+        mcp_server, "_sqlite_integrity_no_verdict_reason", "no quick_check ran: stale"
+    )
+
+    mcp_server._refresh_sqlite_integrity_status()
+
+    assert mcp_server._sqlite_integrity_no_verdict_reason == ""
+    assert mcp_server._sqlite_integrity_payload()["ok"] is True
+
+
+@pytest.mark.parametrize(
+    "palace_path, is_chroma",
+    [("", True), (None, True), ("/nonexistent/palace", False)],
+    ids=["palace-path-empty", "palace-path-none", "non-chroma-backend"],
+)
+def test_refresh_sqlite_integrity_status_clears_absence_on_the_exits_that_never_probe(
+    monkeypatch, palace_path, is_chroma
+):
+    """The exit taken before the probe owns no reason, so it may not keep one.
+
+    All three parameters reach the same ``if not _config.palace_path or not
+    _is_chroma_backend()`` return, which fires before any quick_check. What is
+    asserted here is the gate's own state after that return, not the payload:
+    a server that saw a palace with no database and was then pointed elsewhere
+    must not still be holding that palace's reason. The empty-palace-path route
+    is why it matters, since ``_sqlite_integrity_payload`` would publish a kept
+    reason there while naming no palace at all.
+    """
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(type(mcp_server._config), "palace_path", property(lambda self: palace_path))
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: is_chroma)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", ["stale"])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "stale probe error")
+    monkeypatch.setattr(
+        mcp_server,
+        "_sqlite_integrity_no_verdict_reason",
+        "no quick_check ran: /gone/chroma.sqlite3 does not exist",
+    )
+
+    mcp_server._refresh_sqlite_integrity_status()
+
+    assert mcp_server._sqlite_integrity_no_verdict_reason == ""
+    assert mcp_server._sqlite_integrity_errors == []
+    assert mcp_server._sqlite_integrity_check_error == ""
+    assert mcp_server._sqlite_integrity_checked is True
+
+
+def test_absence_reason_is_written_first_entering_and_last_leaving():
+    """Order the two globals so entering "no verdict" has no clean-looking gap.
+
+    ``_sqlite_integrity_payload`` reads both globals without the refresh lock.
+    Recording the reason before the errors closes the window on the way in: a
+    reader cannot catch an empty list that nothing explains. The way out keeps
+    the reason until the errors are in place, which is the best available
+    there, not a guarantee; no write order makes both directions safe, because
+    the writer sets the pair in opposite orders in the two branches. Both
+    pairs are adjacent assignments on one thread, which no behavioural test
+    can observe, so assert the order structurally.
+    """
+    import ast
+    import inspect
+
+    from mempalace import mcp_server
+
+    tree = ast.parse(inspect.getsource(mcp_server._refresh_sqlite_integrity_status_locked))
+
+    def _assigned_name(node):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, ast.Name):
+                return target.id
+        return None
+
+    branches = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Attribute)
+        and node.test.attr == "checked"
+        and node.orelse
+    ]
+    assert len(branches) == 1, "expected exactly one `if status.checked:` branch"
+
+    checked, absent = branches[0].body, branches[0].orelse
+    assert _assigned_name(absent[0]) == "_sqlite_integrity_no_verdict_reason"
+    assert _assigned_name(absent[1]) == "_sqlite_integrity_errors"
+    assert _assigned_name(checked[0]) == "_sqlite_integrity_errors"
+    assert _assigned_name(checked[-1]) == "_sqlite_integrity_no_verdict_reason"
+
+    # The probe-failed exit is the third writer this test covers. Its error
+    # list is non-empty by construction, so no reader can catch an unexplained
+    # empty one there; the order is asserted anyway, so the branch cannot
+    # drift into a shape where that stops being true.
+    handlers = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ExceptHandler)
+        and any(_assigned_name(stmt) == "_sqlite_integrity_errors" for stmt in node.body)
+    ]
+    assert len(handlers) == 1, "expected exactly one except branch recording the errors"
+    names = [_assigned_name(stmt) for stmt in handlers[0].body]
+    assert "_sqlite_integrity_errors" in names
+    assert "_sqlite_integrity_no_verdict_reason" in names
+    assert names.index("_sqlite_integrity_errors") < names.index(
+        "_sqlite_integrity_no_verdict_reason"
+    )
+
+
 def test_sqlite_integrity_payload_reports_unknown_when_backend_unresolvable(monkeypatch):
     """#1931: if backend resolution raises, status still must not claim an
     integrity pass; it reports not-applicable for an unknown backend.
@@ -6185,6 +6701,12 @@ def test_sqlite_integrity_payload_full_shape_on_chroma_backend(monkeypatch):
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", True)
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+    # A verdict exists, so no absence is recorded. Stated because this is the
+    # one payload test that reaches the reason branch at all: the other two
+    # return earlier on a non-chroma backend. Nothing in the module is known
+    # to leave the global set, but the gate writes it directly rather than
+    # through a fixture, so the input is pinned rather than assumed.
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_no_verdict_reason", "")
 
     payload = mcp_server._sqlite_integrity_payload()
 
@@ -6234,16 +6756,26 @@ def test_sqlite_integrity_reconnect_allowed_when_corrupt(monkeypatch):
     assert '"success": true' in response["result"]["content"][0]["text"]
 
 
-def test_refresh_sqlite_integrity_status_records_quick_check_errors(monkeypatch):
+def test_refresh_sqlite_integrity_status_records_quick_check_errors(monkeypatch, tmp_path):
     from mempalace import mcp_server, repair
 
+    # The database path resolves: the probe reports a verdict wherever the file
+    # is not provably absent, and this test is about the verdict's contents.
+    make_minimal_chroma_sqlite(tmp_path)
+    monkeypatch.setattr(
+        type(mcp_server._config), "palace_path", property(lambda self: str(tmp_path))
+    )
     monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: True)
+    # sqlite_integrity_status is the seam the gate reads; sqlite_integrity_errors
+    # is no longer on that path, so patching it here would inject nothing.
     monkeypatch.setattr(
         repair,
-        "sqlite_integrity_errors",
-        lambda palace_path: [
-            "malformed inverted index for FTS5 table main.embedding_fulltext_search"
-        ],
+        "sqlite_integrity_status",
+        lambda palace_path: repair.SqliteIntegrityStatus(
+            checked=True,
+            errors=("malformed inverted index for FTS5 table main.embedding_fulltext_search",),
+            reason="",
+        ),
     )
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
@@ -6273,16 +6805,24 @@ def test_refresh_sqlite_integrity_status_skips_oversized_db(monkeypatch, tmp_pat
         called["n"] += 1
         raise AssertionError("quick_check must not run for oversized DB")
 
-    monkeypatch.setattr(repair, "sqlite_integrity_errors", _boom)
+    monkeypatch.setattr(repair, "sqlite_integrity_status", _boom)
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", ["stale"])
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+    # Every piece of stale state, including a previous probe's reason for
+    # having no verdict: a palace that had no database at startup and an
+    # oversized one now must not still be described as having none.
+    monkeypatch.setattr(
+        mcp_server, "_sqlite_integrity_no_verdict_reason", "no quick_check ran: stale"
+    )
 
     mcp_server._refresh_sqlite_integrity_status()
 
     assert called["n"] == 0
     assert mcp_server._sqlite_integrity_checked is True
     assert mcp_server._sqlite_integrity_errors == []
+    assert mcp_server._sqlite_integrity_no_verdict_reason == ""
+    assert "does not exist" not in json.dumps(mcp_server._sqlite_integrity_payload())
 
 
 def test_refresh_sqlite_integrity_status_runs_when_under_limit(monkeypatch, tmp_path):
@@ -6300,9 +6840,9 @@ def test_refresh_sqlite_integrity_status_runs_when_under_limit(monkeypatch, tmp_
 
     def _spy(palace_path):
         called["n"] += 1
-        return []
+        return repair.SqliteIntegrityStatus(checked=True, errors=(), reason="")
 
-    monkeypatch.setattr(repair, "sqlite_integrity_errors", _spy)
+    monkeypatch.setattr(repair, "sqlite_integrity_status", _spy)
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
@@ -6328,9 +6868,9 @@ def test_startup_integrity_size_gate_disabled_with_zero(monkeypatch, tmp_path):
 
     def _spy(palace_path):
         called["n"] += 1
-        return []
+        return repair.SqliteIntegrityStatus(checked=True, errors=(), reason="")
 
-    monkeypatch.setattr(repair, "sqlite_integrity_errors", _spy)
+    monkeypatch.setattr(repair, "sqlite_integrity_status", _spy)
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", False)
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
@@ -6529,6 +7069,66 @@ class TestStaleLibraryGate:
         hint = refusal["error"]["data"]["hint"]
         assert "mempalace_reconnect" in hint, "the hint must rule out the wrong remedy by name"
         assert "MEMPALACE_MCP_ALLOW_STALE_LIBRARY" in hint
+
+    def test_refusal_message_names_the_remedy(self, monkeypatch):
+        """Several MCP clients surface only the top-level message and drop
+        `data`, so the message alone must be enough to act on."""
+        from mempalace import mcp_server
+
+        self._reset(monkeypatch)
+        self._versions(monkeypatch, {"mempalace": "3.6.0"}, {"mempalace": "3.7.0"})
+
+        refusal = mcp_server._mcp_stale_library_refusal(1, "mempalace_add_drawer")
+
+        message = refusal["error"]["message"].lower()
+        assert "restart" in message
+        assert "mempalace_reconnect cannot clear this" in refusal["error"]["message"]
+
+    def test_reconnect_result_warns_when_stale(self, monkeypatch):
+        """A reconnect after an upgrade must not answer plain success while
+        every write keeps failing — reconnect cannot reload Python modules."""
+        from mempalace import mcp_server
+
+        self._reset(monkeypatch)
+        self._versions(monkeypatch, {"mempalace": "3.6.0"}, {"mempalace": "3.7.0"})
+
+        result = mcp_server._attach_stale_library_warning(
+            {"success": True, "message": "Reconnected to palace"}
+        )
+
+        assert result["restart_required"] is True
+        assert "restart" in result["warning"].lower()
+        assert "writes stay refused" in result["warning"]
+        assert result["library_versions"]["packages"] == [
+            {"package": "mempalace", "serving": "3.6.0", "installed": "3.7.0"}
+        ]
+
+    def test_reconnect_result_clean_when_versions_match(self, monkeypatch):
+        from mempalace import mcp_server
+
+        self._reset(monkeypatch)
+        self._versions(monkeypatch, {"mempalace": "3.6.0"}, {"mempalace": "3.6.0"})
+
+        result = mcp_server._attach_stale_library_warning(
+            {"success": True, "message": "Reconnected to palace"}
+        )
+
+        assert set(result) == {"success", "message"}
+
+    def test_reconnect_warning_suppressed_by_escape_hatch(self, monkeypatch):
+        """With the gate disabled writes actually work, so warning that they
+        are refused would be false."""
+        from mempalace import mcp_server
+
+        self._reset(monkeypatch)
+        self._versions(monkeypatch, {"mempalace": "3.6.0"}, {"mempalace": "3.7.0"})
+        monkeypatch.setenv("MEMPALACE_MCP_ALLOW_STALE_LIBRARY", "1")
+
+        result = mcp_server._attach_stale_library_warning(
+            {"success": True, "message": "Reconnected to palace"}
+        )
+
+        assert set(result) == {"success", "message"}
 
     def test_status_payload_carries_its_documented_fields(self, monkeypatch):
         """website/reference/mcp-tools.md promises these keys."""
@@ -6946,6 +7546,11 @@ class TestStaleLibraryGate:
 
         self._reset(monkeypatch)
         self._versions(monkeypatch, {"mempalace": "3.6.0"}, {"mempalace": "3.7.0"})
+        monkeypatch.setattr(
+            "mempalace.update_awareness.cached_update_status",
+            lambda: {"enabled": True, "installed": "3.6.0", "available": True},
+        )
+        monkeypatch.setattr("mempalace.update_awareness.schedule_update_check", lambda: False)
 
         decorated = mcp_server._decorate_mcp_tool_result("mempalace_status", {"total_drawers": 0})
 
@@ -6953,6 +7558,13 @@ class TestStaleLibraryGate:
         assert decorated["library_versions"]["packages"] == [
             {"package": "mempalace", "serving": "3.6.0", "installed": "3.7.0"}
         ]
+        assert decorated["updates"] == {
+            "server": {
+                "enabled": True,
+                "installed": "3.6.0",
+                "available": True,
+            }
+        }
 
     def test_unreadable_metadata_fails_open_but_says_so(self, monkeypatch):
         """An unreadable metadata directory must not take the server down, but
@@ -8101,3 +8713,40 @@ class TestSearchDateFilters:
         assert "before" in schema["properties"]
         assert schema["properties"]["since"]["type"] == "string"
         assert schema["properties"]["before"]["type"] == "string"
+
+
+def test_2288_grouped_graph_stats_count_distinct_room_instances(monkeypatch):
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(
+        mcp_server,
+        "_load_graph_tunnels",
+        lambda config=None: [{"id": "t1"}, {"id": "t2"}],
+    )
+    rows = [
+        ("fact", "desercion", "facts", 1, "2026-01-01"),
+        ("general", "desercion-pascual", "misc", 1, "2026-01-01"),
+        ("general", "desertion", "misc", 2, "2026-01-02"),
+        # Same placement, different hall: this must not add a room instance.
+        ("general", "desertion", "other", 3, "2026-01-03"),
+        ("heatstgnn-model-selection", "desertion", "models", 1, "2026-01-01"),
+        ("diary", "desertion", "journal", 1, "2026-01-01"),
+        ("general", "matlab-drive", "misc", 1, "2026-01-01"),
+        ("documentation", "octopus", "docs", 1, "2026-01-01"),
+        ("plans", "octopus", "plans", 1, "2026-01-01"),
+        ("controller", "octopus", "control", 1, "2026-01-01"),
+    ]
+    stats = mcp_server._graph_stats_from_grouped_rows(rows)
+
+    assert stats["total_rooms"] == 7
+    assert stats["total_room_instances"] == 9
+    assert stats["tunnel_rooms"] == stats["passive_tunnel_rooms"] == 1
+    assert stats["explicit_tunnels"] == 2
+    assert stats["total_connections"] == stats["total_edges"] + 2
+    assert set(stats["rooms_per_wing"]) == {
+        "desercion",
+        "desercion-pascual",
+        "desertion",
+        "matlab-drive",
+        "octopus",
+    }

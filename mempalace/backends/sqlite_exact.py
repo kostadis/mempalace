@@ -222,6 +222,10 @@ _CACHED_META_KEYS = frozenset({"wing", "room", "source_file"})
 # "search the wing/room, not the whole palace" — as a sqlite index.
 _LOCUS_FIELDS = ("wing", "room", "hall")
 _LOCUS_INDEX = "idx_documents_coll_wing_room_hall"
+# Expression index for closet-enrichment ``get(where={source_file})``.
+# Locus columns stay wing/room/hall (low-cardinality facets); source_file
+# is high-cardinality and stays in metadata_json.
+_SOURCE_FILE_INDEX = "idx_documents_coll_source_file"
 
 
 def _json_field_sql(key: str) -> str:
@@ -464,8 +468,10 @@ class _SQLiteExactHandle:
         # collection_id -> (ids, float32 matrix, mini-metadata). Filled lazily
         # by query() so a long-lived hub does not re-read every embedding blob
         # on the next search. Mini-metadata is wing/room/source_file for
-        # in-memory equality filters. Cleared on any write.
+        # in-memory equality filters. Cleared on any write through this handle;
+        # ``_vector_cache_data_version`` detects commits from other handles.
         self._vector_cache: dict[int, tuple[list[str], np.ndarray, list[dict]]] = {}
+        self._vector_cache_data_version: Optional[int] = None
 
 
 class SQLiteExactCollection(BaseCollection):
@@ -958,6 +964,10 @@ class SQLiteExactCollection(BaseCollection):
         _validate_where(where_document)
         expected = self._collection_dimension(cur, collection_id)
         empty = np.zeros((0, expected or 0), dtype=np.float32)
+        data_version = int(cur.execute("PRAGMA data_version").fetchone()[0])
+        if self._handle._vector_cache_data_version != data_version:
+            self._handle._vector_cache.clear()
+            self._handle._vector_cache_data_version = data_version
         cached = self._handle._vector_cache.get(collection_id)
         if cached is None:
             cached = self._load_all_vectors(cur, collection_id, expected)
@@ -1054,11 +1064,25 @@ class SQLiteExactCollection(BaseCollection):
     ) -> GetResult:
         spec = _IncludeSpec.resolve(include, default_distances=False)
         # get(ids=...) must not scan the collection: look up by primary key.
-        if ids is not None and where is None and where_document is None:
+        if ids is not None:
+            _validate_where(where)
+            _validate_where(where_document)
+            lookup_spec = _IncludeSpec(
+                documents=spec.documents or bool(where_document),
+                metadatas=spec.metadatas or bool(where),
+                distances=False,
+                embeddings=spec.embeddings,
+            )
             with self._cursor() as cur:
                 collection_id = self._collection_id(cur)
-                by_id = self._rows_by_ids(cur, collection_id, list(ids), spec)
-            rows = [by_id[doc_id] for doc_id in ids if doc_id in by_id]
+                by_id = self._rows_by_ids(cur, collection_id, list(ids), lookup_spec)
+            rows = [
+                by_id[doc_id]
+                for doc_id in ids
+                if doc_id in by_id
+                and _matches_where(by_id[doc_id]["metadata"], where)
+                and _matches_where_document(by_id[doc_id]["document"], where_document)
+            ]
             if offset:
                 rows = rows[offset:]
             if limit is not None:
@@ -1268,8 +1292,22 @@ class SQLiteExactCollection(BaseCollection):
             with self._cursor() as cur:
                 page_count = cur.execute("PRAGMA page_count").fetchone()
                 freelist = cur.execute("PRAGMA freelist_count").fetchone()
+                data_version = cur.execute("PRAGMA data_version").fetchone()
             state["page_count"] = int(page_count[0]) if page_count else 0
             state["freelist_pages"] = int(freelist[0]) if freelist else 0
+            db_path = SQLiteExactBackend._db_path(self._handle.palace_path)
+            file_token = []
+            for suffix in ("", "-wal"):
+                path = f"{db_path}{suffix}"
+                try:
+                    stat = os.stat(path)
+                    file_token.append([suffix or "db", stat.st_size, stat.st_mtime_ns])
+                except FileNotFoundError:
+                    file_token.append([suffix or "db", None, None])
+            state["consistency_token"] = {
+                "data_version": int(data_version[0]) if data_version else 0,
+                "files": file_token,
+            }
         except Exception:
             pass
         return state
@@ -1527,12 +1565,13 @@ class SQLiteExactBackend(BaseBackend):
 
     @staticmethod
     def _ensure_locus_columns(conn: sqlite3.Connection) -> None:
-        """Add VIRTUAL wing/room/hall columns and a composite index.
+        """Add VIRTUAL wing/room/hall columns, the locus index, and source_file.
 
         VIRTUAL generated columns are metadata-only (no table rewrite), so a
         1.6 GB palace does not copy embedding blobs. CREATE INDEX walks
         metadata_json once and stores the loci. Existing palaces migrate
-        here on the next writable open.
+        here on the next writable open. The source_file expression index is
+        the closet-enrichment lookup (``get(where={source_file})``).
         """
         cols = _document_column_names(conn)
         for field in _LOCUS_FIELDS:
@@ -1550,6 +1589,15 @@ class SQLiteExactBackend(BaseBackend):
             f"""
             CREATE INDEX IF NOT EXISTS {_LOCUS_INDEX}
                 ON documents(collection_id, wing, room, hall)
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS {_SOURCE_FILE_INDEX}
+                ON documents(
+                    collection_id,
+                    (json_extract(metadata_json, '$.source_file'))
+                )
             """
         )
 

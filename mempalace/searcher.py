@@ -269,6 +269,64 @@ def _metric_for_collection(col) -> str:
     return metric if metric in ("cosine", "l2", "ip") else "cosine"
 
 
+def _vector_distance(
+    query_vector: list[float], candidate_vector: list[float], metric: str
+) -> float:
+    """Return a backend-style distance between two already-normalized vectors."""
+    if not query_vector or not candidate_vector or len(query_vector) != len(candidate_vector):
+        raise ValueError("embedding dimensions do not match")
+
+    if metric == "l2":
+        return math.sqrt(sum((a - b) ** 2 for a, b in zip(query_vector, candidate_vector)))
+
+    dot = sum(a * b for a, b in zip(query_vector, candidate_vector))
+    if metric == "ip":
+        return -dot
+
+    q_norm = math.sqrt(sum(a * a for a in query_vector))
+    c_norm = math.sqrt(sum(b * b for b in candidate_vector))
+    if q_norm == 0.0 or c_norm == 0.0:
+        raise ValueError("zero-norm embedding")
+    return 1.0 - (dot / (q_norm * c_norm))
+
+
+def _lexical_hit_vector_distances(drawers_col, query: str, lexical_hits: list, metric: str) -> dict:
+    """Compute vector distances for lexical hits when stored embeddings are available."""
+    ids = [hit.id for hit in lexical_hits if getattr(hit, "id", None)]
+    if not ids:
+        return {}
+
+    try:
+        from .backends.embedding_wrapper import _embed_texts
+
+        query_vector = _embed_texts([query])[0]
+        stored = drawers_col.get(ids=ids, include=["embeddings"])
+    except Exception:
+        logger.debug(
+            "candidate_strategy=union: failed to load lexical hit embeddings", exc_info=True
+        )
+        return {}
+
+    stored_ids = getattr(stored, "ids", None) if not isinstance(stored, dict) else stored.get("ids")
+    embeddings = (
+        getattr(stored, "embeddings", None)
+        if not isinstance(stored, dict)
+        else stored.get("embeddings")
+    )
+    if not stored_ids or not embeddings:
+        return {}
+
+    distances = {}
+    for doc_id, candidate_vector in zip(stored_ids, embeddings):
+        try:
+            distances[doc_id] = _vector_distance(query_vector, candidate_vector, metric)
+        except Exception:
+            logger.debug(
+                "candidate_strategy=union: failed to score lexical hit %s", doc_id, exc_info=True
+            )
+    return distances
+
+
 def _hybrid_rank(
     results: list,
     query: str,
@@ -659,6 +717,7 @@ def search(
     n_results: int = 5,
     since: str = None,
     before: str = None,
+    collection=None,
 ):
     """
     Search the palace. Returns verbatim drawer content.
@@ -685,32 +744,34 @@ def search(
     # collection.count(); both happen before the old query-only guard and can
     # hit the same native crash. Non-Chroma backends never use Chroma's HNSW
     # files or sqlite-specific fallback and proceed normally.
-    try:
-        backend_name = resolve_backend_name(palace_path)
-    except (BackendMismatchError, KeyError):
-        # Preserve _open_collection_or_explain's state-specific diagnostics
-        # for mixed artifacts and unknown backend selections. This probe is
-        # only an early Chroma safety fence; it must not become a second,
-        # less-helpful backend validation path.
-        backend_name = None
-
-    if backend_name == "chroma" and _hnsw_capacity_diverged(palace_path):
-        return _print_search_results_bm25_only(
-            query,
-            palace_path,
-            wing,
-            room,
-            n_results,
-            stop_words=stop_words,
-            since_dt=since_dt,
-            before_dt=before_dt,
-        )
-
-    col = _open_collection_or_explain(palace_path, opener=get_collection)
+    col = collection
     if col is None:
-        if not os.path.isdir(palace_path):
-            raise SearchError(f"No palace found at {palace_path}")
-        raise SearchError(f"No palace database at {palace_path}")
+        try:
+            backend_name = resolve_backend_name(palace_path)
+        except (BackendMismatchError, KeyError):
+            # Preserve _open_collection_or_explain's state-specific diagnostics
+            # for mixed artifacts and unknown backend selections. This probe is
+            # only an early Chroma safety fence; it must not become a second,
+            # less-helpful backend validation path.
+            backend_name = None
+
+        if backend_name == "chroma" and _hnsw_capacity_diverged(palace_path):
+            return _print_search_results_bm25_only(
+                query,
+                palace_path,
+                wing,
+                room,
+                n_results,
+                stop_words=stop_words,
+                since_dt=since_dt,
+                before_dt=before_dt,
+            )
+
+        col = _open_collection_or_explain(palace_path, opener=get_collection)
+        if col is None:
+            if not os.path.isdir(palace_path):
+                raise SearchError(f"No palace found at {palace_path}")
+            raise SearchError(f"No palace database at {palace_path}")
 
     # Alert the user if this palace predates hnsw:space=cosine being set on
     # creation — their similarity scores will be junk until they run repair.

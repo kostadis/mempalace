@@ -11,6 +11,9 @@ cross-lingual cosine ~0.88 vs MiniLM's ~0.35, lazy-downloaded on first use):
   matches ChromaDB's library default so palaces created with the default EF
   remain readable. Hardware device selected by
   :attr:`MempalaceConfig.embedding_device` (auto/cpu/cuda/coreml/dml).
+  ``embeddinggemma``'s ``session.run()`` sub-batch size (32 docs by default,
+  #1770) is overridable via ``MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE`` or
+  ``embeddinggemma_batch_size`` in ``config.json`` (#2330).
 * ``ollama`` — remote (or local) Ollama HTTP endpoint, model and dimension
   chosen by :attr:`MempalaceConfig.embedding_model`. Useful for offloading
   embedding work to a separate GPU box. See ``embedding_ollama.py``.
@@ -182,6 +185,21 @@ def _resolve_intra_op_threads() -> int:
     except Exception:
         logger.debug("embedding_threads resolution failed; leaving ORT default", exc_info=True)
         return 0
+
+
+def _resolve_embeddinggemma_batch_size() -> int:
+    """Read the configured EmbeddingGemma sub-batch size (#2330)."""
+    try:
+        from .config import MempalaceConfig
+
+        return MempalaceConfig().embeddinggemma_batch_size
+    except Exception:
+        logger.debug(
+            "embeddinggemma_batch_size resolution failed; using the %d default",
+            _EMBEDDINGGEMMA_BATCH_SIZE,
+            exc_info=True,
+        )
+        return _EMBEDDINGGEMMA_BATCH_SIZE
 
 
 def _build_ef_class():
@@ -850,7 +868,11 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
 
         threads = _resolve_intra_op_threads()
         if model == "embeddinggemma":
-            ef = EmbeddinggemmaONNX(preferred_providers=providers, intra_op_num_threads=threads)
+            ef = EmbeddinggemmaONNX(
+                preferred_providers=providers,
+                intra_op_num_threads=threads,
+                batch_size=_resolve_embeddinggemma_batch_size(),
+            )
         else:
             # Default: minilm (or anything we don't recognize — back-compat win).
             ef_cls = _build_ef_class()

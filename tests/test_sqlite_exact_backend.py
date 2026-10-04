@@ -145,6 +145,37 @@ def test_sqlite_exact_get_preserves_requested_id_order_and_duplicates(tmp_path):
     assert result.documents == ["doc b", "doc a", "doc b"]
 
 
+@pytest.mark.parametrize(
+    "filters",
+    [
+        {"where": {"wing": "keep"}},
+        {"where_document": {"$contains": "needle"}},
+        {
+            "where": {"wing": "keep"},
+            "where_document": {"$contains": "needle"},
+        },
+    ],
+)
+def test_sqlite_exact_get_ids_intersects_filters(tmp_path, filters):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["requested", "not-requested", "filtered-out"],
+        documents=["needle requested", "needle other", "different"],
+        metadatas=[{"wing": "keep"}, {"wing": "keep"}, {"wing": "drop"}],
+        embeddings=[[1, 0], [0, 1], [0.5, 0.5]],
+    )
+
+    result = col.get(
+        ids=["filtered-out", "requested", "requested"],
+        include=[],
+        **filters,
+    )
+
+    assert result.ids == ["requested", "requested"]
+    assert result.documents == []
+    assert result.metadatas == []
+
+
 def _doc_select_sql(col, action):
     """Run ``action`` while tracing SQL; return (result, [documents SELECTs]).
 
@@ -891,10 +922,12 @@ def test_search_union_uses_sqlite_exact_lexical_search(tmp_path, monkeypatch):
         str(tmp_path),
         n_results=1,
         candidate_strategy="union",
+        max_distance=1.5,
     )
 
     assert result["results"][0]["source_file"] == "rare.md"
     assert result["results"][0]["matched_via"] == "bm25_backend"
+    assert result["results"][0]["distance"] <= 1.5
 
 
 def test_search_closets_use_lexical_not_vector_on_sqlite_exact(tmp_path, monkeypatch):
@@ -1220,6 +1253,37 @@ def test_sqlite_exact_query_cache_invalidates_on_add(tmp_path):
     assert second.ids[0] == ["new"]
 
 
+def test_sqlite_exact_query_cache_invalidates_after_external_handle_write(tmp_path):
+    reader_backend, reader = _collection(tmp_path)
+    reader.add(
+        ids=["old"],
+        documents=["old"],
+        metadatas=[{}],
+        embeddings=[[0.0, 1.0]],
+    )
+    first = reader.query(query_embeddings=[[1.0, 0.0]], n_results=1)
+    assert first.ids[0] == ["old"]
+
+    writer_backend = SQLiteExactBackend()
+    writer = writer_backend.get_collection(
+        palace=PalaceRef(id=str(tmp_path), local_path=str(tmp_path)),
+        collection_name="mempalace_drawers",
+        create=False,
+    )
+    writer.add(
+        ids=["new"],
+        documents=["new"],
+        metadatas=[{}],
+        embeddings=[[1.0, 0.0]],
+    )
+
+    second = reader.query(query_embeddings=[[1.0, 0.0]], n_results=2)
+    assert second.ids[0] == ["new", "old"]
+
+    writer_backend.close()
+    reader_backend.close()
+
+
 def test_sqlite_exact_wing_room_counts(tmp_path):
     from mempalace.backends.sqlite_exact import sqlite_wing_room_counts
 
@@ -1321,7 +1385,11 @@ def test_sqlite_exact_equality_where_uses_locus_column(tmp_path):
 
 def test_sqlite_exact_migrates_locus_columns_on_existing_palace(tmp_path):
     import numpy as np
-    from mempalace.backends.sqlite_exact import _LOCUS_FIELDS, _LOCUS_INDEX
+    from mempalace.backends.sqlite_exact import (
+        _LOCUS_FIELDS,
+        _LOCUS_INDEX,
+        _SOURCE_FILE_INDEX,
+    )
 
     db = tmp_path / "sqlite_exact.sqlite3"
     conn = sqlite3.connect(str(db))
@@ -1368,6 +1436,13 @@ def test_sqlite_exact_migrates_locus_columns_on_existing_palace(tmp_path):
     assert set(_LOCUS_FIELDS) <= cols
     indexes = {row[1] for row in handle.execute("PRAGMA index_list(documents)").fetchall()}
     assert _LOCUS_INDEX in indexes
+    assert _SOURCE_FILE_INDEX in indexes
+    plan = handle.execute(
+        "EXPLAIN QUERY PLAN SELECT document FROM documents "
+        "WHERE collection_id = 1 AND json_extract(metadata_json, '$.source_file') = ?",
+        ("C:/convo/keep.jsonl",),
+    ).fetchall()
+    assert _SOURCE_FILE_INDEX in " ".join(str(row[-1]) for row in plan)
     assert tuple(
         handle.execute("SELECT wing, room, hall FROM documents WHERE id='a'").fetchone()
     ) == (
@@ -1380,3 +1455,37 @@ def test_sqlite_exact_migrates_locus_columns_on_existing_palace(tmp_path):
     total, wings = sqlite_wing_room_counts(str(tmp_path), "mempalace_drawers")
     assert total == 1
     assert wings["alpha"]["notes"] == 1
+
+
+def test_sqlite_exact_source_file_index_used_for_equality_get(tmp_path):
+    """The closet-enrichment source filter must use its expression index."""
+    from mempalace.backends.sqlite_exact import _SOURCE_FILE_INDEX
+
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["keep", "drop"],
+        documents=["keep me", "drop me"],
+        metadatas=[
+            {"source_file": "C:/convo/keep.jsonl", "wing": "w", "chunk_index": 0},
+            {"source_file": "C:/convo/drop.jsonl", "wing": "w", "chunk_index": 0},
+        ],
+        embeddings=[[1.0, 0.0], [1.0, 0.0]],
+    )
+    conn = col._handle.conn
+    indexes = {row[1] for row in conn.execute("PRAGMA index_list(documents)").fetchall()}
+    assert _SOURCE_FILE_INDEX in indexes
+
+    result, selects = _doc_select_sql(
+        col,
+        lambda: col.get(where={"source_file": "C:/convo/keep.jsonl"}, include=["documents"]),
+    )
+    assert result.ids == ["keep"]
+    assert selects
+    plan = conn.execute(
+        "EXPLAIN QUERY PLAN SELECT document FROM documents "
+        "WHERE collection_id = 1 AND json_extract(metadata_json, '$.source_file') = ?",
+        ("C:/convo/keep.jsonl",),
+    ).fetchall()
+    plan_text = " ".join(str(row[-1]) for row in plan)
+    assert _SOURCE_FILE_INDEX in plan_text, plan_text
+    assert "idx_documents_collection" not in plan_text

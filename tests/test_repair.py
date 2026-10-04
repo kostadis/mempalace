@@ -1,7 +1,9 @@
 """Tests for mempalace.repair — scan, prune, and rebuild HNSW index."""
 
+import errno
 import os
 import sqlite3
+import sys
 from contextlib import closing
 from unittest.mock import MagicMock, call, patch
 
@@ -10,6 +12,44 @@ import pytest
 from _chroma_palace_helper import make_minimal_chroma_sqlite
 
 from mempalace import repair
+
+# Mirrors the guard test_backups declares; test_non_regular_file_guards carries
+# a root-only variant because its cases already sit under posix_only. Neither
+# root nor Windows is stopped by a directory's permission bits, so a test that
+# removes them proves nothing there.
+needs_unprivileged_posix = pytest.mark.skipif(
+    os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="directory permission bits gate neither root nor Windows",
+)
+
+needs_posix_path_errno = pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows raises ENOENT where POSIX raises ENOTDIR for a file used as a directory",
+)
+
+needs_posix_filenames = pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows filenames are UTF-16; a byte that is not valid UTF-8 cannot name a directory",
+)
+
+
+def _symlink_or_skip(link, target):
+    """Create ``link`` pointing at ``target``, or skip if the platform refuses.
+
+    Same guard test_backups uses, for the same reason (PR #1555 review, Igor):
+    Windows without ``SeCreateSymbolicLinkPrivilege`` raises before any product
+    code runs. On POSIX only a permission refusal becomes a skip, so a test
+    that leaves the name behind still fails; on Windows the errno cannot be
+    relied on, so any ``OSError`` skips.
+    """
+    try:
+        link.symlink_to(target)
+    except NotImplementedError as exc:
+        pytest.skip(f"symlinks are unavailable here: {exc}")
+    except OSError as exc:
+        if os.name != "nt" and exc.errno not in (errno.EPERM, errno.EACCES):
+            raise
+        pytest.skip(f"symlink creation not permitted for this user: {exc}")
 
 
 # ── _get_palace_path ──────────────────────────────────────────────────
@@ -1722,6 +1762,11 @@ def test_sqlite_integrity_errors_uses_bounded_contention_timeout(tmp_path, monke
     Assert the sqlite connection contract directly so this regression test is
     deterministic and does not add the seven-second delay from the original
     proposal to every test run.
+
+    The contract includes the close. ``sqlite3``'s own context manager ends the
+    transaction and leaves the handle open, so the probe wraps the connection in
+    ``closing()`` and the double is shaped the same way: no ``__enter__``, since
+    nothing enters it any more, and a ``close`` that has to be called.
     """
     palace = tmp_path / "palace"
     palace.mkdir()
@@ -1736,15 +1781,12 @@ def test_sqlite_integrity_errors_uses_bounded_contention_timeout(tmp_path, monke
             return [("ok",)]
 
     class _Connection:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
         def execute(self, statement):
             calls.append(("execute", statement))
             return _Result()
+
+        def close(self):
+            calls.append(("close",))
 
     def _connect(database, **kwargs):
         calls.append(("connect", database, kwargs))
@@ -1763,6 +1805,7 @@ def test_sqlite_integrity_errors_uses_bounded_contention_timeout(tmp_path, monke
             },
         ),
         ("execute", "PRAGMA quick_check"),
+        ("close",),
     ]
     assert repair._SQLITE_INTEGRITY_BUSY_TIMEOUT_SECONDS == 15.0
 
@@ -1777,6 +1820,221 @@ def test_sqlite_integrity_errors_reports_unreadable_sqlite_file(tmp_path):
 
     assert errors
     assert "quick_check failed" in errors[0]
+
+
+def test_sqlite_integrity_status_reports_a_verdict_for_a_healthy_database(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    with closing(sqlite3.connect(palace / "chroma.sqlite3")) as conn:
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+        conn.commit()
+
+    status = repair.sqlite_integrity_status(str(palace))
+
+    assert status.checked is True
+    assert status.errors == ()
+    assert status.reason == ""
+    # frozen=True is only worth stating if the verdict is actually immutable.
+    assert isinstance(hash(status), int)
+
+
+def test_sqlite_integrity_status_reports_no_verdict_when_the_database_is_absent(tmp_path):
+    """An absent database is not a clean one.
+
+    ``sqlite_integrity_errors`` answers ``[]`` here and always has. Callers
+    that read an empty list as "quick_check found nothing wrong" then state a
+    verdict no probe produced, which is what ``checked`` exists to prevent.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    status = repair.sqlite_integrity_status(str(palace))
+
+    assert status.checked is False
+    assert status.errors == ()
+    # The whole string, not a substring: this one is read by an operator through
+    # `mempalace_status` and `/statusz`, so rewording it should have to be a
+    # deliberate edit here rather than a drift nothing notices.
+    assert status.reason == (
+        f"no quick_check ran: {palace / 'chroma.sqlite3'} does not exist, "
+        "so there was no SQLite database to open"
+    )
+    assert repair.sqlite_integrity_errors(str(palace)) == []
+
+
+def test_sqlite_integrity_status_asks_about_absence_once(tmp_path, monkeypatch):
+    """A database that vanishes mid-call must not come back as a clean verdict.
+
+    ``sqlite_integrity_errors`` gates on absence itself, so reaching the probe
+    through it would put the same question twice. A file unlinked between the
+    two would answer ``[]`` the second time, and an empty list beside
+    ``checked=True`` is the clean bill of health this function exists to
+    withhold. Past the gate, only an open attempt may answer.
+
+    The counter is the point: it fails on the second call rather than on the
+    verdict, so the test names the cause instead of waiting for a race to show
+    the symptom.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    with closing(sqlite3.connect(palace / "chroma.sqlite3")) as conn:
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+        conn.commit()
+
+    real_gate = repair._integrity_target_is_absent
+    asked = []
+
+    def counting_gate(sqlite_path):
+        asked.append(sqlite_path)
+        verdict = real_gate(sqlite_path)
+        if len(asked) == 1:
+            # The file goes away just after the gate reported it present.
+            os.unlink(sqlite_path)
+        return verdict
+
+    monkeypatch.setattr(repair, "_integrity_target_is_absent", counting_gate)
+
+    status = repair.sqlite_integrity_status(str(palace))
+
+    assert len(asked) == 1, f"absence was tested {len(asked)} times: {asked}"
+    assert status.checked is True
+    assert status.errors
+    assert "quick_check failed" in status.errors[0]
+
+
+def test_sqlite_integrity_errors_does_not_raise_on_a_path_it_cannot_stat(tmp_path):
+    """A NUL in the path is not proof of absence, and must not escape either.
+
+    ``os.path.exists`` folded ``ValueError`` into False, so callers never had
+    to handle it; ``cli.cmd_repair`` and the post-mine validator still do not.
+    The replacement keeps it inside the function and lets the open attempt
+    speak, as it does for every other unreadable path. The NUL survives that
+    far because ``sqlite_read_uri`` percent-encodes it, so ``sqlite3.connect``
+    is never handed a literal NUL and fails on the path instead.
+    """
+    errors = repair.sqlite_integrity_errors(str(tmp_path) + "\x00nope")
+
+    assert errors
+    assert "quick_check failed" in errors[0]
+
+
+@needs_posix_filenames
+def test_sqlite_integrity_errors_reports_a_path_python_cannot_encode(tmp_path):
+    """A palace under a name that is not valid UTF-8 is answered, not raised.
+
+    POSIX filenames are bytes, and ``os.listdir`` hands such a name back
+    through ``surrogateescape``, so a palace can legitimately live under one.
+    Absence is not proven for it, which routes it to the probe.
+
+    What happens there depends on the interpreter, measured on 3.9, 3.11, 3.12,
+    3.13 and 3.14: up to 3.12 ``pathname2url`` raises ``UnicodeEncodeError``
+    while building the URI, before SQLite is reached, and from 3.13 it
+    percent-encodes the byte and the database opens normally. The first is a
+    ``ValueError`` subclass, and the absence gate's docstring promises callers
+    never see one; ``palace._validate_palace_fts5_after_mine`` and
+    ``cli.cmd_repair`` both call this without a guard, so raising there is a
+    traceback out of ``mempalace mine`` and ``mempalace repair`` on a database
+    sitting right at the end of that path.
+
+    The invariant asserted here is that the call answers. The version-gated
+    half is what pins the ``ValueError`` catch on the versions where it is
+    reachable at all. Filesystems that enforce UTF-8 names cannot hold this
+    palace, so there the state does not exist and the test says so.
+    """
+    palace = os.fsdecode(os.path.join(os.fsencode(str(tmp_path)), b"pal\xff"))
+    try:
+        os.mkdir(os.fsencode(palace))
+    except OSError as exc:
+        # APFS enforces UTF-8 names and refuses this one, so the state cannot be
+        # built there at all: with nothing at the path, `lstat` reports ENOENT,
+        # the gate proves absence, and the probe is never reached. Skip rather
+        # than weaken the assertions, and only for the errno that means the
+        # filesystem rejected the name; anything else is a real failure. Same
+        # shape as `_symlink_or_skip` above, for the same reason.
+        if exc.errno not in (errno.EILSEQ, errno.EINVAL):
+            raise
+        pytest.skip(f"this filesystem will not hold a non-UTF-8 name: {exc}")
+
+    with closing(sqlite3.connect(os.path.join(palace, "chroma.sqlite3"))) as conn:
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+        conn.commit()
+
+    # The database is there and readable; only its name is unencodable, so the
+    # gate cannot prove absence and the path goes to the probe.
+    assert repair._integrity_target_is_absent(os.path.join(palace, "chroma.sqlite3")) is False
+
+    errors = repair.sqlite_integrity_errors(palace)
+
+    assert all("quick_check failed" in error for error in errors)
+    assert repair.sqlite_integrity_status(palace).checked is True
+    if sys.version_info < (3, 13):
+        assert errors, "pathname2url raises here, and the probe has to report that"
+
+
+@needs_posix_path_errno
+def test_sqlite_integrity_status_reports_a_path_component_that_is_a_file(tmp_path):
+    """``ENOTDIR`` proves absence too, and is deliberately not treated as proof.
+
+    A palace path whose parent component is a regular file cannot hold a
+    database, but the check routes it to the open attempt rather than calling
+    it absent, so the operator is told the path is wrong instead of being told
+    there was nothing to check.
+
+    POSIX only: Windows raises ``ENOENT`` for the same path, so there the state
+    is proven absent and reported as no verdict. Both answers are safe, and the
+    difference is the platform's, not the gate's.
+    """
+    not_a_directory = tmp_path / "file"
+    not_a_directory.write_text("x")
+
+    status = repair.sqlite_integrity_status(str(not_a_directory))
+
+    assert status.checked is True
+    assert status.errors
+    assert "quick_check failed" in status.errors[0]
+
+
+def test_sqlite_integrity_status_reports_a_dangling_symlink_as_an_error(tmp_path):
+    """A symlink whose target is gone is damage, not an absent database.
+
+    ``os.path.exists`` follows the link and answers False, collapsing this
+    into the same "nothing to check" the empty palace gets.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    _symlink_or_skip(palace / "chroma.sqlite3", palace / "moved-away.sqlite3")
+
+    status = repair.sqlite_integrity_status(str(palace))
+
+    assert status.checked is True
+    assert status.errors
+    assert "quick_check failed" in status.errors[0]
+
+
+@needs_unprivileged_posix
+def test_sqlite_integrity_status_reports_an_unreachable_directory_as_an_error(tmp_path):
+    """Losing the right to look is not evidence that there is nothing to see.
+
+    The database here is intact; only the directory permission stands in the
+    way. ``os.path.exists`` answers False for that too.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    with closing(sqlite3.connect(palace / "chroma.sqlite3")) as conn:
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+        conn.commit()
+
+    # Closed above: an open handle inside the directory would be a second
+    # variable in an experiment about not being able to reach it.
+    os.chmod(palace, 0o000)
+    try:
+        status = repair.sqlite_integrity_status(str(palace))
+    finally:
+        os.chmod(palace, 0o755)
+
+    assert status.checked is True
+    assert status.errors
+    assert "quick_check failed" in status.errors[0]
 
 
 @patch("mempalace.repair._copy_file_no_follow")

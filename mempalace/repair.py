@@ -38,6 +38,7 @@ import stat
 import time
 from collections import defaultdict
 from contextlib import closing, suppress
+from dataclasses import dataclass
 from datetime import datetime
 import re
 from typing import Callable, Iterator, Optional
@@ -732,36 +733,99 @@ def sqlite_drawer_count(palace_path: str, collection_name: Optional[str] = None)
 _SQLITE_INTEGRITY_BUSY_TIMEOUT_SECONDS = 15.0
 
 
-def sqlite_integrity_errors(palace_path: str) -> list[str]:
-    """Return SQLite quick_check errors for chroma.sqlite3.
+@dataclass(frozen=True)
+class SqliteIntegrityStatus:
+    """Whether a quick_check verdict exists for a palace, and what it says.
 
-    The repair rebuild path eventually calls Chroma's delete_collection().
-    If the SQLite layer has corrupt secondary indexes or FTS5 shadow pages,
-    Chroma can raise an opaque SQLITE_CORRUPT_INDEX / code 779 error before
-    repair reaches the HNSW rebuild.
+    ``checked`` False means no probe ran, so an empty ``errors`` says nothing
+    about the database. That is the distinction :func:`sqlite_integrity_errors`
+    cannot express: it answers ``[]`` both for a database quick_check found
+    intact and for a palace that has none to open.
 
-    Run a direct SQLite quick_check first so repair can fail with a clear,
-    actionable message before invoking Chroma's destructive collection-delete
-    path.
+    ``errors`` is a tuple rather than a list so ``frozen=True`` means what it
+    says: a list field would leave the generated ``__hash__`` raising
+    ``TypeError`` on every call, and would let a caller append to a verdict it
+    was handed.
     """
 
-    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
-    if not os.path.exists(sqlite_path):
-        return []
+    checked: bool
+    errors: tuple[str, ...]
+    reason: str
 
+
+def _integrity_target_is_absent(sqlite_path: str) -> bool:
+    """Return True only when nothing resolves under ``sqlite_path``.
+
+    ``ENOENT`` is the one errno this accepts as proof, because it cannot mean
+    anything else: no file answered to that path. It does not say which
+    component was missing, so it is proof about the path and not about the
+    palace. A palace directory that is itself a dangling symlink, and a mount
+    point with nothing mounted on it, both reach here as ``ENOENT`` and are
+    reported as no verdict. That is the same answer ``develop`` gives, only
+    without ``develop``'s claim that the check passed.
+
+    ``ENOTDIR`` would be proof too and is deliberately left to the open
+    attempt, which reports it rather than silently treating it as nothing to
+    do. Windows raises ``ENOENT`` for that case, so it is proven absent there;
+    both answers are safe. Every other failure, a parent directory this process
+    may not enter for one, leaves the question open and takes the same route.
+    False therefore means "not proven absent", not "the file is there".
+
+    ``os.path.exists`` cannot draw that line: it follows symlinks and folds
+    every ``OSError`` into False, so a dangling link and an unreadable
+    directory both read as "no database here". ``ValueError`` (an embedded NUL
+    in the path) is caught for the same reason as any ``OSError``: it does not
+    prove absence either, and callers that never handled it still never see
+    it. What they do see changes, as it does for the other unreadable paths:
+    the open attempt reports the failure instead of returning nothing.
+    """
+    try:
+        os.lstat(sqlite_path)
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError):
+        return False
+    return False
+
+
+def _quick_check_errors(sqlite_path: str) -> list[str]:
+    """Run ``PRAGMA quick_check`` against ``sqlite_path`` and report what it says.
+
+    There is no absence gate here on purpose. A caller that has already asked
+    whether the path is provably absent passes it straight through, so the
+    answer comes from the attempt to read it rather than from a second guess
+    about whether it is there. Re-testing for absence would reopen the hole
+    this module exists to close: a file that vanishes between the two tests
+    would come back as an empty error list, which reads as a clean verdict for
+    a database nobody opened.
+
+    ``ValueError`` is reported rather than raised. ``sqlite_read_uri`` builds a
+    URI before SQLite is reached, and up to Python 3.12 that raises for a
+    directory name holding a byte that came back through ``surrogateescape``;
+    3.13 percent-encodes it instead. Such a path reaches here because absence
+    was not proven for it, the same reason every unreadable path reaches here,
+    so it gets the same answer rather than a traceback out of ``mempalace
+    mine`` and ``mempalace repair``, neither of which guards this call.
+    """
     try:
         # A writer holding SQLite's lock is contention, not corruption. The
         # sqlite3 module defaults to five seconds, which is shorter than
         # routine batch mines and curator writes on rollback-journal palaces.
         # Give those writers a bounded grace period before surfacing BUSY to
         # callers; genuine corruption still comes from PRAGMA quick_check.
-        with sqlite3.connect(
-            sqlite_read_uri(sqlite_path),
-            uri=True,
-            timeout=_SQLITE_INTEGRITY_BUSY_TIMEOUT_SECONDS,
+        # closing(), as at the other two quick_check sites in this module: the
+        # sqlite3 context manager ends the transaction and leaves the handle
+        # open, so the descriptor would sit there until the cyclic collector
+        # ran.
+        with closing(
+            sqlite3.connect(
+                sqlite_read_uri(sqlite_path),
+                uri=True,
+                timeout=_SQLITE_INTEGRITY_BUSY_TIMEOUT_SECONDS,
+            )
         ) as conn:
             rows = conn.execute("PRAGMA quick_check").fetchall()
-    except sqlite3.Error as e:
+    except (sqlite3.Error, ValueError) as e:
         return [f"PRAGMA quick_check failed: {e}"]
 
     errors: list[str] = []
@@ -773,6 +837,65 @@ def sqlite_integrity_errors(palace_path: str) -> list[str]:
             errors.append(message)
 
     return errors
+
+
+def sqlite_integrity_status(palace_path: str) -> SqliteIntegrityStatus:
+    """Run the quick_check probe and report whether it produced a verdict.
+
+    Callers that state an integrity result to an operator want this rather
+    than :func:`sqlite_integrity_errors`, whose empty list cannot separate a
+    clean database from one that was never opened.
+    """
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    if _integrity_target_is_absent(sqlite_path):
+        return SqliteIntegrityStatus(
+            checked=False,
+            errors=(),
+            reason=(
+                f"no quick_check ran: {sqlite_path} does not exist, so there "
+                "was no SQLite database to open"
+            ),
+        )
+    # _quick_check_errors, not sqlite_integrity_errors: that one gates on
+    # absence again, and a file unlinked between the two gates would come back
+    # as an empty list, which is the clean verdict this function exists to
+    # withhold. Past the gate above, only an open attempt may answer.
+    return SqliteIntegrityStatus(
+        checked=True,
+        errors=tuple(_quick_check_errors(sqlite_path)),
+        reason="",
+    )
+
+
+def sqlite_integrity_errors(palace_path: str) -> list[str]:
+    """Return SQLite quick_check errors for chroma.sqlite3.
+
+    The repair rebuild path eventually calls Chroma's delete_collection().
+    If the SQLite layer has corrupt secondary indexes or FTS5 shadow pages,
+    Chroma can raise an opaque SQLITE_CORRUPT_INDEX / code 779 error before
+    repair reaches the HNSW rebuild.
+
+    Run a direct SQLite quick_check first so repair can fail with a clear,
+    actionable message before invoking Chroma's destructive collection-delete
+    path.
+
+    An empty list means one of two things and cannot tell them apart: the
+    check ran and found nothing, or the palace provably has no database to
+    check. Callers stating a result to an operator want
+    :func:`sqlite_integrity_status` instead. A path that resolves to a
+    directory entry but cannot be opened — a dangling symlink, a database
+    under a directory this process may not enter — is reported here as an
+    error, since the probe did fail.
+    """
+
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    # Absence is the one state with nothing to report; anything else that
+    # cannot be read is reported by the open attempt below. Callers that need
+    # to tell an absent database from a clean one use sqlite_integrity_status.
+    if _integrity_target_is_absent(sqlite_path):
+        return []
+
+    return _quick_check_errors(sqlite_path)
 
 
 def print_sqlite_integrity_abort(palace_path: str, errors: list[str]) -> None:
