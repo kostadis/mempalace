@@ -13,7 +13,10 @@ from minute one — before a single session is indexed.
 
 Usage:
     python3 -m mempalace.onboarding
-    or: mempalace init
+
+Not wired into ``mempalace init``. The registry it seeds is machine-level
+(~/.mempalace/entity_registry.json) by design: it describes the user, not a
+palace. Per-project names go to each palace's own known_entities.json.
 """
 
 from pathlib import Path

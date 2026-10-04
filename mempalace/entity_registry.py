@@ -274,7 +274,11 @@ class EntityRegistry:
     """
     Persistent personal entity registry.
 
-    Stored at ~/.mempalace/entity_registry.json
+    Stored at ~/.mempalace/entity_registry.json -- machine-level by design.
+    It describes the user (mode, the people in their life), not a palace, and
+    nothing in it is written into a palace; its only runtime reader is
+    spellcheck's "don't correct these names" list. Per-project names live in
+    each palace's own ``known_entities.json`` instead (see palace-isolation.md).
     Schema:
     {
       "mode": "personal",   # work | personal | combo

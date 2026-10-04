@@ -166,7 +166,7 @@ in code. Everything else is policy enforced by the user's own
 | `mempalace/config.py:85,145-172` | Walk-up discovery in `palace_path`; palace-alias resolution; new `default_palace` in file config; raise `PalaceNotDeclared` on miss |
 | `mempalace/mcp_server.py:79-103` | Lazy backend map keyed by palace path; optional `palace` arg on search tool; walk-up fallback when no `--palace` given |
 | `mempalace/knowledge_graph.py:47` | Always co-locate KG under palace path; drop global default |
-| `mempalace/entity_registry.py` | Co-locate under palace path |
+| `mempalace/entity_registry.py` | **Stays global by design** (decided 2026-10-04). It describes the user, not a palace: usage mode and the people in their life (from `onboarding.py`). Its only runtime reader is `spellcheck.py`'s "don't correct these names" list, and nothing in it is written into a palace. Per-project names live in the per-palace `<palace>/known_entities.json` instead (#51). |
 | `mempalace/room_detector_local.py:282` | Parse new `palace:` yaml key (CLI only; hooks ignore) |
 | `hooks/mempal_save_hook.sh:156` | `--palace "$MEMPAL_CHAT_PALACE"` |
 | `hooks/mempal_precompact_hook.sh:68` | Same |
