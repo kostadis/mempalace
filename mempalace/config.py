@@ -1,7 +1,12 @@
 """
 MemPalace configuration system.
 
-Priority: env vars > config file (~/.mempalace/config.json) > defaults
+Priority: env vars > config file > defaults.
+
+The config directory is $MEMPALACE_CONFIG_DIR if set (explicit override,
+used by tests and CI), otherwise ~/.mempalace. Upstream falls back to the
+XDG Base Directory location; this fork pins ~/.mempalace because palace
+isolation lives there (see _default_config_dir).
 """
 
 import errno
@@ -230,6 +235,25 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
 
 LEGACY_PALACE_DIR = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palaces/chat")
+
+
+def _default_config_dir() -> Path:
+    """Return the config directory: ``$MEMPALACE_CONFIG_DIR`` or ``~/.mempalace``.
+
+    Upstream resolves this per the XDG Base Directory spec (#148), falling
+    back to ``~/.config/mempalace`` when ``~/.mempalace`` holds no legacy
+    marker file. This fork pins it to ``~/.mempalace``: palace isolation
+    (``default_palace`` and aliases in ``config.json``, the chat palace at
+    ``~/.mempalace/palaces/chat``, the hooks' chat-palace pinning) lives
+    there, and a silent move to the XDG directory would split it.
+    ``MEMPALACE_CONFIG_DIR`` remains the explicit override.
+    """
+    env_dir = os.environ.get("MEMPALACE_CONFIG_DIR")
+    if env_dir and env_dir.strip():
+        return Path(env_dir).expanduser()
+    return Path.home() / ".mempalace"
+
+
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
 DEFAULT_BACKEND = "chroma"
 DEFAULT_MILVUS_CONSISTENCY_LEVEL = "Strong"
@@ -842,16 +866,15 @@ class MempalaceConfig:
 
         Args:
             config_dir: Override config directory (useful for testing).
-                        Defaults to ~/.mempalace.
+                        Defaults to the XDG-aware base directory — see
+                        _default_config_dir() for the resolution order.
             palace_path: Explicit palace data directory. This is primarily
                          used by CLI operations that received ``--palace``;
                          it takes precedence over environment and file config.
         """
         if config_dir is None:
             _maybe_migrate_legacy_palace_dir()
-        self._config_dir = (
-            Path(config_dir) if config_dir else Path(os.path.expanduser("~/.mempalace"))
-        )
+        self._config_dir = Path(config_dir).expanduser() if config_dir else _default_config_dir()
         self._config_file = self._config_dir / "config.json"
         self._people_map_file = self._config_dir / "people_map.json"
         self._palace_path_override = (
@@ -1035,8 +1058,22 @@ class MempalaceConfig:
             print(f"  ! Could not write {self._config_file}: {exc}", file=sys.stderr)
 
     @property
+    def config_dir(self):
+        """Active config directory (XDG-aware).
+
+        Public accessor for the resolved config-dir path so callers outside
+        ``config.py`` can derive sibling locations (write-ahead-log dir,
+        cache dir, etc.) without reaching into ``_config_dir``.
+        """
+        return self._config_dir
+
+    @property
     def palace_path(self):
-        """Path to the memory palace data directory."""
+        """Path to the memory palace data directory.
+
+        Defaults to a "palace" sub-directory inside the active config
+        directory, so the palace follows the config wherever XDG places it.
+        """
         if self._palace_path_override is not None:
             return self._palace_path_override
         env_val = os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get("MEMPAL_PALACE_PATH")
@@ -1045,7 +1082,9 @@ class MempalaceConfig:
             # code path (mcp_server.py:62) and prevent surprise redirection
             # when the env var contains unresolved components.
             return os.path.abspath(os.path.expanduser(env_val))
-        return os.path.expanduser(self._file_config.get("palace_path", DEFAULT_PALACE_PATH))
+        return os.path.expanduser(
+            self._file_config.get("palace_path", str(self._config_dir / "palace"))
+        )
 
     @property
     def palaces(self):
