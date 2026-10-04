@@ -183,6 +183,18 @@ extend-exclude = ["benchmarks", "*.md"]
 select = ["E", "F", "W", "C901"]
 ignore = ["E501"]
 
+[tool.ruff.lint.per-file-ignores]
+# mcp_server fragments exec into the package namespace. Names they use live
+# in __init__.py and earlier fragments, so F821 is expected; __init__.py
+# imports those names for the fragments, so F401 is expected there too.
+"mempalace/mcp_server/__init__.py" = ["F401"]
+"mempalace/mcp_server/_*.py" = ["F821"]
+"mempalace/mcp_server/tools_*.py" = ["F821"]
+"mempalace/mcp_server/schemas.py" = ["F821"]
+"mempalace/mcp_server/protocol.py" = ["F821"]
+"mempalace/mcp_server/http.py" = ["F821"]
+"mempalace/mcp_server/runtime.py" = ["F821"]
+
 [tool.ruff.lint.mccabe]
 max-complexity = 25
 
