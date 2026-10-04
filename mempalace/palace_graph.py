@@ -61,9 +61,17 @@ def _normalize_wing(wing: str | None) -> str | None:
 # Module-level graph cache with TTL and write-invalidation.
 # Warm cache serves build_graph() in O(1); invalidate_graph_cache() clears on writes.
 _graph_cache_lock = threading.Lock()
-_graph_cache_nodes = None
-_graph_cache_edges = None
-_graph_cache_time = 0.0
+# Keyed by absolute palace path -> (nodes, edges, built_at). A single
+# process can serve several palaces (MCP ``palace=`` reads, #45), so one
+# palace's graph must never answer for another.
+_graph_cache: dict = {}
+
+
+def _graph_cache_key(config=None) -> str:
+    config = config or MempalaceConfig()
+    return os.path.abspath(os.path.expanduser(config.palace_path or ""))
+
+
 _GRAPH_CACHE_TTL = 60.0  # seconds — graph changes less often than metadata
 
 
@@ -174,11 +182,8 @@ def _nodes_edges_from_grouped_rows(rows):
 
 def invalidate_graph_cache():
     """Clear the graph cache. Called from mcp_server.py on writes."""
-    global _graph_cache_nodes, _graph_cache_edges, _graph_cache_time
     with _graph_cache_lock:
-        _graph_cache_nodes = None
-        _graph_cache_edges = None
-        _graph_cache_time = 0.0
+        _graph_cache.clear()
 
 
 def _get_collection(config=None):
@@ -221,21 +226,21 @@ def build_graph(col=None, config=None):
     Returns cached result if fresh (within TTL). Cache is invalidated
     on writes via invalidate_graph_cache(). Thread-safe via _graph_cache_lock.
 
-    Note: warm cache ignores ``col`` and ``config`` arguments — this is
-    intentional for the MCP server's single-palace use case. Callers
-    switching collections should call ``invalidate_graph_cache()`` first.
+    The warm cache is keyed by the palace ``config`` names (the default
+    palace when ``config`` is None), so cross-palace callers get their own
+    entry (#45). A caller that injects ``col`` without ``config`` shares the
+    default palace's entry; such callers should invalidate first.
 
     Returns:
         nodes: dict of {room: {wings: set, halls: set, count: int}}
         edges: list of {room, wing_a, wing_b, hall} — one per tunnel crossing
     """
-    global _graph_cache_nodes, _graph_cache_edges, _graph_cache_time
     now = time.time()
-    # NOTE: warm cache ignores col/config args — intentional for the MCP server's
-    # single-palace use case. Callers switching collections must invalidate first.
+    cache_key = _graph_cache_key(config)
     with _graph_cache_lock:
-        if _graph_cache_nodes is not None and (now - _graph_cache_time) < _GRAPH_CACHE_TTL:
-            return _graph_cache_nodes, _graph_cache_edges
+        cached = _graph_cache.get(cache_key)
+        if cached is not None and (now - cached[2]) < _GRAPH_CACHE_TTL:
+            return cached[0], cached[1]
 
     # Only when the caller did not pass a collection: MCP tools. Tests that
     # inject ``col=`` keep the client paging path against that collection.
@@ -245,9 +250,7 @@ def build_graph(col=None, config=None):
             nodes, edges = sqlite_graph
             if nodes:
                 with _graph_cache_lock:
-                    _graph_cache_nodes = nodes
-                    _graph_cache_edges = edges
-                    _graph_cache_time = time.time()
+                    _graph_cache[cache_key] = (nodes, edges, time.time())
             return nodes, edges
         col = _get_collection(config)
     if not col:
@@ -310,9 +313,7 @@ def build_graph(col=None, config=None):
     # when the palace is first populated.
     if nodes:
         with _graph_cache_lock:
-            _graph_cache_nodes = nodes
-            _graph_cache_edges = edges
-            _graph_cache_time = time.time()
+            _graph_cache[cache_key] = (nodes, edges, time.time())
 
     return nodes, edges
 
@@ -752,14 +753,14 @@ def create_tunnel(
     return tunnel
 
 
-def list_tunnels(wing: str = None):
+def list_tunnels(wing: str = None, config=None):
     """List all explicit tunnels, optionally filtered by wing.
 
     Returns tunnels where ``wing`` appears as either source or target
     (tunnels are symmetric, so either endpoint is a valid filter match).
     """
     norm_wing = _normalize_wing(wing)
-    tunnels = _load_tunnels()
+    tunnels = _load_tunnels(config)
     if norm_wing:
         # Normalize stored wings too: older tunnels.json records hold the
         # underscore form (from the prior write-path normalization), while
@@ -797,7 +798,7 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
     # mempalace.yaml slug (underscore) and an explicit ``--wing`` slug
     # (verbatim) both resolve through the same comparison.
     norm_wing = _normalize_wing(wing) or wing
-    tunnels = _load_tunnels()
+    tunnels = _load_tunnels(config)
     connections = []
 
     for t in tunnels:

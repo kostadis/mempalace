@@ -231,7 +231,7 @@ def tool_kg_supersede(
     }
 
 
-def tool_kg_timeline(entity: str = None, limit: int = 100, offset: int = 0):
+def tool_kg_timeline(entity: str = None, limit: int = 100, offset: int = 0, palace: str = None):
     """Get chronological timeline of facts, optionally for one entity.
 
     Paginated with ``limit``/``offset`` following the ``tool_list_drawers``
@@ -244,6 +244,9 @@ def tool_kg_timeline(entity: str = None, limit: int = 100, offset: int = 0):
             entity = sanitize_kg_value(entity, "entity")
         except ValueError as e:
             return {"error": str(e)}
+    resolved, is_default, err = _read_target(palace)
+    if err:
+        return err
 
     def _query(kg):
         return {
@@ -251,7 +254,7 @@ def tool_kg_timeline(entity: str = None, limit: int = 100, offset: int = 0):
             "total": kg.timeline_total(entity),
         }
 
-    result = _call_kg(_query)
+    result = _call_kg(_query, palace_path=None if is_default else resolved)
     return {
         "entity": entity or "all",
         "timeline": result["timeline"],
@@ -262,6 +265,9 @@ def tool_kg_timeline(entity: str = None, limit: int = 100, offset: int = 0):
     }
 
 
-def tool_kg_stats():
+def tool_kg_stats(palace: str = None):
     """Knowledge graph overview: entities, triples, relationship types."""
-    return _call_kg(lambda kg: kg.stats())
+    resolved, is_default, err = _read_target(palace)
+    if err:
+        return err
+    return _call_kg(lambda kg: kg.stats(), palace_path=None if is_default else resolved)

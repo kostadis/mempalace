@@ -21,7 +21,15 @@ TOOLS = {
     },
     "mempalace_list_wings": {
         "description": "List all wings with drawer counts",
-        "input_schema": {"type": "object", "properties": {}},
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "palace": {
+                    "type": "string",
+                    "description": "Palace alias or path (optional — defaults to the active workspace palace). Use 'chat' to read the chat palace from a campaign workspace.",
+                },
+            },
+        },
         "handler": tool_list_wings,
     },
     "mempalace_list_rooms": {
@@ -29,6 +37,10 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "palace": {
+                    "type": "string",
+                    "description": "Palace alias or path (optional — defaults to the active workspace palace). Use 'chat' to read the chat palace from a campaign workspace.",
+                },
                 "wing": {"type": "string", "description": "Wing to list rooms for (optional)"},
             },
         },
@@ -36,7 +48,15 @@ TOOLS = {
     },
     "mempalace_get_taxonomy": {
         "description": "Full taxonomy: wing → room → drawer count",
-        "input_schema": {"type": "object", "properties": {}},
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "palace": {
+                    "type": "string",
+                    "description": "Palace alias or path (optional — defaults to the active workspace palace). Use 'chat' to read the chat palace from a campaign workspace.",
+                },
+            },
+        },
         "handler": tool_get_taxonomy,
     },
     "mempalace_get_aaak_spec": {
@@ -149,6 +169,10 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "palace": {
+                    "type": "string",
+                    "description": "Palace alias or path (optional — defaults to the active workspace palace). Use 'chat' to read the chat palace from a campaign workspace.",
+                },
                 "entity": {
                     "type": "string",
                     "description": "Entity to get timeline for (optional — omit for full timeline)",
@@ -170,7 +194,15 @@ TOOLS = {
     },
     "mempalace_kg_stats": {
         "description": "Knowledge graph overview: entities, triples, current vs expired facts, relationship types.",
-        "input_schema": {"type": "object", "properties": {}},
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "palace": {
+                    "type": "string",
+                    "description": "Palace alias or path (optional — defaults to the active workspace palace). Use 'chat' to read the chat palace from a campaign workspace.",
+                },
+            },
+        },
         "handler": tool_kg_stats,
     },
     "mempalace_traverse": {
@@ -178,6 +210,10 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "palace": {
+                    "type": "string",
+                    "description": "Palace alias or path (optional — defaults to the active workspace palace). Use 'chat' to read the chat palace from a campaign workspace.",
+                },
                 "start_room": {
                     "type": "string",
                     "description": "Room to start from (e.g. 'chromadb-setup', 'riley-school')",
@@ -196,6 +232,10 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "palace": {
+                    "type": "string",
+                    "description": "Palace alias or path (optional — defaults to the active workspace palace). Use 'chat' to read the chat palace from a campaign workspace.",
+                },
                 "wing_a": {"type": "string", "description": "First wing (optional)"},
                 "wing_b": {"type": "string", "description": "Second wing (optional)"},
             },
@@ -204,7 +244,15 @@ TOOLS = {
     },
     "mempalace_graph_stats": {
         "description": "Palace graph overview: total rooms, tunnel connections, edges between wings.",
-        "input_schema": {"type": "object", "properties": {}},
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "palace": {
+                    "type": "string",
+                    "description": "Palace alias or path (optional — defaults to the active workspace palace). Use 'chat' to read the chat palace from a campaign workspace.",
+                },
+            },
+        },
         "handler": tool_graph_stats,
     },
     "mempalace_mesh_peers": {
@@ -240,6 +288,10 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "palace": {
+                    "type": "string",
+                    "description": "Palace alias or path (optional — defaults to the active workspace palace). Use 'chat' to read the chat palace from a campaign workspace.",
+                },
                 "wing": {
                     "type": "string",
                     "description": "Filter tunnels by wing (shows tunnels where wing is source or target)",
@@ -264,6 +316,10 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "palace": {
+                    "type": "string",
+                    "description": "Palace alias or path (optional — defaults to the active workspace palace). Use 'chat' to read the chat palace from a campaign workspace.",
+                },
                 "wing": {
                     "type": "string",
                     "description": "Filter hallways by wing",
@@ -288,6 +344,10 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "palace": {
+                    "type": "string",
+                    "description": "Palace alias or path (optional — defaults to the active workspace palace). Use 'chat' to read the chat palace from a campaign workspace.",
+                },
                 "wing": {"type": "string", "description": "Wing to start from"},
                 "room": {"type": "string", "description": "Room to follow tunnels from"},
             },
@@ -431,6 +491,10 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "palace": {
+                    "type": "string",
+                    "description": "Palace alias or path (optional — defaults to the active workspace palace). Use 'chat' to read the chat palace from a campaign workspace.",
+                },
                 "content": {"type": "string", "description": "Content to check"},
                 "threshold": {
                     "type": "number",
@@ -619,6 +683,10 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "palace": {
+                    "type": "string",
+                    "description": "Palace alias or path (optional — defaults to the active workspace palace). Use 'chat' to read the chat palace from a campaign workspace.",
+                },
                 "drawer_id": {"type": "string", "description": "ID of the drawer to fetch"},
             },
             "required": ["drawer_id"],
@@ -630,6 +698,10 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "palace": {
+                    "type": "string",
+                    "description": "Palace alias or path (optional — defaults to the active workspace palace). Use 'chat' to read the chat palace from a campaign workspace.",
+                },
                 "wing": {"type": "string", "description": "Filter by wing (optional)"},
                 "room": {"type": "string", "description": "Filter by room (optional)"},
                 "since": {
@@ -716,6 +788,10 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "palace": {
+                    "type": "string",
+                    "description": "Palace alias or path (optional — defaults to the active workspace palace). Use 'chat' to read the chat palace from a campaign workspace.",
+                },
                 "agent_name": {
                     "type": "string",
                     "description": "Your name — each agent gets their own diary wing",

@@ -998,11 +998,14 @@ def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
             _invalidate_overview_caches()
 
 
-def tool_get_drawer(drawer_id: str):
+def tool_get_drawer(drawer_id: str, palace: str = None):
     """Fetch a single logical drawer by ID."""
-    col = _get_collection()
+    resolved, is_default, err = _read_target(palace)
+    if err:
+        return err
+    col = _read_collection(resolved, is_default)
     if not col:
-        return _collection_error_or_no_palace()
+        return _collection_error_or_no_palace(None if is_default else resolved)
 
     try:
         record = _logical_drawer_record(col, drawer_id)
@@ -1020,6 +1023,7 @@ def tool_list_drawers(
     before: str = None,
     limit: int = 20,
     offset: int = 0,
+    palace: str = None,
 ):
     """List logical drawers with pagination.
 
@@ -1043,6 +1047,9 @@ def tool_list_drawers(
             raise ValueError(f"since ({since!r}) must be earlier than before ({before!r})")
     except ValueError as e:
         return {"error": str(e)}
+    resolved, is_default, err = _read_target(palace)
+    if err:
+        return err
 
     try:
         where = None
@@ -1059,7 +1066,8 @@ def tool_list_drawers(
             where = {"$and": conditions}
 
         listed = None
-        if _is_chroma_backend() and _config.palace_path:
+        # The sqlite fast path reads the default palace (_config) only.
+        if is_default and _is_chroma_backend() and _config.palace_path:
             from ..backends.chroma import sqlite_list_id_metadata
 
             listed = sqlite_list_id_metadata(
@@ -1070,9 +1078,9 @@ def tool_list_drawers(
             ids, metadatas = listed
             documents = []
         else:
-            col = _get_collection()
+            col = _read_collection(resolved, is_default)
             if not col:
-                return _collection_error_or_no_palace()
+                return _collection_error_or_no_palace(None if is_default else resolved)
             ids, documents, metadatas = _fetch_drawer_rows(col, where=where, include=["metadatas"])
         drawers = _collapse_drawer_rows(ids, documents, metadatas)
 
@@ -1087,7 +1095,7 @@ def tool_list_drawers(
         if listed is not None:
             _fill_drawer_previews_from_sqlite(page)
         else:
-            col = _get_collection()
+            col = _read_collection(resolved, is_default)
             if col:
                 _fill_drawer_previews(col, page)
 
