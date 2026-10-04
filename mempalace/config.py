@@ -233,6 +233,19 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
     return strip_lone_surrogates(value)
 
 
+# Palace-local files that live inside a palace directory next to its vector
+# store. Operations that replace the palace directory (repair rebuild,
+# migrate) must carry these over (see repair.carry_over_palace_sidecars).
+TUNNELS_FILENAME = "tunnels.json"
+HALLWAYS_FILENAME = "hallways.json"
+PALACE_SIDECAR_FILENAMES = (
+    "knowledge_graph.sqlite3",
+    "knowledge_graph.sqlite3-wal",
+    "knowledge_graph.sqlite3-shm",
+    TUNNELS_FILENAME,
+    HALLWAYS_FILENAME,
+)
+
 LEGACY_PALACE_DIR = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palaces/chat")
 
@@ -1221,20 +1234,25 @@ class MempalaceConfig:
 
     @property
     def tunnel_file(self):
-        """Path to the tunnel file, sibling of palace_path."""
-        return os.path.join(os.path.dirname(self.palace_path), "tunnels.json")
+        """Path to the tunnel file, inside the palace directory (#48).
+
+        It used to sit beside the palace (``dirname(palace_path)``), so every
+        palace under ``~/.mempalace/palaces/`` shared one file and tunnels
+        leaked across palaces.
+        """
+        return os.path.join(self.palace_path, TUNNELS_FILENAME)
 
     @property
     def hallway_file(self):
-        """Path to the hallway file, sibling of palace_path.
+        """Path to the hallway file, inside the palace directory (#48).
 
-        Mirrors ``tunnel_file`` so within-wing hallway state is scoped to the
-        configured palace and survives palace rebuilds (it does not live in
-        ChromaDB which can be recreated). Prior to this property the path was
-        hardcoded under ``~/.mempalace/hallways.json`` and multiple palaces on
-        one host silently shared one file (see ``hallways._legacy_hallway_file``).
+        Mirrors ``tunnel_file``. It is not stored in the vector store, so it
+        survives a store rebuild; repair and migrate carry it over when they
+        replace the palace directory. Earlier locations -- the hardcoded
+        ``~/.mempalace/hallways.json`` and the palace's parent directory --
+        were shared by every palace on the host.
         """
-        return os.path.join(os.path.dirname(self.palace_path), "hallways.json")
+        return os.path.join(self.palace_path, HALLWAYS_FILENAME)
 
     @property
     def collection_name(self):

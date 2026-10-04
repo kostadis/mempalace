@@ -1599,8 +1599,8 @@ def test_explicit_palace_path_overrides_env_and_file_config(monkeypatch, tmp_pat
 
     expected = os.path.abspath(os.path.expanduser(str(explicit)))
     assert cfg.palace_path == expected
-    assert cfg.hallway_file == os.path.join(os.path.dirname(expected), "hallways.json")
-    assert cfg.tunnel_file == os.path.join(os.path.dirname(expected), "tunnels.json")
+    assert cfg.hallway_file == os.path.join(expected, "hallways.json")
+    assert cfg.tunnel_file == os.path.join(expected, "tunnels.json")
 
 
 # ── cfg.lang resolution ────────────────────────────────────────────────

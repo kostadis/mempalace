@@ -377,6 +377,12 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
             except Exception:
                 _restore_stale_palace(palace_path, stale_path)
                 raise
+        # The fresh palace holds only the vector store. Carry the palace-local
+        # files (knowledge graph, tunnels, hallways) over from the old dir
+        # before it is removed -- they were silently dropped here before.
+        from .repair import carry_over_palace_sidecars
+
+        carry_over_palace_sidecars(stale_path, palace_path)
         shutil.rmtree(stale_path, ignore_errors=True)
     finally:
         # On the happy path os.replace/shutil.move consumed temp_palace, so

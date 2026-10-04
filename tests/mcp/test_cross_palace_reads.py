@@ -148,7 +148,7 @@ def test_list_tunnels_reads_the_requested_palaces_tunnel_file(two_palaces):
         "target": {"wing": "gamma", "room": "room_c"},
         "label": "x",
     }
-    with open(os.path.join(os.path.dirname(other), "tunnels.json"), "w") as f:
+    with open(os.path.join(other, "tunnels.json"), "w") as f:
         json.dump([tunnel], f)
     assert [t["id"] for t in mcp_server.tool_list_tunnels(palace=other)] == ["t1"]
     assert mcp_server.tool_list_tunnels() == []

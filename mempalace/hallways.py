@@ -108,14 +108,20 @@ def _load_hallways(config=None) -> list[dict]:
             return raw
         return []
 
-    legacy = _legacy_hallway_file()
-    if legacy != current_hallway_file and os.path.exists(legacy):
-        logger.warning(
-            "Legacy hallways file at '%s' is being ignored; configured location is '%s'. "
-            "Move or copy the legacy file to the configured path to recover its hallways.",
-            legacy,
-            current_hallway_file,
-        )
+    # Earlier locations: the hardcoded ~/.mempalace file and the palace's
+    # parent directory (shared by every sibling palace until #48). Hallways
+    # are rebuilt from the palace's drawers on the next mine, so nothing is
+    # migrated; name the old file so it can be cleaned up.
+    from .palace_graph import _shared_sibling_file
+
+    for legacy in (_legacy_hallway_file(), _shared_sibling_file(current_hallway_file)):
+        if legacy != current_hallway_file and os.path.exists(legacy):
+            logger.warning(
+                "Legacy hallways file at '%s' is being ignored; configured location is '%s'. "
+                "Hallways are rebuilt from this palace's drawers on the next mine.",
+                legacy,
+                current_hallway_file,
+            )
     return []
 
 

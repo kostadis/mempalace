@@ -527,27 +527,26 @@ class TestTunnelFileFollowsConfig:
     """
 
     def test_default_tunnel_file_is_sibling_of_palace_path(self):
-        """Regression: tunnel_file is the sibling of palace_path (single
-        source of truth), regardless of whether the default resolves to the
-        legacy ``~/.mempalace/`` or the XDG ``~/.config/mempalace/`` layout.
+        """Regression: tunnel_file lives inside palace_path (single source of
+        truth, palace-local since #48) wherever the default palace resolves.
         """
         from mempalace.config import MempalaceConfig
 
         cfg = MempalaceConfig()
-        expected = os.path.join(os.path.dirname(cfg.palace_path), "tunnels.json")
+        expected = os.path.join(cfg.palace_path, "tunnels.json")
         assert cfg.tunnel_file == expected
         assert palace_graph._get_tunnel_file(cfg) == expected
 
     def test_tunnel_file_follows_palace_path(self, tmp_path):
-        """Custom palace_path → tunnel sits beside the palace, not at the
-        hardcoded legacy location."""
+        """Custom palace_path → tunnel lives inside that palace (#48), not at
+        the hardcoded legacy location or beside the palace."""
         from mempalace.config import MempalaceConfig
 
         custom_dir = tmp_path / "custom-palace"
         cfg = MempalaceConfig(config_dir=tmp_path)
         cfg._file_config["palace_path"] = str(custom_dir)
-        assert cfg.tunnel_file == str(tmp_path / "tunnels.json")
-        assert palace_graph._get_tunnel_file(cfg) == str(tmp_path / "tunnels.json")
+        assert cfg.tunnel_file == str(custom_dir / "tunnels.json")
+        assert palace_graph._get_tunnel_file(cfg) == str(custom_dir / "tunnels.json")
 
     def test_load_tunnels_warns_on_orphaned_legacy_file(self, tmp_path, monkeypatch, caplog):
         """When the configured tunnel file is missing but a legacy file

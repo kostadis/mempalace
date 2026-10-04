@@ -1991,19 +1991,20 @@ def extract_via_sqlite(palace_path: str, collection_name: str) -> Iterator[tuple
         conn.close()
 
 
-def _preserve_knowledge_graph_sqlite(source_palace: str, dest_palace: str) -> list[str]:
-    """Copy KG SQLite sidecars when rebuilding a palace from chroma.sqlite3.
+def carry_over_palace_sidecars(source_palace: str, dest_palace: str) -> list[str]:
+    """Copy palace-local files from a replaced palace dir into its successor.
 
-    rebuild_from_sqlite reconstructs Chroma collections into a fresh
-    destination directory. The knowledge graph is a separate SQLite database,
-    so it must be copied explicitly or the repair succeeds while silently
-    dropping KG state (#1816).
+    Operations that rebuild a palace into a fresh directory (repair's
+    rebuild_from_sqlite, migrate's swap) recreate only the vector store. The
+    knowledge graph (#1816) and the palace's tunnels and hallways (#48) live
+    beside the store inside the palace, so they must be copied explicitly or
+    the operation succeeds while silently dropping them.
     """
+    from .config import PALACE_SIDECAR_FILENAMES
 
     copied: list[str] = []
 
-    for suffix in ("", "-wal", "-shm"):
-        filename = f"knowledge_graph.sqlite3{suffix}"
+    for filename in PALACE_SIDECAR_FILENAMES:
         src = os.path.join(source_palace, filename)
         dst = os.path.join(dest_palace, filename)
 
@@ -2020,9 +2021,13 @@ def _preserve_knowledge_graph_sqlite(source_palace: str, dest_palace: str) -> li
         copied.append(filename)
 
     if copied:
-        print(" Preserved knowledge graph: " + ", ".join(copied))
+        print(" Preserved palace files: " + ", ".join(copied))
 
     return copied
+
+
+# Kept for callers and tests that name the KG-only helper (#1816).
+_preserve_knowledge_graph_sqlite = carry_over_palace_sidecars
 
 
 def rebuild_from_sqlite(
@@ -2428,7 +2433,7 @@ def _rebuild_from_sqlite_locked(
             )
 
     os.makedirs(dest_palace, exist_ok=True)
-    _preserve_knowledge_graph_sqlite(source_palace, dest_palace)
+    carry_over_palace_sidecars(source_palace, dest_palace)
 
     # Backend lifetime is wrapped in try/finally so the dest palace's
     # PersistentClient handle (opened lazily inside ``create_collection``

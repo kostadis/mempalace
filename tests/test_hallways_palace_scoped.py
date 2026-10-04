@@ -28,29 +28,27 @@ with patch.dict("sys.modules", {"chromadb": MagicMock()}):
 
 class TestHallwayFileResolution:
     def test_default_hallway_file_is_sibling_of_default_palace(self):
-        # Fork layout: the default palace is ``<config_dir>/palaces/chat``, so
-        # its hallway sibling is ``<config_dir>/palaces/hallways.json`` (where
-        # it lived before upstream's XDG change, too).
+        # Palace-local since #48: the hallway file lives inside the default palace.
         cfg = MempalaceConfig()
-        expected = os.path.join(cfg.config_dir, "palaces", "hallways.json")
+        expected = os.path.join(cfg.palace_path, "hallways.json")
         assert cfg.hallway_file == expected
         assert hallways_mod._get_hallway_file(cfg) == expected
 
     def test_hallway_file_follows_palace_path(self, tmp_path):
-        """Custom palace_path → hallway sits beside the palace, not at the
-        hardcoded legacy location."""
+        """Custom palace_path → hallway lives inside that palace (#48), not at
+        the hardcoded legacy location or beside the palace."""
         custom_dir = tmp_path / "custom-palace"
         cfg = MempalaceConfig(config_dir=tmp_path)
         cfg._file_config["palace_path"] = str(custom_dir)
-        assert cfg.hallway_file == str(tmp_path / "hallways.json")
-        assert hallways_mod._get_hallway_file(cfg) == str(tmp_path / "hallways.json")
+        assert cfg.hallway_file == str(custom_dir / "hallways.json")
+        assert hallways_mod._get_hallway_file(cfg) == str(custom_dir / "hallways.json")
 
     def test_palace_env_var_redirects_hallway_file(self, tmp_path, monkeypatch):
         """MEMPALACE_PALACE_PATH must redirect the hallway file too."""
         custom_palace = tmp_path / "envpalace" / "palace"
         monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(custom_palace))
         cfg = MempalaceConfig()
-        assert cfg.hallway_file == str(tmp_path / "envpalace" / "hallways.json")
+        assert cfg.hallway_file == str(custom_palace / "hallways.json")
 
 
 # =============================================================================
@@ -123,8 +121,8 @@ class TestMultiPalaceIsolation:
         file_b = MempalaceConfig().hallway_file
 
         assert file_a != file_b
-        assert file_a == str(tmp_path / "a" / "hallways.json")
-        assert file_b == str(tmp_path / "b" / "hallways.json")
+        assert file_a == str(palace_a / "hallways.json")
+        assert file_b == str(palace_b / "hallways.json")
 
     def test_save_then_load_under_different_palace_returns_empty(self, tmp_path, monkeypatch):
         """End-to-end: writing hallways under palace-A and then loading under
@@ -156,7 +154,7 @@ class TestMultiPalaceIsolation:
                 }
             ]
         )
-        assert os.path.exists(str(tmp_path / "a" / "hallways.json"))
+        assert os.path.exists(str(palace_a / "hallways.json"))
 
         monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(palace_b))
         assert hallways_mod._load_hallways() == []
