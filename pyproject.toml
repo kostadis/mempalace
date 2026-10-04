@@ -194,6 +194,13 @@ ignore = ["E501"]
 "mempalace/mcp_server/protocol.py" = ["F821"]
 "mempalace/mcp_server/http.py" = ["F821"]
 "mempalace/mcp_server/runtime.py" = ["F821"]
+# cli fragments exec into the package namespace. Names they use live in
+# __init__.py and earlier fragments, so F821 is expected; __init__.py
+# imports those names for the fragments, so F401 is expected there too.
+"mempalace/cli/__init__.py" = ["F401"]
+"mempalace/cli/_*.py" = ["F821"]
+"mempalace/cli/cmd_*.py" = ["F821"]
+"mempalace/cli/parser.py" = ["F821"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 25

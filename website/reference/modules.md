@@ -8,7 +8,7 @@ Complete source file reference for the MemPalace codebase.
 mempalace/
 ├── README.md                  ← project documentation
 ├── mempalace/                 ← core package
-│   ├── cli.py                 ← CLI entry point
+│   ├── cli/                   ← CLI package (commands, parser)
 │   ├── mcp_server/            ← MCP server package (tools, protocol, HTTP)
 │   ├── knowledge_graph.py     ← temporal entity graph
 │   ├── palace_graph.py        ← room navigation graph
@@ -50,7 +50,7 @@ mempalace/
 
 ## Core Modules
 
-### `cli.py` — CLI Entry Point
+### `cli/` — CLI Entry Point
 
 Argparse-based CLI with subcommands: `init`, `mine`, `split`, `search`, `compress`, `wake-up`, `repair`, `status`, `hook`, `instructions`. Dispatches to the corresponding module.
 
