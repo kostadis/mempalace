@@ -227,8 +227,7 @@ def search_within(
                 # Full stored source_file value; lets a caller round-trip a
                 # result back into an exact ``source_file`` filter (#1815).
                 "source_path": source,
-                "created_at": meta.get("filed_at", "unknown"),
-                "authored_at": meta.get("authored_at", meta.get("filed_at", "unknown")),
+                **_result_date_fields(meta),
                 "similarity": round(max(0.0, 1 - dist), 3),
                 "distance": round(dist, 4),
                 "_sort_key": dist,
