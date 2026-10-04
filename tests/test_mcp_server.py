@@ -996,8 +996,9 @@ class TestReadTools:
         assert db_path.read_bytes() == before_bytes
         assert db_path.stat().st_mtime_ns == before_mtime_ns
 
+    @pytest.mark.parametrize("backend_name", ["sqlite_exact", "rust_exact"])
     def test_stdio_sqlite_exact_reads_with_peer_writer_then_reopens_on_promotion(
-        self, monkeypatch, config, palace_path, kg
+        self, monkeypatch, config, palace_path, kg, backend_name
     ):
         """A writable-capable stdio server must recall through a read-only
         handle while a peer owns the palace, then discard that handle when it
@@ -1006,7 +1007,7 @@ class TestReadTools:
         from mempalace import mcp_server, palace
         from mempalace.backends import PalaceRef
 
-        monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
+        monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", backend_name)
         monkeypatch.setattr(
             embedding_wrapper,
             "_embed_texts",
@@ -1065,6 +1066,19 @@ with mine_palace_lock(sys.argv[1]):
             holder.stdin.close()
             holder.wait(timeout=10)
             assert holder.returncode == 0
+
+            # Complete a writer/checkpoint cycle while MCP retains its wrapper.
+            from mempalace.backends.sqlite_exact import SQLiteExactBackend
+
+            peer = SQLiteExactBackend()
+            try:
+                peer_col = peer.get_collection(
+                    palace=palace_ref, collection_name=config.collection_name
+                )
+                peer_col.add(ids=["new_drawer"], documents=["new memory"], embeddings=[[1.0, 0.0]])
+            finally:
+                peer.close()
+            assert mcp_server.tool_list_drawers()["count"] == 2
 
             writer_ok, writer_reason = mcp_server._acquire_mcp_writer_lock()
             assert writer_ok is True
@@ -4222,6 +4236,66 @@ class TestKGTools:
         assert result["count"] == 1
         assert result["facts"][0]["object"] == "Acme"
 
+    def test_kg_query_as_of_does_not_duplicate_ended_facts(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        kg.add_triple(
+            "Alice",
+            "works_at",
+            "Acme",
+            valid_from="2026-01-01",
+            valid_to="2026-06-01",
+        )
+        result = mcp_server.tool_kg_query("Alice", as_of="2026-04-01", direction="outgoing")
+        assert result["count"] == 1
+        assert len(result["active_facts"]) == 1
+        assert result["historical_facts"] == []
+
+    def test_kg_query_excludes_future_valid_from_from_active(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        kg.add_triple("Alice", "starts", "school", valid_from="2099-01-01")
+        kg.add_triple("Alice", "lives_in", "Town", valid_from="2020-01-01")
+        result = mcp_server.tool_kg_query("Alice", direction="outgoing")
+        active_preds = {r["predicate"] for r in result["active_facts"]}
+        future_preds = {r["predicate"] for r in result["future_facts"]}
+        assert "lives_in" in active_preds
+        assert "starts" not in active_preds
+        assert "starts" in future_preds
+
+    def test_kg_query_keeps_bounded_future_end_as_active(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        kg.add_triple(
+            "Alice",
+            "on_med",
+            "Empagliflozin",
+            valid_from="2025-01-01",
+            valid_to="2099-12-31",
+        )
+        kg.add_triple(
+            "Alice",
+            "on_med",
+            "Metformin",
+            valid_from="2020-01-01",
+            valid_to="2025-01-01",
+        )
+        result = mcp_server.tool_kg_query("Alice", direction="outgoing")
+        active_objs = {r["object"] for r in result["active_facts"]}
+        historical_objs = {r["object"] for r in result["historical_facts"]}
+        assert "Empagliflozin" in active_objs
+        assert "Empagliflozin" not in historical_objs
+        assert "Metformin" in historical_objs
+
     def test_kg_invalidate_accepts_datetime_ended(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
 
@@ -4381,6 +4455,54 @@ class TestDiaryTools:
 
         r = tool_diary_read(agent_name="Nobody")
         assert r["entries"] == []
+
+    def test_diary_read_pages_past_10000_and_returns_true_latest(self, monkeypatch, config, kg):
+        """Entries beyond the old 10k cap must affect both recency and total."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        class PagedDiaryCollection:
+            total = 10001
+
+            def __init__(self):
+                self.calls = []
+
+            def get(self, *, where, include, limit, offset):
+                self.calls.append(
+                    {"where": where, "include": include, "limit": limit, "offset": offset}
+                )
+                stop = min(offset + limit, self.total)
+                indices = range(offset, stop)
+                return {
+                    "ids": [f"diary-{index}" for index in indices],
+                    "documents": [f"entry-{index}" for index in indices],
+                    "metadatas": [
+                        {
+                            "filed_at": f"2026-01-01T00:00:00.{index:06d}Z",
+                            "date": "2026-01-01",
+                            "topic": "pagination",
+                        }
+                        for index in indices
+                    ],
+                }
+
+        collection = PagedDiaryCollection()
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: collection)
+
+        result = mcp_server.tool_diary_read(agent_name="TestAgent", last_n=10)
+
+        assert result["total"] == 10001
+        assert result["showing"] == 10
+        assert [entry["content"] for entry in result["entries"]] == [
+            f"entry-{index}" for index in range(10000, 9990, -1)
+        ]
+        assert len(collection.calls) == 11
+        assert all(call["limit"] == 1000 for call in collection.calls)
+        assert [call["offset"] for call in collection.calls] == list(range(0, 11000, 1000))
+        assert all(
+            call["where"] == {"$and": [{"room": "diary"}, {"agent": "testagent"}]}
+            for call in collection.calls
+        )
 
     def test_diary_write_same_second_shared_prefix_no_collision(
         self, monkeypatch, config, palace_path, kg

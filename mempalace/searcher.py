@@ -767,7 +767,7 @@ def search(
                 before_dt=before_dt,
             )
 
-        col = _open_collection_or_explain(palace_path, opener=get_collection)
+        col = _open_collection_or_explain(palace_path, opener=get_collection, read_only=True)
         if col is None:
             if not os.path.isdir(palace_path):
                 raise SearchError(f"No palace found at {palace_path}")
@@ -903,7 +903,7 @@ def _themes_for_cli(query: str, palace_path: str, where: dict, n_results: int) -
     empty list — themes are advisory, never load-bearing.
     """
     try:
-        closets_col = get_closets_collection(palace_path, create=False)
+        closets_col = get_closets_collection(palace_path, create=False, read_only=True)
     except Exception:
         return []
     try:
@@ -1445,9 +1445,11 @@ def search_within(
     """
     try:
         if collection_name is not None:
-            drawers_col = get_collection(palace_path, collection_name=collection_name, create=False)
+            drawers_col = get_collection(
+                palace_path, collection_name=collection_name, create=False, read_only=True
+            )
         else:
-            drawers_col = get_collection(palace_path, create=False)
+            drawers_col = get_collection(palace_path, create=False, read_only=True)
     except BackendError as e:
         # Distinguish a backend that failed to open (service down, mismatch)
         # from a palace that simply doesn't exist yet — collapsing both to
@@ -1539,7 +1541,7 @@ def search_within(
     # the verbatim answer.
     themes: list = []
     try:
-        closets_col = get_closets_collection(palace_path, create=False)
+        closets_col = get_closets_collection(palace_path, create=False, read_only=True)
         closet_docs, closet_metas, closet_dists = _fetch_closet_candidates(
             closets_col, query=query, n_results=max(theme_limit * 4, 10), where=where
         )
