@@ -238,12 +238,14 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
 # migrate) must carry these over (see repair.carry_over_palace_sidecars).
 TUNNELS_FILENAME = "tunnels.json"
 HALLWAYS_FILENAME = "hallways.json"
+ENTITIES_FILENAME = "known_entities.json"
 PALACE_SIDECAR_FILENAMES = (
     "knowledge_graph.sqlite3",
     "knowledge_graph.sqlite3-wal",
     "knowledge_graph.sqlite3-shm",
     TUNNELS_FILENAME,
     HALLWAYS_FILENAME,
+    ENTITIES_FILENAME,
 )
 
 LEGACY_PALACE_DIR = os.path.expanduser("~/.mempalace/palace")
@@ -1253,6 +1255,17 @@ class MempalaceConfig:
         were shared by every palace on the host.
         """
         return os.path.join(self.palace_path, HALLWAYS_FILENAME)
+
+    @property
+    def entity_registry_file(self):
+        """Path to the known-entities registry, inside the palace (#51).
+
+        ``mempalace init`` writes confirmed people/projects/topics (and
+        ``topics_by_wing``) here; the miners, fact-checker and topic tunnels
+        read it. It used to be one global ``~/.mempalace/known_entities.json``
+        shared by every palace.
+        """
+        return os.path.join(self.palace_path, ENTITIES_FILENAME)
 
     @property
     def collection_name(self):

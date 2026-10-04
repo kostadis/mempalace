@@ -172,7 +172,11 @@ def cmd_init(args):
             # same key in ``topics_by_wing`` at mine time (issue #1194 —
             # without this, hyphenated dirnames silently lose tunnels).
             wing = normalize_wing_name(project_path.name)
-            registry_path = add_to_known_entities(confirmed, wing=wing)
+            # The registry is per palace (#51): write into the palace this init
+            # (and its post-init mine) targets -- --palace, else the default.
+            registry_path = add_to_known_entities(
+                confirmed, wing=wing, palace_path=MempalaceConfig().palace_path
+            )
             if registry_path:
                 print(f"  Registry updated: {registry_path}")
             # ``None`` means the registry was left alone and said why on

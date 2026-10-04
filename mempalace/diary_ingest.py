@@ -159,7 +159,7 @@ def ingest_diaries(
         content_changed = prev_hash is not None and curr_hash != prev_hash
 
         now_iso = datetime.now(timezone.utc).isoformat()
-        entities = _extract_entities_for_metadata(text)
+        entities = _extract_entities_for_metadata(text, palace_path)
         source_file = str(diary_path)
 
         # Serialize per source — two terminals running ingest at once must

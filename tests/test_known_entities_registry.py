@@ -19,10 +19,10 @@ from mempalace import miner
 
 @pytest.fixture
 def temp_registry(tmp_path, monkeypatch):
-    """Redirect the module-level registry path to a tmp file and reset cache."""
+    """Redirect the registry path resolver to a tmp file and reset the cache."""
     registry = tmp_path / "known_entities.json"
-    monkeypatch.setattr(miner, "_ENTITY_REGISTRY_PATH", str(registry))
-    miner._ENTITY_REGISTRY_CACHE.update({"mtime": None, "names": frozenset(), "raw": {}})
+    monkeypatch.setattr(miner, "_entity_registry_path", lambda palace_path=None: str(registry))
+    miner._ENTITY_REGISTRY_CACHE.clear()
     return registry
 
 
@@ -411,7 +411,7 @@ def test_an_unreadable_registry_answers_none_so_the_caller_says_nothing(temp_reg
     temp_registry.write_text(json.dumps({"people": ["Alice"]}))
     directory = temp_registry.parent / "known_entities.json.d"
     directory.mkdir()
-    miner._ENTITY_REGISTRY_PATH = str(directory)
+    miner._entity_registry_path = lambda palace_path=None: str(directory)
 
     assert miner.add_to_known_entities({"people": ["Dana"]}) is None
 

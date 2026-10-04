@@ -663,9 +663,8 @@ class TestEntityMetadata:
         registry.write_text(json.dumps({"people": ["Zelda"]}))
         from mempalace import miner
 
-        monkeypatch.setattr(miner, "_ENTITY_REGISTRY_PATH", str(registry))
-        miner._ENTITY_REGISTRY_CACHE["mtime"] = None
-        miner._ENTITY_REGISTRY_CACHE["names"] = frozenset()
+        monkeypatch.setattr(miner, "_entity_registry_path", lambda palace_path=None: str(registry))
+        miner._ENTITY_REGISTRY_CACHE.clear()
 
         first = _load_known_entities()
         assert "Zelda" in first

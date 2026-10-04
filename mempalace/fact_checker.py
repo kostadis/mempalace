@@ -69,7 +69,7 @@ def check_text(text: str, palace_path: str = None, config=None) -> list:
         return []
 
     issues: list = []
-    entity_names_raw = _load_known_entities_raw()
+    entity_names_raw = _load_known_entities_raw(palace_path)
 
     issues.extend(_check_entity_confusion(text, entity_names_raw))
     issues.extend(_check_kg_contradictions(text, palace_path))
