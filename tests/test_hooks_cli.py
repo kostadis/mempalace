@@ -2964,3 +2964,18 @@ def test_regular_file_at_palace_root_treated_as_absent(tmp_path, monkeypatch):
     # The stray file is left untouched; we never try to convert it.
     assert fake_root.is_file()
     assert fake_root.read_text() == "oops, this is a file not a directory"
+
+
+def test_daemon_submitted_hook_writes_target_chat_palace(monkeypatch, tmp_path):
+    """Isolation invariant #1: a hook write routed through the daemon must
+    target the chat palace even when MEMPALACE_PALACE_PATH points elsewhere (#41)."""
+    from mempalace import hooks_cli
+
+    chat = tmp_path / "chat"
+    curated = tmp_path / "campaign"
+    monkeypatch.setenv("MEMPAL_CHAT_PALACE", str(chat))
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(curated))
+    with patch("mempalace.daemon.submit_job", return_value={"id": "j"}) as mock_submit:
+        hooks_cli._submit_daemon_job("mine", {"source": "/t.jsonl"})
+
+    assert mock_submit.call_args.kwargs["palace_path"] == str(chat)

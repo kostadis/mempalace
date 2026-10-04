@@ -779,7 +779,10 @@ def _submit_daemon_job(
     """
     from .daemon import submit_job
 
-    palace_path = MempalaceConfig().palace_path
+    # Hook writes are chat-palace-only (palace-isolation invariant #1). The
+    # daemon files into whatever palace is passed here, so this must be the
+    # pinned chat palace, never MempalaceConfig().palace_path (#41).
+    palace_path = _chat_palace_path()
     return submit_job(
         kind,
         payload,
