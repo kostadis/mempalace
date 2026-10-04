@@ -1813,7 +1813,8 @@ def test_legacy_mempalace_dir_respected_for_backcompat(monkeypatch, tmp_path):
     assert _default_config_dir() == legacy
 
     cfg = MempalaceConfig()
-    assert cfg.palace_path == str(legacy / "palace")
+    # Fork layout: the fallback palace is the chat palace, not legacy/palace.
+    assert cfg.palace_path == str(legacy / "palaces" / "chat")
 
 
 @pytest.mark.skip(
@@ -1895,7 +1896,8 @@ def test_mempalace_config_dir_env_overrides_everything(monkeypatch, tmp_path):
     assert _default_config_dir() == override
 
     cfg = MempalaceConfig()
-    assert cfg.palace_path == str(override / "palace")
+    # Fork layout: the fallback palace is the chat palace, not override/palace.
+    assert cfg.palace_path == str(override / "palaces" / "chat")
 
 
 @pytest.mark.skip(
@@ -1939,3 +1941,36 @@ def test_init_writes_xdg_aware_palace_path(tmp_path):
     with open(tmp_path / "config.json") as f:
         written = json.load(f)
     assert written["palace_path"] == str(tmp_path / "palace")
+
+
+def test_palace_path_fallback_is_the_chat_palace_not_the_legacy_dir(monkeypatch, tmp_path):
+    """With no palace_path in config.json, the palace is <config dir>/palaces/chat.
+
+    Upstream's XDG change made the fallback <config dir>/palace, which under
+    the default ~/.mempalace is the legacy single-palace directory the
+    palace-isolation migration renames away.
+    """
+    import mempalace.config as cfg_mod
+
+    fake_home = tmp_path / "home"
+    (fake_home / ".mempalace").mkdir(parents=True)
+    _set_home(monkeypatch, fake_home)
+    monkeypatch.delenv("MEMPALACE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("MEMPALACE_PALACE_PATH", raising=False)
+    monkeypatch.delenv("MEMPAL_PALACE_PATH", raising=False)
+    monkeypatch.setattr(cfg_mod, "_maybe_migrate_legacy_palace_dir", lambda: None)
+
+    cfg = MempalaceConfig()
+
+    assert cfg.palace_path == str(fake_home / ".mempalace" / "palaces" / "chat")
+    assert not cfg.palace_path.endswith(os.path.join(".mempalace", "palace"))
+
+
+def test_palace_path_fallback_follows_config_dir_override(monkeypatch, tmp_path):
+    override = tmp_path / "override"
+    override.mkdir()
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(override))
+    monkeypatch.delenv("MEMPALACE_PALACE_PATH", raising=False)
+    monkeypatch.delenv("MEMPAL_PALACE_PATH", raising=False)
+
+    assert MempalaceConfig().palace_path == str(override / "palaces" / "chat")

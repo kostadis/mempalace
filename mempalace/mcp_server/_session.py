@@ -239,6 +239,10 @@ def _get_collection(palace_path=None, create=False):
             }
             return None
 
+    handled, collection = _open_cross_palace_collection(palace_path, is_default)
+    if handled:
+        return collection
+
     # Chroma open — shared by the default palace (backend_name == "chroma",
     # above) and any non-default cross-palace ``palace=`` read (assumed
     # chroma, per the docstring). Cached per-palace in ``_palace_caches``
@@ -392,7 +396,87 @@ def _no_palace():
     }
 
 
-def _collection_error_or_no_palace():
+def _open_cross_palace_collection(palace_path: str, is_default: bool):
+    """Open a non-default palace whose backend is not chroma.
+
+    Returns ``(handled, collection)``. ``handled`` is False for the default
+    palace and for a chroma palace (or one with no artifacts yet); the
+    caller's own paths serve those.
+    """
+    if is_default:
+        return False, None
+    # Cross-palace ``palace=`` read: the target palace's own on-disk
+    # artifacts decide its backend. The process-wide selection
+    # (MEMPALACE_BACKEND, the default palace's backend) does not apply to
+    # another palace. Chroma palaces use _get_collection's per-palace
+    # chroma cache; any other backend opens read-only through
+    # palace.get_collection, so a read never bootstraps a chroma store
+    # inside a non-chroma palace.
+    backend_name, open_error = _cross_palace_backend(palace_path)
+    entry = _cache_entry(palace_path)
+    entry["open_error"] = open_error
+    if open_error:
+        return True, None
+    if backend_name not in (None, "chroma"):
+        if entry["collection"] is None or entry.get("backend") != backend_name:
+            from ..palace import get_collection as palace_get_collection
+
+            try:
+                entry["collection"] = palace_get_collection(
+                    palace_path,
+                    collection_name=_config.collection_name,
+                    create=False,
+                    backend=backend_name,
+                    read_only=True,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "cross-palace open failed (palace=%s, backend=%s): %s",
+                    palace_path,
+                    backend_name,
+                    exc,
+                )
+                entry["collection"] = None
+                entry["open_error"] = {
+                    "error": "Backend error",
+                    "details": str(exc),
+                    "backend": backend_name,
+                }
+                return True, None
+            entry["backend"] = backend_name
+            entry["metadata"] = None
+            entry["metadata_time"] = 0
+        return True, entry["collection"]
+    return False, None
+
+
+def _cross_palace_backend(palace_path: str):
+    """Return ``(backend_name, open_error)`` for a non-default palace.
+
+    Decided by that palace's own on-disk artifacts only. ``backend_name`` is
+    None for a palace with no artifacts yet. Artifacts from more than one
+    backend are reported, never guessed between.
+    """
+    detected = detect_backends_for_path(palace_path)
+    if len(detected) > 1:
+        return None, {
+            "error": "Backend mismatch",
+            "details": (
+                f"palace at {palace_path!r} contains multiple backend artifacts: "
+                f"{', '.join(detected)}"
+            ),
+            "hint": "Remove the stale store or select the palace's backend explicitly.",
+        }
+    return (detected[0] if detected else None), None
+
+
+def _collection_error_or_no_palace(palace_path=None):
+    if (
+        palace_path is not None
+        and os.path.abspath(os.path.expanduser(palace_path)) != _default_palace_path()
+    ):
+        entry_error = _cache_entry(palace_path).get("open_error")
+        return dict(entry_error) if entry_error else _no_palace()
     if not _collection_open_error:
         return _no_palace()
     result = dict(_collection_open_error)
