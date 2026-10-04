@@ -591,6 +591,7 @@ def _file_chunks_locked(
     agent,
     source_mtime: Optional[float] = None,
     content: Optional[str] = None,
+    palace_path: Optional[str] = None,
 ):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
@@ -677,7 +678,7 @@ def _file_chunks_locked(
                 if file_content_date:
                     meta["content_date"] = file_content_date
                     meta["content_date_source"] = file_content_date_source
-                entities = _extract_entities_for_metadata(content)
+                entities = _extract_entities_for_metadata(content, palace_path)
                 if entities:
                     meta["entities"] = entities
                 batch_docs.append(content)
@@ -899,6 +900,7 @@ def mine_formats(
                     agent,
                     source_mtime=source_mtime,
                     content=text,
+                    palace_path=palace_path,
                 )
                 if skipped:
                     files_skipped += 1

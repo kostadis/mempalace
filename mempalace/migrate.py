@@ -485,12 +485,12 @@ def _apply_wing_updates(col, updates, batch_size=500):
         col.update(ids=[u[0] for u in chunk], metadatas=[u[1] for u in chunk])
 
 
-def _plan_topics_by_wing_renames():
+def _plan_topics_by_wing_renames(palace_path=None):
     """Return ``{old_wing: new_wing}`` for ``topics_by_wing`` keys to normalize."""
     try:
         from .miner import _load_known_entities_raw
 
-        reg = _load_known_entities_raw()
+        reg = _load_known_entities_raw(palace_path)
     except Exception:
         return {}
     tbw = reg.get("topics_by_wing")
@@ -504,16 +504,18 @@ def _plan_topics_by_wing_renames():
     return renames
 
 
-def _apply_topics_by_wing_renames(renames):
+def _apply_topics_by_wing_renames(renames, palace_path=None):
     """Re-key ``topics_by_wing`` in known_entities.json, merging on collision."""
     if not renames:
         return
     import json
 
-    from .miner import _ENTITY_REGISTRY_PATH, _load_known_entities_raw
+    from .miner import _entity_registry_path, _load_known_entities_raw
+
+    registry_path = _entity_registry_path(palace_path)
 
     try:
-        reg = _load_known_entities_raw()
+        reg = _load_known_entities_raw(palace_path)
     except Exception:
         return
     tbw = reg.get("topics_by_wing")
@@ -532,12 +534,12 @@ def _apply_topics_by_wing_renames(renames):
         else:
             tbw[new] = old_topics
     reg["topics_by_wing"] = tbw
-    os.makedirs(os.path.dirname(_ENTITY_REGISTRY_PATH), exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(_ENTITY_REGISTRY_PATH), suffix=".tmp")
+    os.makedirs(os.path.dirname(registry_path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(registry_path), suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(reg, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, _ENTITY_REGISTRY_PATH)
+        os.replace(tmp, registry_path)
     except Exception:
         if os.path.exists(tmp):
             os.remove(tmp)
@@ -573,7 +575,7 @@ def migrate_wing_names(palace_path: str, dry_run: bool = False, confirm: bool = 
     except Exception:
         closets = None
 
-    topic_renames = _plan_topics_by_wing_renames()
+    topic_renames = _plan_topics_by_wing_renames(palace_path)
 
     if not d_updates and not c_updates and not topic_renames:
         print("  All wing names are already normalized -- nothing to migrate.")
@@ -607,7 +609,7 @@ def migrate_wing_names(palace_path: str, dry_run: bool = False, confirm: bool = 
     _apply_wing_updates(drawers, d_updates)
     if closets is not None and c_updates:
         _apply_wing_updates(closets, c_updates)
-    _apply_topics_by_wing_renames(topic_renames)
+    _apply_topics_by_wing_renames(topic_renames, palace_path)
 
     parts = [f"{len(d_updates)} drawer(s)"]
     if c_updates:

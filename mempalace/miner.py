@@ -809,37 +809,74 @@ def chunk_text(
 # =============================================================================
 
 
-_ENTITY_REGISTRY_PATH = os.path.join(os.path.expanduser("~"), ".mempalace", "known_entities.json")
-_ENTITY_REGISTRY_CACHE: dict = {"mtime": None, "names": frozenset(), "raw": {}}
+# The known-entities registry is per palace (#51): ``<palace>/known_entities.json``
+# (``MempalaceConfig.entity_registry_file``). The old global file below is
+# ignored -- named in a one-time warning per palace, never migrated.
+_LEGACY_ENTITY_REGISTRY_PATH = os.path.join(
+    os.path.expanduser("~"), ".mempalace", "known_entities.json"
+)
+_LEGACY_REGISTRY_WARNED: set = set()
+# Cache keyed by registry path: {"mtime", "names", "raw"} per palace.
+_ENTITY_REGISTRY_CACHE: dict = {}
 _ENTITY_EXTRACT_WINDOW = 5000  # chars of content scanned for capitalized words
 _ENTITY_METADATA_LIMIT = 25  # max entities packed into the metadata field
 
 
-def _refresh_known_entities_cache() -> None:
-    """Reload ``~/.mempalace/known_entities.json`` into the module cache if
-    its mtime changed since the last read. Shared by ``_load_known_entities``
-    (flat set) and ``_load_known_entities_raw`` (category dict), so callers
-    can pick whichever shape they need without duplicating the mtime-gated
-    disk read.
-    """
-    try:
-        mtime = os.path.getmtime(_ENTITY_REGISTRY_PATH)
-    except OSError:
-        if _ENTITY_REGISTRY_CACHE["mtime"] is not None:
-            _ENTITY_REGISTRY_CACHE["mtime"] = None
-            _ENTITY_REGISTRY_CACHE["names"] = frozenset()
-            _ENTITY_REGISTRY_CACHE["raw"] = {}
-        return
+def _entity_registry_path(palace_path: Optional[str] = None) -> str:
+    """The registry file for ``palace_path``; None means the default palace."""
+    if palace_path:
+        from .config import ENTITIES_FILENAME
 
-    if _ENTITY_REGISTRY_CACHE["mtime"] == mtime:
-        return
+        return os.path.join(os.path.abspath(os.path.expanduser(palace_path)), ENTITIES_FILENAME)
+    from .config import MempalaceConfig
+
+    return MempalaceConfig().entity_registry_file
+
+
+def _warn_if_legacy_registry(registry_path: str) -> None:
+    legacy = _LEGACY_ENTITY_REGISTRY_PATH
+    if (
+        registry_path != legacy
+        and registry_path not in _LEGACY_REGISTRY_WARNED
+        and os.path.isfile(legacy)
+    ):
+        _LEGACY_REGISTRY_WARNED.add(registry_path)
+        logger.warning(
+            "Global known-entities registry '%s' is ignored; this palace's registry is '%s'. "
+            "Re-run `mempalace init` for the projects mined into this palace to repopulate it.",
+            legacy,
+            registry_path,
+        )
+
+
+def _refresh_known_entities_cache(palace_path: Optional[str] = None) -> dict:
+    """Reload the palace's registry into the cache if its mtime changed.
+
+    Shared by ``_load_known_entities`` (flat set) and
+    ``_load_known_entities_raw`` (category dict), so callers can pick
+    whichever shape they need without duplicating the mtime-gated disk read.
+    Returns the cache entry for that palace.
+    """
+    path = _entity_registry_path(palace_path)
+    entry = _ENTITY_REGISTRY_CACHE.setdefault(
+        path, {"mtime": None, "names": frozenset(), "raw": {}}
+    )
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        entry.update({"mtime": None, "names": frozenset(), "raw": {}})
+        _warn_if_legacy_registry(path)
+        return entry
+
+    if entry["mtime"] == mtime:
+        return entry
 
     names: set = set()
     raw: dict = {}
     try:
         import json
 
-        with open(_ENTITY_REGISTRY_PATH, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
             raw = data
@@ -861,30 +898,27 @@ def _refresh_known_entities_cache() -> None:
         names = set()
         raw = {}
 
-    _ENTITY_REGISTRY_CACHE["mtime"] = mtime
-    _ENTITY_REGISTRY_CACHE["names"] = frozenset(names)
-    _ENTITY_REGISTRY_CACHE["raw"] = raw
+    entry.update({"mtime": mtime, "names": frozenset(names), "raw": raw})
+    return entry
 
 
-def _load_known_entities() -> frozenset:
-    """Flat set of every known entity name (across all categories).
+def _load_known_entities(palace_path: Optional[str] = None) -> frozenset:
+    """Flat set of every known entity name (across all categories) for a palace.
 
     Cached by mtime; invalidated when the registry file changes.
     """
-    _refresh_known_entities_cache()
-    return _ENTITY_REGISTRY_CACHE["names"]
+    return _refresh_known_entities_cache(palace_path)["names"]
 
 
-def _load_known_entities_raw() -> dict:
-    """Full category-dict view of the registry, shape
+def _load_known_entities_raw(palace_path: Optional[str] = None) -> dict:
+    """Full category-dict view of a palace's registry, shape
     ``{"category": ["Name1", ...], ...}``. Cached by mtime.
 
     Consumed by modules (e.g., fact_checker) that need to reason about
     categories rather than a flat name set. Never returns a mutable
     reference to the cache — callers get a shallow copy.
     """
-    _refresh_known_entities_cache()
-    return dict(_ENTITY_REGISTRY_CACHE["raw"])
+    return dict(_refresh_known_entities_cache(palace_path)["raw"])
 
 
 def _set_wing_topics(existing: dict, wing_key: str, topics_for_wing: list, coerce) -> None:
@@ -1213,8 +1247,13 @@ def _registry_to_merge_into(registry_path) -> Optional[dict]:
     return {}
 
 
-def add_to_known_entities(entities_by_category: dict, wing: str = None) -> Optional[str]:
-    """Union ``entities_by_category`` into ``~/.mempalace/known_entities.json``.
+def add_to_known_entities(
+    entities_by_category: dict, wing: str = None, palace_path: Optional[str] = None
+) -> Optional[str]:
+    """Union ``entities_by_category`` into the palace's ``known_entities.json``.
+
+    ``palace_path`` selects the palace whose registry is updated (#51); None
+    means the default palace.
 
     Accepts ``{category: [names]}`` shape as produced by ``mempalace init``
     and merges into the registry the miner reads at mine time. Existing
@@ -1246,7 +1285,7 @@ def add_to_known_entities(entities_by_category: dict, wing: str = None) -> Optio
     """
     from pathlib import Path as _Path
 
-    registry_path = _Path(_ENTITY_REGISTRY_PATH)
+    registry_path = _Path(_entity_registry_path(palace_path))
     registry_path.parent.mkdir(parents=True, exist_ok=True)
 
     # A registry this call cannot merge into is kept rather than written over,
@@ -1312,21 +1351,19 @@ def add_to_known_entities(entities_by_category: dict, wing: str = None) -> Optio
     _publish_registry(registry_path, existing)
 
     # Invalidate in-process cache so later calls in the same run see the write.
-    _ENTITY_REGISTRY_CACHE["mtime"] = None
-    _ENTITY_REGISTRY_CACHE["names"] = frozenset()
-    _ENTITY_REGISTRY_CACHE["raw"] = {}
+    _ENTITY_REGISTRY_CACHE.pop(str(registry_path), None)
 
     return str(registry_path)
 
 
-def get_topics_by_wing() -> dict:
-    """Return ``topics_by_wing`` from the global registry as a dict.
+def get_topics_by_wing(palace_path: Optional[str] = None) -> dict:
+    """Return ``topics_by_wing`` from the palace's registry as a dict.
 
     Returns ``{}`` if the registry is missing, malformed, or has no
     ``topics_by_wing`` key. Casing is preserved from disk; callers that
     need case-insensitive comparison should normalize themselves.
     """
-    raw = _load_known_entities_raw()
+    raw = _load_known_entities_raw(palace_path)
     topics_map = raw.get("topics_by_wing")
     if not isinstance(topics_map, dict):
         return {}
@@ -1368,7 +1405,7 @@ def detect_hall(content: str) -> str:
     return "general"
 
 
-def _extract_entities_for_metadata(content: str) -> str:
+def _extract_entities_for_metadata(content: str, palace_path: Optional[str] = None) -> str:
     """Extract entity names from content for metadata tagging.
 
     Combines the user's known-entity registry (cached across calls) with
@@ -1386,7 +1423,7 @@ def _extract_entities_for_metadata(content: str) -> str:
 
     matched: set = set()
 
-    known = _load_known_entities()
+    known = _load_known_entities(palace_path)
     for name in known:
         # Case-insensitive match — mirrors entity_detector.py's init-time
         # behavior so a known entity like "Aya" tags drawers that mention
@@ -1734,6 +1771,7 @@ def _build_drawer_metadata(
     content_date: Optional[str] = None,
     chunk_total: Optional[int] = None,
     content_date_source: Optional[str] = None,
+    palace_path: Optional[str] = None,
 ) -> dict:
     """Build the metadata dict for one drawer without upserting.
 
@@ -1784,7 +1822,7 @@ def _build_drawer_metadata(
     if chunk_total is not None:
         metadata["chunk_total"] = chunk_total
     metadata["hall"] = detect_hall(content)
-    entities = _extract_entities_for_metadata(content)
+    entities = _extract_entities_for_metadata(content, palace_path)
     if entities:
         metadata["entities"] = entities
     return metadata
@@ -1866,6 +1904,7 @@ def _prepare_file(
     chunk_overlap: int = None,
     min_chunk_size: int = None,
     max_chunks_per_file: Optional[int] = None,
+    palace_path: Optional[str] = None,
 ) -> Optional[_PreparedFile]:
     """Read, chunk, and pre-build per-batch documents/ids/metadata.
 
@@ -1966,6 +2005,7 @@ def _prepare_file(
                     content_date=file_content_date,
                     content_date_source=file_content_date_source,
                     chunk_total=len(chunks),
+                    palace_path=palace_path,
                 )
             )
         batches.append(_BatchDocs(documents=batch_docs, ids=batch_ids, metadatas=batch_metas))
@@ -2002,6 +2042,7 @@ def _write_prepared(
     collection,
     closets_col,
     wing: str,
+    palace_path: Optional[str] = None,
 ) -> int:
     """Single-writer phase: under ``mine_lock``, upsert with pre-computed embeddings.
 
@@ -2103,7 +2144,7 @@ def _write_prepared(
             closet_id_base = (
                 f"closet_{wing}_{room}_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
             )
-            entities = _extract_entities_for_metadata(prepared.content)
+            entities = _extract_entities_for_metadata(prepared.content, palace_path)
             closet_meta = {
                 "wing": wing,
                 "room": room,
@@ -2132,6 +2173,7 @@ def process_file(
     chunk_overlap: int = None,
     min_chunk_size: int = None,
     max_chunks_per_file: Optional[int] = None,
+    palace_path: Optional[str] = None,
 ) -> tuple:
     """Read, chunk, route, and file one file.
 
@@ -2157,6 +2199,7 @@ def process_file(
         chunk_overlap=chunk_overlap,
         min_chunk_size=min_chunk_size,
         max_chunks_per_file=max_chunks_per_file,
+        palace_path=palace_path,
     )
     if prepared is None:
         return 0, "general", None
@@ -2175,7 +2218,9 @@ def process_file(
 
     ef = get_embedding_function()
     embeddings_batches = _embed_prepared(prepared, ef)
-    drawers_added = _write_prepared(prepared, embeddings_batches, collection, closets_col, wing)
+    drawers_added = _write_prepared(
+        prepared, embeddings_batches, collection, closets_col, wing, palace_path=palace_path
+    )
     return drawers_added, prepared.room, None
 
 
@@ -2484,6 +2529,7 @@ def _mine_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run/parall
                         chunk_overlap=cfg_chunk_overlap,
                         min_chunk_size=cfg_min_chunk_size,
                         max_chunks_per_file=effective_chunk_cap,
+                        palace_path=palace_path,
                     )
                 except KeyboardInterrupt:
                     last_file = filepath.name
@@ -2520,6 +2566,7 @@ def _mine_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run/parall
                     chunk_overlap=cfg_chunk_overlap,
                     min_chunk_size=cfg_min_chunk_size,
                     max_chunks_per_file=effective_chunk_cap,
+                    palace_path=palace_path,
                 )
                 if prepared is None:
                     return WorkerResult(
@@ -2560,7 +2607,9 @@ def _mine_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run/parall
                         files_skipped_chunk_cap += 1
                     return
                 prepared, embeddings = result.payload
-                drawers = _write_prepared(prepared, embeddings, collection, closets_col, wing)
+                drawers = _write_prepared(
+                    prepared, embeddings, collection, closets_col, wing, palace_path=palace_path
+                )
                 if drawers == 0:
                     files_skipped += 1
                     return
@@ -2718,10 +2767,12 @@ def _compute_topic_tunnels_for_wing(wing: str, config=None) -> int:
     from .config import MempalaceConfig
     from .palace_graph import topic_tunnels_for_wing
 
-    topics_map = get_topics_by_wing()
+    cfg = config or MempalaceConfig()
+    # The palace's own registry (#51): topic tunnels must only connect wings
+    # of the palace being mined, never wings that live in another palace.
+    topics_map = get_topics_by_wing(cfg.palace_path)
     if not topics_map or wing not in topics_map:
         return 0
-    cfg = config or MempalaceConfig()
     min_count = cfg.topic_tunnel_min_count
     created = topic_tunnels_for_wing(wing, topics_map, min_count=min_count, config=cfg)
     return len(created)

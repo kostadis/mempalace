@@ -732,7 +732,9 @@ def test_entity_metadata_matches_known_names_case_insensitively(monkeypatch):
     from mempalace import miner
 
     # Stub the known-entity registry to a controlled set
-    monkeypatch.setattr(miner, "_load_known_entities", lambda: frozenset({"Aya", "Lumi"}))
+    monkeypatch.setattr(
+        miner, "_load_known_entities", lambda palace_path=None: frozenset({"Aya", "Lumi"})
+    )
 
     # Lowercase mentions of seeded names must still be tagged.
     result = miner._extract_entities_for_metadata("aya talked to lumi today about the palace.")
@@ -1235,7 +1237,9 @@ def test_process_file_uses_bounded_upsert_batches(tmp_path, monkeypatch):
     monkeypatch.setattr(miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
     monkeypatch.setattr(miner, "chunk_text", lambda content, source_file, **kwargs: chunks)
     monkeypatch.setattr(miner, "detect_hall", lambda content: "code")
-    monkeypatch.setattr(miner, "_extract_entities_for_metadata", lambda content: "")
+    monkeypatch.setattr(
+        miner, "_extract_entities_for_metadata", lambda content, palace_path=None: ""
+    )
     monkeypatch.setattr(embedding, "get_embedding_function", lambda: fake_ef)
 
     drawers, room, skip_reason = miner.process_file(
@@ -1284,7 +1288,9 @@ def test_process_file_stamps_chunk_total_for_completion_check(tmp_path, monkeypa
     monkeypatch.setattr(miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
     monkeypatch.setattr(miner, "chunk_text", lambda content, source_file, **kwargs: chunks)
     monkeypatch.setattr(miner, "detect_hall", lambda content: "code")
-    monkeypatch.setattr(miner, "_extract_entities_for_metadata", lambda content: "")
+    monkeypatch.setattr(
+        miner, "_extract_entities_for_metadata", lambda content, palace_path=None: ""
+    )
 
     miner.process_file(
         source,
@@ -1344,7 +1350,9 @@ def test_process_file_stamps_metadata_with_read_time_mtime_not_a_later_restat(
     col = FakeCol()
     monkeypatch.setattr(miner, "chunk_text", lambda content, source_file, **kwargs: chunks)
     monkeypatch.setattr(miner, "detect_hall", lambda content: "code")
-    monkeypatch.setattr(miner, "_extract_entities_for_metadata", lambda content: "")
+    monkeypatch.setattr(
+        miner, "_extract_entities_for_metadata", lambda content, palace_path=None: ""
+    )
 
     miner.process_file(
         source,
@@ -1391,7 +1399,9 @@ def test_process_file_aborts_when_stale_drawer_purge_fails(tmp_path, monkeypatch
     col = FailingPurgeCol()
     monkeypatch.setattr(miner, "chunk_text", lambda content, source_file, **kwargs: chunks)
     monkeypatch.setattr(miner, "detect_hall", lambda content: "code")
-    monkeypatch.setattr(miner, "_extract_entities_for_metadata", lambda content: "")
+    monkeypatch.setattr(
+        miner, "_extract_entities_for_metadata", lambda content, palace_path=None: ""
+    )
 
     drawers, room, skip_reason = miner.process_file(
         source,
@@ -1789,8 +1799,8 @@ def test_mine_creates_topic_tunnels_for_shared_topics(tmp_path, monkeypatch):
     # Redirect both the registry and tunnel-storage paths into tmp_path
     # so we never touch the developer's real ~/.mempalace directory.
     registry = tmp_path / "known_entities.json"
-    monkeypatch.setattr(miner, "_ENTITY_REGISTRY_PATH", str(registry))
-    miner._ENTITY_REGISTRY_CACHE.update({"mtime": None, "names": frozenset(), "raw": {}})
+    monkeypatch.setattr(miner, "_entity_registry_path", lambda palace_path=None: str(registry))
+    miner._ENTITY_REGISTRY_CACHE.clear()
     tunnels_file = tmp_path / "tunnels.json"
     monkeypatch.setattr(palace_graph, "_get_tunnel_file", lambda *a, **kw: str(tunnels_file))
     monkeypatch.setattr(palace_graph, "_legacy_tunnel_file", lambda: str(tunnels_file) + ".legacy")
@@ -1831,8 +1841,8 @@ def test_mine_no_tunnel_when_threshold_blocks_overlap(tmp_path, monkeypatch):
     from mempalace import miner, palace_graph
 
     registry = tmp_path / "known_entities.json"
-    monkeypatch.setattr(miner, "_ENTITY_REGISTRY_PATH", str(registry))
-    miner._ENTITY_REGISTRY_CACHE.update({"mtime": None, "names": frozenset(), "raw": {}})
+    monkeypatch.setattr(miner, "_entity_registry_path", lambda palace_path=None: str(registry))
+    miner._ENTITY_REGISTRY_CACHE.clear()
     tunnels_file = tmp_path / "tunnels.json"
     monkeypatch.setattr(palace_graph, "_get_tunnel_file", lambda *a, **kw: str(tunnels_file))
     monkeypatch.setattr(palace_graph, "_legacy_tunnel_file", lambda: str(tunnels_file) + ".legacy")
@@ -1862,8 +1872,8 @@ def test_mine_no_tunnel_when_only_one_wing_has_topics(tmp_path, monkeypatch):
     from mempalace import miner, palace_graph
 
     registry = tmp_path / "known_entities.json"
-    monkeypatch.setattr(miner, "_ENTITY_REGISTRY_PATH", str(registry))
-    miner._ENTITY_REGISTRY_CACHE.update({"mtime": None, "names": frozenset(), "raw": {}})
+    monkeypatch.setattr(miner, "_entity_registry_path", lambda palace_path=None: str(registry))
+    miner._ENTITY_REGISTRY_CACHE.clear()
     tunnels_file = tmp_path / "tunnels.json"
     monkeypatch.setattr(palace_graph, "_get_tunnel_file", lambda *a, **kw: str(tunnels_file))
     monkeypatch.setattr(palace_graph, "_legacy_tunnel_file", lambda: str(tunnels_file) + ".legacy")
@@ -2093,7 +2103,9 @@ def test_process_file_sentinel_zero_disables_cap(tmp_path, monkeypatch):
     big = [{"content": f"chunk {i}", "chunk_index": i} for i in range(20)]
     monkeypatch.setattr(miner, "chunk_text", lambda content, source_file, **kwargs: big)
     monkeypatch.setattr(miner, "detect_room", lambda *a, **k: "general")
-    monkeypatch.setattr(miner, "_extract_entities_for_metadata", lambda content: "")
+    monkeypatch.setattr(
+        miner, "_extract_entities_for_metadata", lambda content, palace_path=None: ""
+    )
     monkeypatch.setattr(miner, "build_closet_lines", lambda *a, **k: [])
     monkeypatch.setattr(miner, "purge_file_closets", lambda *a, **k: None)
     monkeypatch.setattr(miner, "upsert_closet_lines", lambda *a, **k: None)

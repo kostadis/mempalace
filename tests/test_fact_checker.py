@@ -252,8 +252,8 @@ class TestCheckTextContract:
         registry.write_text(json.dumps({"people": ["Milla", "Mila"]}))
         from mempalace import miner
 
-        monkeypatch.setattr(miner, "_ENTITY_REGISTRY_PATH", str(registry))
-        miner._ENTITY_REGISTRY_CACHE.update({"mtime": None, "names": frozenset(), "raw": {}})
+        monkeypatch.setattr(miner, "_entity_registry_path", lambda palace_path=None: str(registry))
+        miner._ENTITY_REGISTRY_CACHE.clear()
 
         issues = check_text("Chatted with Mila.", str(tmp_path / "nonexistent_palace"))
         assert any(i["type"] == "similar_name" for i in issues)
@@ -272,15 +272,14 @@ class TestCLI:
         collide with runpy re-executing it as ``__main__``, which produced
         a spurious RuntimeWarning from <frozen runpy>.
         """
-        # Place the registry where the subprocess's miner will find it:
-        # $HOME/.mempalace/known_entities.json.  We give the subprocess a
-        # private HOME so we don't touch the developer's real registry.
+        # Place the registry where the subprocess will find it: inside the
+        # palace passed with --palace (per-palace registry, #51). A private
+        # HOME keeps the developer's real ~/.mempalace out of it.
         fake_home = tmp_path / "home"
-        mempalace_dir = fake_home / ".mempalace"
-        mempalace_dir.mkdir(parents=True)
-        (mempalace_dir / "known_entities.json").write_text(
-            json.dumps({"people": ["Milla", "Mila"]})
-        )
+        (fake_home / ".mempalace").mkdir(parents=True)
+        palace = tmp_path / "palace"
+        palace.mkdir()
+        (palace / "known_entities.json").write_text(json.dumps({"people": ["Milla", "Mila"]}))
 
         env = {**os.environ, "HOME": str(fake_home), "USERPROFILE": str(fake_home)}
         result = subprocess.run(

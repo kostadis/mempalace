@@ -1,6 +1,6 @@
 # Divergence: `kostadis-dev` vs upstream `v3.10.0`
 
-Context: `kostadis-dev` is a personal fork of MemPalace carrying local commits on top of upstream (67 as of the v3.5.0 sync, per an earlier revision of this document; more have landed since). It was brought current with upstream `v3.5.0` through a chain of five per-release merges tracked under issue #23, then with `v3.6.0` through a single direct merge (`v3.5.0` → `v3.6.0` has no intermediate tags) on `merge/v3.6.0-into-kostadis-dev`, tracked under issue #35 (PR #37). It is now current with `v3.7.1` through a single direct merge spanning two intermediate upstream releases (`v3.6.0` → `v3.7.0` → `v3.7.1`, 50 commits) on `merge/v3.7.1-into-kostadis-dev`. It was then brought current with `v3.10.0` on `merge/v3.10.0-into-kostadis-dev` (issue #39), as one PR made of per-step merge commits: v3.8.0, v3.9.0, then v3.10.0 in cuts around upstream's four package splits and the XDG commit (§15). `version.py` = 3.10.0. This document explains, for offline review and potential discussion with the upstream maintainers, where the two branches diverge and why. (An earlier revision described the fork against v3.3.5; the seven structural divergences below originated there and **held unchanged through v3.7.1** — the local design absorbed each release's bugfixes without moving off its own shape. Sections 8–12 are tensions that surfaced during the v3.4.0–v3.5.0 merges; §13 covers what changed during the v3.6.0 merge; §14 covers the v3.7.1 merge; §15 covers the v3.8.0–v3.10.0 merge; §16 is the XDG config-directory pin, a new standing divergence.)
+Context: `kostadis-dev` is a personal fork of MemPalace carrying local commits on top of upstream (67 as of the v3.5.0 sync, per an earlier revision of this document; more have landed since). It was brought current with upstream `v3.5.0` through a chain of five per-release merges tracked under issue #23, then with `v3.6.0` through a single direct merge (`v3.5.0` → `v3.6.0` has no intermediate tags) on `merge/v3.6.0-into-kostadis-dev`, tracked under issue #35 (PR #37). It is now current with `v3.7.1` through a single direct merge spanning two intermediate upstream releases (`v3.6.0` → `v3.7.0` → `v3.7.1`, 50 commits) on `merge/v3.7.1-into-kostadis-dev`. It was then brought current with `v3.10.0` on `merge/v3.10.0-into-kostadis-dev` (issue #39), as one PR made of per-step merge commits: v3.8.0, v3.9.0, then v3.10.0 in cuts around upstream's four package splits and the XDG commit (§15). `version.py` = 3.10.0. After the sync, five follow-up PRs completed palace isolation: #46 (#43), #47 (#44), #49 (#45), #50 (#48) and #52 (#51). They are described in §17 and, unlike §15, they are new local design rather than merge adaptation. This document explains, for offline review and potential discussion with the upstream maintainers, where the two branches diverge and why. (An earlier revision described the fork against v3.3.5; the seven structural divergences below originated there and **held unchanged through v3.7.1** — the local design absorbed each release's bugfixes without moving off its own shape. Sections 8–12 are tensions that surfaced during the v3.4.0–v3.5.0 merges; §13 covers what changed during the v3.6.0 merge; §14 covers the v3.7.1 merge; §15 covers the v3.8.0–v3.10.0 merge; §16 is the XDG config-directory pin; §17 covers the palace-isolation work that landed after the sync.)
 
 The divergence is not the merge — the bulk of upstream's v3.3.5→v3.7.1 delta (525 commits through v3.5.0, 50 for v3.5.0→v3.6.0, another 50 for v3.6.0→v3.7.1) applied cleanly. The divergence is **structural**: a set of upstream features were dropped, restructured, or replaced because the local branch had already moved in a different direction on the same surface area. This document enumerates those tensions.
 
@@ -23,7 +23,9 @@ These were built on `kostadis-dev` and had no upstream equivalent when they land
 | Storage | **DrvFs / 9P / CIFS / NFS warning** at palace path resolution. | ChromaDB + SQLite mmap/flock/fsync semantics break on WSL2 DrvFs mounts; silent corruption. |
 | Storage | **Walk-up `mempalace.yaml` discovery** + **`default_palace` config key** + **alias resolver** + **loud-fail when no palace declared** (`PalaceNotDeclared`). | Removes the implicit-fallback footgun; users must declare which palace they want. |
 | Storage | **KG co-located with palace directory** (`<palace>/knowledge_graph.sqlite3` instead of `~/.mempalace/knowledge_graph.sqlite3`). | Co-location is required for palace isolation — otherwise a palace move/copy leaves the KG dangling. |
-| MCP | **Per-palace backend cache + optional `palace=` arg on all read tools**. | Cross-palace reads from a single MCP server (e.g. `mempalace_search(palace='chat')` from a campaign workspace). |
+| Storage | **Palace-local sidecar files** (§17): `tunnels.json`, `hallways.json` and `known_entities.json` live *inside* the palace, next to the KG. Upstream keeps the first two beside the palace and the registry global. Repair rebuild and migrate carry all of them over. | Sibling palaces under `~/.mempalace/palaces/` shared one tunnels file, one hallways file and one entity registry, so tunnels, hallways, entity tags and topic tunnels leaked across palaces. |
+| Storage | **`palace_path` honours `default_palace`** (§17): constructor override > `MEMPALACE_PALACE_PATH` > `default_palace` > `palace_path` > chat fallback. | Upstream has no `default_palace`; without this, the MCP server and every non-CLI reader silently served `palace_path` while the CLI resolved `default_palace`. |
+| MCP | **Per-palace backend cache + optional `palace=` arg on all 19 read tools**, opening each palace with **its own backend** (detected from its on-disk artifacts), and a per-palace graph cache (§17). | Cross-palace reads from a single MCP server (e.g. `mempalace_search(palace='chat')` from a campaign workspace). |
 | Mining | **Parallel mining pipeline** — producer/consumer harness with `--workers` CLI flag. Mine splits into `_prepare_file` (CPU + IO), `_embed_prepared` (HTTP/ONNX), `_write_prepared` (single-writer under lock). | Single-threaded mine wastes the time spent waiting on remote embedding endpoints (Ollama, Spark). |
 | Mining | **Parallel convo mining** + **parallel closet regeneration** + **parallel LLM refinement** via the same `ParallelPipeline` harness. | Same motivation — overlap remote-API waits. |
 | Mining | **urllib3 PoolManager keep-alive** for the embedding and LLM HTTP clients. | Reuse connections across the parallel producers; new TCP handshake per request dominated wall time. |
@@ -210,11 +212,52 @@ Palace isolation lives in `~/.mempalace`: `config.json` with `default_palace` an
 
 **Open question for upstream:** recognising the multi-palace layout (`palaces/`) as a legacy install would let this fork take the XDG resolver unchanged.
 
+### 17. Palace isolation completed (post-v3.10.0)
+
+Verifying the sync's follow-ups against a real turbovec palace found that palace isolation was incomplete in several places. None of the gaps came from the merge; they predate it. Each fix extends a local-only design further from upstream. Upstream has no multi-palace model, so every item here is a standing divergence, not a reconciliation.
+
+**a. Cross-palace reads use the target palace's backend (#43, PR #46).** The fork's cross-palace path (`_get_collection(palace_path=<non-default>)`) assumed chroma. Against a turbovec palace, one `mempalace_status(palace=…)` reported 0 drawers and created `chroma.sqlite3` inside it. Every later backend-detected open of that palace then failed with "multiple backend artifacts".
+- A non-default palace's backend is now decided by its own on-disk artifacts, never by the process-wide `MEMPALACE_BACKEND` or the default palace's backend.
+- Chroma keeps the per-palace chroma cache; other backends open read-only via `palace.get_collection(backend=…)`.
+- Mixed artifacts return an explicit error, never a guess.
+
+Upstream has no cross-palace reads, so there is nothing to compare.
+
+**b. `palace_path` honours `default_palace` (#44, PR #47).** `palace-isolation.md` puts `default_palace` in the precedence chain and leaves out the `palace_path` key. The CLI followed the chain. The MCP server and every other `MempalaceConfig.palace_path` reader (KG default, layers, daemon, dedup, MCP proxy) used `palace_path`. The property itself now applies `default_palace`, so no process-wide env pin is needed; such a pin would beat the `_config` that tests monkeypatch, which is why `8ade4ef` avoided one. An unknown alias warns and falls through.
+
+**c. `palace=` on every read tool, plus a per-palace graph cache (#45, PR #49).**
+- The 15 remaining read tools (taxonomy, drawers, duplicate check, KG stats/timeline, diary, graph, tunnels, hallways) gained `palace=`.
+- The default palace keeps its unchanged path, including the sqlite fast paths, which read `_config` only.
+- `check_duplicate`'s vector-disabled gate is scoped to the default palace.
+- `palace_graph`'s module-level warm cache ignored its `config` and served one graph for every palace. It is now keyed by palace path. Upstream's single cache is correct for upstream's single palace.
+
+**d. Tunnels, hallways and the entity registry live inside the palace (#48 PR #50, #51 PR #52).**
+- **Upstream v3.10.0:** `tunnel_file`/`hallway_file` = `dirname(palace_path)/…`, beside the palace. `known_entities.json` is global (`~/.mempalace`).
+- **Local:** all three are `<palace>/…`. Under the fork's `~/.mempalace/palaces/<name>/` layout, upstream's locations made every palace share one tunnels file, one hallways file and one registry. Tunnels and hallways leaked across palaces; names confirmed for one palace were tagged on another's drawers; topic tunnels (derived from the registry's `topics_by_wing`) linked wings across palaces.
+- **Plumbing:** `palace_path` is threaded explicitly from `mine()` through `process_file`/`_prepare_file`/`_write_prepared`/`_build_drawer_metadata`, because the parallel miner's worker threads would not inherit a context variable. The format miner, diary ingest, fact-checker, topic tunnels, `migrate`'s `topics_by_wing` re-keying and `init` all use their palace's copy.
+- **No migration (user decision, both PRs):** the old shared and global files are left in place and named in a warning. Hallways and topic tunnels regenerate on the next mine. The registry repopulates when `init` is re-run. Existing explicit tunnels are not carried over, because which palace owns a shared tunnel cannot be known from the file.
+
+**e. Repair and migrate carry palace-local files over (PR #50).** Both rebuild a palace into a fresh directory. `repair.carry_over_palace_sidecars` generalises the KG-only `_preserve_knowledge_graph_sqlite` (#1816; kept as an alias) to `config.PALACE_SIDECAR_FILENAMES`: the KG and its WAL/SHM, tunnels, hallways and the registry. **`migrate` now calls it too.** Upstream's `migrate` swaps in the fresh directory and removes the old one, silently dropping `knowledge_graph.sqlite3` from the live palace; only the `.pre-migrate` backup keeps it. That is an upstream bug independent of the fork's design.
+
+**f. Isolation bugs fixed during the sync (#40, #41).** `tool_search`'s transient-error retry re-searched the default palace. Hook writes routed through the daemon used `MempalaceConfig().palace_path` instead of the pinned chat palace. Both are local-only code paths.
+
+**Next-sync watch list.** These changes touch files upstream edits often, so expect conflicts and check for silent defects in:
+- `config.py` (`tunnel_file`, `hallway_file`, `entity_registry_file`, `palace_path`);
+- `palace_graph.py` (cache keying, `list_tunnels`/`follow_tunnels` config);
+- `hallways.py`;
+- `miner.py`'s registry functions and the `palace_path` keyword on the mine pipeline;
+- `repair.py`/`migrate.py` carry-over;
+- the read tools in `mcp_server/tools_*.py`.
+
+Any new upstream caller of `_load_known_entities()`, `get_topics_by_wing()`, `tunnel_file` or `hallway_file` resolves to the **default** palace unless it passes one. Grep for new call sites after each merge.
+
 ---
 
 ## Test impact
 
-After the v3.10.0 merge (this document): **5643 pass, 170 skipped, 2 failures** (`env -u MEMPALACE_BACKEND uv run pytest tests/ --ignore=tests/benchmarks`, with turbovecdb installed from the sibling checkout). Neither failure was introduced by this merge. One is the long-standing `test_hook_chat_palace` assertion described below. The other, `test_repair::test_sqlite_integrity_errors_reports_a_path_python_cannot_encode`, also fails on pure upstream v3.9.0 in this environment. New skip categories this cycle:
+After the post-sync isolation work (§17, through PR #52): **5684 pass, 170 skipped, 2 failures**. The same two failures as below. §17 added 39 new tests, each failing against the code before its fix: `tests/mcp/test_cross_palace_backend.py` (3), the `default_palace` precedence tests in `tests/test_config_palace_path.py` (5), `tests/mcp/test_cross_palace_reads.py` (16), `tests/test_palace_local_sidecars.py` (7) and `tests/test_palace_entity_registry.py` (8). The other two of the 41 extra passes are upstream tests adapted to the fork's palace layout. `test_mcp_http_transport::…wait_for_in_flight_search` is a timing flake under full-suite load; it passes in isolation with and without these changes.
+
+After the v3.10.0 merge: **5643 pass, 170 skipped, 2 failures** (`env -u MEMPALACE_BACKEND uv run pytest tests/ --ignore=tests/benchmarks`, with turbovecdb installed from the sibling checkout). Neither failure was introduced by this merge. One is the long-standing `test_hook_chat_palace` assertion described below. The other, `test_repair::test_sqlite_integrity_errors_reports_a_path_python_cannot_encode`, also fails on pure upstream v3.9.0 in this environment. New skip categories this cycle:
 - closet-enrichment/union internals (§15);
 - the `init --palace` persistence tests (§15);
 - the XDG-resolution tests (§16);
@@ -249,14 +292,16 @@ Of the divergences:
 
 - **§15 (package splits)**: no tension in itself; the exec-fragment design keeps one namespace, so the local design crossed it mechanically.
 - **§16 (XDG)**: small and concrete. Recognising `palaces/` as a legacy install would let the fork drop its override.
+- **§17e (`migrate` drops the KG)** is an upstream bug with a one-call fix (carry palace files over before removing the old dir). It is the best small backport candidate the fork has.
+- **§17a–d** only make sense with a multi-palace model. Fold them into the §3 design RFC; palace-local sidecar files are the concrete shape to propose.
 
-Net suggestion for the upstream conversation: lead with §6 (small, mergeable, valuable — §4 already converged), then propose §3 and §1 as design RFCs. The rest follows from those.
+Net suggestion for the upstream conversation: lead with §17e and §6 (small, mergeable, valuable — §4 already converged), then propose §3 (with §17) and §1 as design RFCs. The rest follows from those.
 
 ---
 
 ## Deferred follow-ups (open work, tracked here so nothing is silently dropped)
 
-None of these are regressions; each is a conscious "keep local / defer" from the v3.5.0 merge.
+None of these are regressions. Each is a conscious "keep local / defer" from a merge, or an item found and either resolved or filed during the post-sync isolation work (§17). Resolved items are kept so the history stays readable.
 
 1. **§12 `--limit` semantics** — port upstream #1535 ("stop after N *new*") into the parallel mine consumer; today's local `files[:limit]` pre-slice under-mines a partially-mined directory. Highest-value follow-up.
 2. **#1383 KG cache canonicalization** — upstream now keys the KG cache by `realpath`+`normcase` (collapses symlinked / case-variant palace paths); local `_kg_cache` still keys by `abspath`+`expanduser`. Port the canonicalization into the local dual-cache (§7). **Partially landed in v3.7.1**: the new RFC 003 logstream cache (§14) uses the ported `_canonicalize_kg_path` helper already — the KG cache itself is still unconverted.
@@ -271,4 +316,5 @@ None of these are regressions; each is a conscious "keep local / defer" from the
 11. **MCP server never applies `default_palace` (#44) — RESOLVED.** `MempalaceConfig.palace_path` now honours `default_palace` ahead of the `palace_path` key (constructor override > `MEMPALACE_PALACE_PATH` > `default_palace` > `palace_path` > chat fallback), matching `palace-isolation.md`'s chain. Every reader (MCP server, KG default, layers, daemon, dedup) now agrees with the CLI's `resolved_palace_path()`, with no process-wide env pin. An unknown `default_palace` alias warns and falls through.
 12. **Read tools without `palace=` (#45) — RESOLVED.** All 19 read tools now accept `palace=`: search, search_hierarchical, status, kg_query, list_wings, list_rooms, get_taxonomy, get_drawer, list_drawers, check_duplicate, kg_stats, kg_timeline, diary_read, graph_stats, traverse, find_tunnels, follow_tunnels, list_tunnels and list_hallways. The default palace keeps its unchanged path, including the sqlite fast paths. `palace_graph`'s warm cache is now keyed by palace. Remaining: sibling palaces share one tunnels/hallways file (#48, item 13).
 13. **Sibling palaces shared `tunnels.json` / `hallways.json` (#48) — RESOLVED.** Both files now live inside the palace directory, like the knowledge graph. Repair rebuild and migrate carry them over through `repair.carry_over_palace_sidecars`, which also fixes migrate silently dropping `knowledge_graph.sqlite3`. Per the user's decision there is no migration: old shared files are left in place and named in a warning, hallways and topic tunnels regenerate on the next mine, and existing explicit tunnels are not carried over.
-14. **`~/.mempalace/known_entities.json` is global.** Topic tunnels are derived from its `topics_by_wing`, so topic-tunnel *inputs* are still shared across palaces even though the tunnel files are not. Noted on #48; not yet scoped per palace.
+14. **`~/.mempalace/known_entities.json` was global (#51) — RESOLVED.** The registry now lives inside each palace (`<palace>/known_entities.json`, `MempalaceConfig.entity_registry_file`). `init` writes into its target palace. The project/format/diary miners, the fact-checker, topic tunnels and `migrate` wing-renames read the palace's own copy, so topic tunnels only connect wings of that palace. Repair and migrate carry it over. Per the user's decision there is no migration: the global file is ignored and named in a warning, and palaces repopulate when `init` is re-run.
+15. **`~/.mempalace/entity_registry.json` is still global.** This is the personal people registry (`entity_registry.py`: onboarding, learned and researched names). `palace-isolation.md`'s touchpoint table says to co-locate it under the palace path, which was never done. It may be global by design ("who the user knows"), unlike the per-project `known_entities.json` (§17d), but that is a user decision. `identity.txt` (wake-up identity) and `known_names.json` (speaker names for `split_mega_files`) are machine-level by design; `hook_state/`, `locks/`, `daemon/`, `server/` and `watch/` are infrastructure.
