@@ -362,7 +362,11 @@ def sqlite_wing_room_counts(
 
 
 def sqlite_room_wing_hall_counts(palace_path: str, collection_name: str) -> Optional[list[tuple]]:
-    """Grouped (room, wing, hall, n) rows for graph_stats, or ``None``."""
+    """Grouped ``(room, wing, hall, n, last_date)`` rows, or ``None``.
+
+    ``last_date`` is the newest ``date`` metadata value in the group — enough
+    for ``find_tunnels``' ``recent`` field without paging every drawer.
+    """
     db_path = os.path.join(palace_path, _DB_FILENAME)
     if not os.path.isfile(db_path):
         return None
@@ -385,7 +389,8 @@ def sqlite_room_wing_hall_counts(palace_path: str, collection_name: str) -> Opti
             return list(
                 conn.execute(
                     f"""
-                    SELECT {room_expr}, {wing_expr}, {hall_expr}, COUNT(*)
+                    SELECT {room_expr}, {wing_expr}, {hall_expr}, COUNT(*),
+                           COALESCE(MAX(json_extract(metadata_json, '$.date')), '')
                     FROM documents
                     WHERE collection_id = ?
                     GROUP BY 1, 2, 3

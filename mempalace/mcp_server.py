@@ -2188,11 +2188,16 @@ def _sqlite_graph_stats():
 
 
 def _graph_stats_from_grouped_rows(rows):
-    """Rebuild ``graph_stats`` from ``(room, wing, hall, n)`` grouped rows."""
+    """Rebuild ``graph_stats`` from ``(room, wing, hall, n)`` grouped rows.
+
+    Backends may append a fifth ``last_date`` column for ``find_tunnels``;
+    stats do not use it, so extra columns are ignored rather than unpacked.
+    """
     from collections import Counter, defaultdict
 
     room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0})
-    for room, wing, hall, n in rows:
+    for row in rows:
+        room, wing, hall, n = row[0], row[1], row[2], row[3]
         if not room or room == "general" or not wing:
             continue
         node = room_data[room]
@@ -2228,46 +2233,24 @@ def _graph_stats_from_grouped_rows(rows):
     }
 
 
-def _chroma_room_wing_hall_counts():
-    import sqlite3 as _sqlite3
+def _graph_sqlite_reader():
+    """The sqlite grouped-counts reader for this palace, or ``None``.
 
+    ``None`` means the graph tools must go through the collection, which is
+    what keeps a missing or broken palace reporting a diagnostic instead of
+    an empty graph.
+    """
+    from .palace_graph import sqlite_grouped_counts_reader
+
+    return sqlite_grouped_counts_reader(_config)
+
+
+def _chroma_room_wing_hall_counts():
     if not _config.palace_path:
         return None
-    db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
-    if not os.path.isfile(db_path):
-        return None
-    collection_name = _config.collection_name
-    conn = _sqlite3.connect(sqlite_read_uri(db_path), uri=True)
-    try:
-        conn.execute("PRAGMA busy_timeout = 3000")
-        if (
-            conn.execute("SELECT 1 FROM collections WHERE name = ?", (collection_name,)).fetchone()
-            is None
-        ):
-            return None
-        return conn.execute(
-            """
-            SELECT
-                COALESCE(rm.string_value, CAST(rm.int_value AS TEXT),
-                         CAST(rm.float_value AS TEXT), '') AS room,
-                COALESCE(wm.string_value, CAST(wm.int_value AS TEXT),
-                         CAST(wm.float_value AS TEXT), '') AS wing,
-                COALESCE(hm.string_value, CAST(hm.int_value AS TEXT),
-                         CAST(hm.float_value AS TEXT), '') AS hall,
-                COUNT(*) AS n
-            FROM embeddings e
-            JOIN segments s ON e.segment_id = s.id AND s.scope = 'METADATA'
-            JOIN collections c ON s.collection = c.id
-            LEFT JOIN embedding_metadata rm ON rm.id = e.id AND rm.key = 'room'
-            LEFT JOIN embedding_metadata wm ON wm.id = e.id AND wm.key = 'wing'
-            LEFT JOIN embedding_metadata hm ON hm.id = e.id AND hm.key = 'hall'
-            WHERE c.name = ?
-            GROUP BY room, wing, hall
-            """,
-            (collection_name,),
-        ).fetchall()
-    finally:
-        conn.close()
+    from .backends.chroma import sqlite_room_wing_hall_counts
+
+    return sqlite_room_wing_hall_counts(_config.palace_path, _config.collection_name)
 
 
 def tool_status(palace: str = None):
@@ -2974,10 +2957,15 @@ def tool_get_aaak_spec():
 def tool_traverse_graph(start_room: str, max_hops: int = 2):
     """Walk the palace graph from a room. Find connected ideas across wings."""
     max_hops = max(1, min(max_hops, 10))
-    col = _get_collection()
-    if not col:
-        return _collection_error_or_no_palace()
-    return traverse(start_room, col=col, max_hops=max_hops)
+    # sqlite metadata path does not open HNSW. When it cannot serve, open the
+    # collection here so a missing/broken palace still reports why (#1379
+    # follow-up) instead of looking like a palace with no such room.
+    if _graph_sqlite_reader() is None:
+        col = _get_collection()
+        if not col:
+            return _collection_error_or_no_palace()
+        return traverse(start_room, col=col, max_hops=max_hops)
+    return traverse(start_room, max_hops=max_hops, config=_config)
 
 
 def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
@@ -2987,10 +2975,12 @@ def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
         wing_b = _sanitize_optional_name(wing_b, "wing_b")
     except ValueError as e:
         return {"error": str(e)}
-    col = _get_collection()
-    if not col:
-        return _collection_error_or_no_palace()
-    return find_tunnels(wing_a, wing_b, col=col)
+    if _graph_sqlite_reader() is None:
+        col = _get_collection()
+        if not col:
+            return _collection_error_or_no_palace()
+        return find_tunnels(wing_a, wing_b, col=col)
+    return find_tunnels(wing_a, wing_b, config=_config)
 
 
 def tool_graph_stats():
@@ -3290,8 +3280,8 @@ def _fetch_drawer_rows(col, where=None, page_size: int = 1000, include=None):
     return ids, documents, metadatas
 
 
-def _fill_drawer_previews(col, page: list) -> None:
-    """Hydrate ``content_preview`` for a page of logical drawers only."""
+def _page_physical_ids(page: list) -> list:
+    """The physical row ids backing one page of logical drawers."""
     physical_ids = []
     for drawer in page:
         chunk_ids = drawer.get("chunk_ids") or (drawer.get("metadata") or {}).get("chunk_ids")
@@ -3299,12 +3289,11 @@ def _fill_drawer_previews(col, page: list) -> None:
             physical_ids.extend(chunk_ids)
         else:
             physical_ids.append(drawer["drawer_id"])
-    if not physical_ids:
-        return
-    result = col.get(ids=physical_ids, include=["documents"])
-    ids = _chroma_field(result, "ids", []) or []
-    docs = _chroma_field(result, "documents", []) or []
-    docs_by_id = {doc_id: (docs[i] if i < len(docs) else "") or "" for i, doc_id in enumerate(ids)}
+    return physical_ids
+
+
+def _apply_drawer_previews(page: list, docs_by_id: dict) -> None:
+    """Set ``content_preview`` from an already-fetched ``{id: document}`` map."""
     for drawer in page:
         chunk_ids = drawer.get("chunk_ids") or (drawer.get("metadata") or {}).get("chunk_ids")
         if chunk_ids:
@@ -3312,6 +3301,41 @@ def _fill_drawer_previews(col, page: list) -> None:
         else:
             content = docs_by_id.get(drawer["drawer_id"], "")
         drawer["content_preview"] = _content_preview(content)
+
+
+def _fill_drawer_previews(col, page: list) -> None:
+    """Hydrate ``content_preview`` for a page of logical drawers only."""
+    physical_ids = _page_physical_ids(page)
+    if not physical_ids:
+        return
+    result = col.get(ids=physical_ids, include=["documents"])
+    ids = _chroma_field(result, "ids", []) or []
+    docs = _chroma_field(result, "documents", []) or []
+    docs_by_id = {doc_id: (docs[i] if i < len(docs) else "") or "" for i, doc_id in enumerate(ids)}
+    _apply_drawer_previews(page, docs_by_id)
+
+
+def _fill_drawer_previews_from_sqlite(page: list) -> None:
+    """Same, reading the page's documents straight from ``chroma.sqlite3``.
+
+    The list itself is answered from metadata only — joining documents into
+    that scan would pull the palace's entire verbatim text into memory to
+    render one page. This fetches just the rows on screen.
+    """
+    physical_ids = _page_physical_ids(page)
+    if not physical_ids:
+        return
+    from .backends.chroma import sqlite_documents_for_ids
+
+    docs_by_id = sqlite_documents_for_ids(
+        _config.palace_path, _config.collection_name, physical_ids
+    )
+    if docs_by_id is None:
+        # sqlite went unreadable between the two reads; previews are a
+        # display detail, so degrade to blank rather than fail the listing.
+        logger.debug("sqlite preview hydration failed; leaving previews empty")
+        return
+    _apply_drawer_previews(page, docs_by_id)
 
 
 def _collapse_drawer_rows(ids, documents, metadatas):
@@ -4069,10 +4093,6 @@ def tool_list_drawers(
     except ValueError as e:
         return {"error": str(e)}
 
-    col = _get_collection()
-    if not col:
-        return _collection_error_or_no_palace()
-
     try:
         where = None
         conditions = []
@@ -4087,7 +4107,22 @@ def tool_list_drawers(
         elif len(conditions) > 1:
             where = {"$and": conditions}
 
-        ids, documents, metadatas = _fetch_drawer_rows(col, where=where, include=["metadatas"])
+        listed = None
+        if _is_chroma_backend() and _config.palace_path:
+            from .backends.chroma import sqlite_list_id_metadata
+
+            listed = sqlite_list_id_metadata(
+                _config.palace_path, _config.collection_name, where=where
+            )
+        if listed is not None:
+            # Documents are fetched for the displayed page only, below.
+            ids, metadatas = listed
+            documents = []
+        else:
+            col = _get_collection()
+            if not col:
+                return _collection_error_or_no_palace()
+            ids, documents, metadatas = _fetch_drawer_rows(col, where=where, include=["metadatas"])
         drawers = _collapse_drawer_rows(ids, documents, metadatas)
 
         if since_dt is not None or before_dt is not None:
@@ -4098,7 +4133,12 @@ def tool_list_drawers(
             ]
 
         page = drawers[offset : offset + limit]
-        _fill_drawer_previews(col, page)
+        if listed is not None:
+            _fill_drawer_previews_from_sqlite(page)
+        else:
+            col = _get_collection()
+            if col:
+                _fill_drawer_previews(col, page)
 
         return {
             "drawers": page,
@@ -4973,8 +5013,10 @@ def _preview_event(event: dict) -> dict:
     Event bodies are stored verbatim and fleet status updates run to several
     KB, so listing many events full-body is a large payload. Preview keeps all
     routing/metadata fields and trims only ``body`` — enough to scan the stream
-    and decide which events to re-fetch in full (a targeted ``since_event_id``
-    call returns the untouched body)."""
+    and decide which events to re-fetch in full. ``since_event_id`` is
+    strictly *after* that id, so passing the truncated event's own id
+    skips it; repeat the original filters with ``preview=false`` (and
+    ``correlation_id`` / ``from_agent`` as needed) instead."""
     body = event.get("body") or ""
     if len(body) <= _PREVIEW_BODY_CHARS:
         return event
@@ -5002,8 +5044,9 @@ def tool_event_list(
 
     ``preview=True`` truncates each event's verbatim body to a short excerpt
     (marking ``body_truncated`` + ``body_length``) so scanning many events
-    stays cheap; re-fetch a specific event's full body with a targeted
-    ``since_event_id``.
+    stays cheap. ``since_event_id`` is strictly after that id, so do not
+    pass the truncated event's own id to re-fetch it — repeat the original
+    filters with ``preview=false``.
     """
     try:
         events = _call_logstream(
@@ -5949,8 +5992,16 @@ TOOLS = {
     },
     "mempalace_event_list": {
         "description": (
-            "List agent-coordination events with structured filters, oldest first. Use"
-            " since_event_id as the precise resume cursor (strictly after that event)."
+            "List agent-coordination events with structured filters, oldest first (append"
+            " order, not timestamp order). Use since_event_id as the resume cursor: it means"
+            " strictly after that event in append order, so it cannot skip anything. Do NOT"
+            " resume with since_created_at — a peer's event syncs in whenever it arrives, so"
+            " it can already be older than a timestamp cursor and be missed permanently;"
+            " since_created_at is a time window ('what happened today'), not a cursor. Store"
+            " the id of the last event you processed — that is your whole watcher state. Pass"
+            " preview=true when sweeping a busy stream. to_agent=<you> also matches '*'"
+            " broadcasts, so no second call is needed. To wait for something that has not"
+            " happened yet, use mempalace_event_wait instead of polling this."
         ),
         "input_schema": {
             "type": "object",
@@ -5975,8 +6026,10 @@ TOOLS = {
                 "since_created_at": {
                     "type": "string",
                     "description": (
-                        "Return events created at or after this time"
-                        " (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional)"
+                        "Time window filter, inclusive: events created at or after this time"
+                        " (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional). NOT a resume cursor"
+                        " — use since_event_id for that; a timestamp cursor silently drops"
+                        " peer events that sync in late. Dedup by id when using this."
                     ),
                 },
                 "limit": {"type": "integer", "description": "Max events to return (default 50)"},
@@ -5984,8 +6037,10 @@ TOOLS = {
                     "type": "boolean",
                     "description": (
                         "Truncate each event body to a short excerpt (marks body_truncated +"
-                        " body_length) so scanning many events stays cheap; re-fetch a specific"
-                        " event's full body with a targeted since_event_id (default false)"
+                        " body_length) so scanning many events stays cheap. since_event_id is"
+                        " strictly AFTER that id, so do not pass the truncated event's own id"
+                        " to re-fetch it — repeat the original filters with preview=false"
+                        " (default false)"
                     ),
                 },
             },
@@ -5994,8 +6049,14 @@ TOOLS = {
     },
     "mempalace_event_wait": {
         "description": (
-            "Block until a matching coordination event exists or the timeout expires (max 5"
-            " minutes). Returns {timed_out: true, events: []} on timeout instead of an error."
+            "Block until a matching coordination event exists or the timeout expires (default"
+            " 60s, max 5 minutes). Returns {timed_out: true, events: []} on timeout — a normal"
+            " result, not an error. This is the right tool for actively waiting on a"
+            " correlation_id you delegated or claimed. It already backs off internally, so do"
+            " not wrap it in a tight retry loop: on timeout just call it again with"
+            " since_event_id updated to the last event you processed. For long-lived consumers"
+            " (daemons, dashboards) prefer the push stream at GET /logstream/stream, which"
+            " takes the same filters and the same since_event_id resume."
         ),
         "input_schema": {
             "type": "object",
@@ -6020,8 +6081,8 @@ TOOLS = {
                 "since_created_at": {
                     "type": "string",
                     "description": (
-                        "Only match events created at or after this time"
-                        " (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, optional)"
+                        "Time window filter, inclusive (optional). NOT a resume cursor — use"
+                        " since_event_id, which cannot skip a late-syncing peer event."
                     ),
                 },
                 "timeout_ms": {

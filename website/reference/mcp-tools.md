@@ -205,7 +205,9 @@ Prune drawers whose source files are gitignored, deleted, or moved. Returns a dr
 | `wing` | string | No | Limit to one wing |
 | `apply` | boolean | No | Actually delete drawers; default is dry-run preview |
 
-**Returns:** `{ scanned, kept, gitignored, missing, no_source, out_of_scope, removed_drawers, removed_closets, dry_run, by_source }`
+**Returns:** `{ scanned, kept, gitignored, missing, unresolved, no_source, out_of_scope, removed_drawers, removed_closets, dry_run, by_source, unresolved_by_source }`
+
+Only `gitignored` and `missing` are removed. A source file that is not at its path counts as `missing` only while the palace can still see a source file of its own in the same directory: a deletion leaves its neighbours behind, an unmounted volume takes all of them at once. Everything else counts as `unresolved`, which is kept and named in `unresolved_by_source` the way removals are named in `by_source`.
 
 ---
 

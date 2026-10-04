@@ -1265,17 +1265,17 @@ def test_sqlite_exact_room_wing_hall_counts(tmp_path):
         ids=["1", "2", "3"],
         documents=["a", "b", "c"],
         metadatas=[
-            {"room": "chromadb", "wing": "wing_code", "hall": "db"},
+            {"room": "chromadb", "wing": "wing_code", "hall": "db", "date": "2026-01-02"},
             {"room": "chromadb", "wing": "wing_project", "hall": "db"},
             {"room": "auth", "wing": "wing_code", "hall": "security"},
         ],
         embeddings=[[1, 0], [1, 0], [1, 0]],
     )
     rows = sqlite_room_wing_hall_counts(str(tmp_path), "mempalace_drawers")
-    grouped = {(room, wing, hall): n for room, wing, hall, n in rows}
-    assert grouped[("chromadb", "wing_code", "db")] == 1
-    assert grouped[("chromadb", "wing_project", "db")] == 1
-    assert grouped[("auth", "wing_code", "security")] == 1
+    grouped = {(room, wing, hall): (n, last) for room, wing, hall, n, last in rows}
+    assert grouped[("chromadb", "wing_code", "db")] == (1, "2026-01-02")
+    assert grouped[("chromadb", "wing_project", "db")] == (1, "")
+    assert grouped[("auth", "wing_code", "security")] == (1, "")
 
 
 def test_sqlite_exact_locus_columns_and_index(tmp_path):
