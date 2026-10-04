@@ -354,11 +354,10 @@ def tool_add_drawer(
     via a single batched upsert. Each chunk carries ``parent_drawer_id``
     linkage and ``chunk_index`` metadata so search can rejoin them. The
     returned ``drawer_id`` is the LOGICAL group handle on the chunked
-    path; physical drawer ids are in ``chunk_ids`` (#1539). To delete
-    or fetch the underlying drawers, iterate ``chunk_ids`` or query by
-    ``parent_drawer_id`` — ``tool_get_drawer(drawer_id)`` and
-    ``tool_delete_drawer(drawer_id)`` report "not found" on the chunked
-    path because no row is stored under the logical group id.
+    path; physical drawer ids are in ``chunk_ids`` (#1539).
+    ``tool_get_drawer(drawer_id)`` automatically hydrates and reassembles all
+    chunks, and ``tool_delete_drawer(drawer_id)`` removes both the logical group
+    and all constituent physical chunks.
     """
     try:
         wing = sanitize_name(wing, "wing")

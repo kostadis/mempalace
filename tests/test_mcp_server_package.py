@@ -58,3 +58,34 @@ def test_fragment_files_exist():
     missing = [name for name in FRAGMENTS if not (pkg / f"{name}.py").is_file()]
     assert missing == []
     assert not (REPO_ROOT / "mempalace" / "mcp_server.py").exists()
+
+
+def test_stdio_protection_preserves_handles_across_reload():
+    """Reloading mempalace.mcp_server must not clobber _REAL_STDOUT or leak fds."""
+    code = (
+        "import importlib, sys, os\n"
+        "import mempalace.mcp_server as mcp\n"
+        "orig_stdout = mcp._REAL_STDOUT\n"
+        "orig_fd = mcp._REAL_STDOUT_FD\n"
+        "# Reload while redirected\n"
+        "importlib.reload(mcp)\n"
+        "assert mcp._REAL_STDOUT is orig_stdout\n"
+        "assert mcp._REAL_STDOUT_FD == orig_fd\n"
+        "# Restore stdout and verify reload re-protects cleanly\n"
+        "mcp._restore_stdout()\n"
+        "assert mcp._REAL_STDOUT_FD is None\n"
+        "assert sys.stdout is orig_stdout\n"
+        "importlib.reload(mcp)\n"
+        "assert mcp._REAL_STDOUT is orig_stdout\n"
+        "assert mcp._REAL_STDOUT_FD is not None\n"
+        "mcp._restore_stdout()\n"
+        "assert sys.stdout is orig_stdout\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=str(REPO_ROOT),
+    )
+    assert proc.returncode == 0, proc.stderr

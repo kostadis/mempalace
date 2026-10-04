@@ -42,15 +42,24 @@ import sys
 # which breaks Claude Desktop's JSON parser. Redirect stdout → stderr at
 # both the Python and file-descriptor level before heavy imports, then
 # restore the real stdout in main() before entering the protocol loop.
-_REAL_STDOUT = sys.stdout
-_REAL_STDOUT_FD = None
-try:
-    _REAL_STDOUT_FD = os.dup(1)
-    os.dup2(2, 1)
-except (OSError, AttributeError):
-    # Environments without fd-level stdio (embedded interpreters, some test
-    # harnesses). The Python-level redirect below still applies.
-    pass
+#
+# Preserved across importlib.reload (#2485): once redirected, sys.stdout points
+# to sys.stderr. If a reload executes unconditionally, it captures sys.stderr
+# into _REAL_STDOUT and duplicates the already-redirected fd 1, permanently
+# breaking stdout and leaking file descriptors.
+_REAL_STDOUT = globals().get("_REAL_STDOUT")
+if _REAL_STDOUT is None:
+    _REAL_STDOUT = sys.stdout
+
+_REAL_STDOUT_FD = globals().get("_REAL_STDOUT_FD")
+if _REAL_STDOUT_FD is None:
+    try:
+        _REAL_STDOUT_FD = os.dup(1)
+        os.dup2(2, 1)
+    except (OSError, AttributeError):
+        # Environments without fd-level stdio (embedded interpreters, some test
+        # harnesses). The Python-level redirect below still applies.
+        pass
 sys.stdout = sys.stderr
 
 import argparse  # noqa: E402  (deferred until after stdio protection above)
