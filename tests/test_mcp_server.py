@@ -2192,7 +2192,7 @@ class TestSearchTool:
                 }
             return {"results": [{"text": "ok", "wing": "w", "room": "r"}]}
 
-        def fake_reset():
+        def fake_reset(palace_path=None):
             reset_calls["n"] += 1
 
         monkeypatch.setattr(mcp_server, "search_memories", fake_search)
@@ -2230,7 +2230,7 @@ class TestSearchTool:
             return {"results": [{"text": "ok", "wing": "w", "room": "r"}]}
 
         monkeypatch.setattr(mcp_server, "search_memories", fake_search)
-        monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", lambda: None)
+        monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", lambda *a, **k: None)
         monkeypatch.setattr(mcp_server.time, "sleep", lambda _: None)
 
         # Local tool_search has no candidate_strategy (closets stay out of the
@@ -2239,6 +2239,42 @@ class TestSearchTool:
 
         assert "results" in result
         assert seen_calls == ["custom_drawers", "custom_drawers"]
+
+    def test_search_retry_targets_requested_palace(self, monkeypatch, config, kg, tmp_path):
+        """A transient error on a palace= search must retry -- and reset the
+        cache of -- that palace, never the default one (#40)."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        other = str(tmp_path / "other-palace")
+        monkeypatch.setattr(
+            mcp_server,
+            "_resolve_palace_arg",
+            lambda p=None: other if p else os.path.abspath(config.palace_path),
+        )
+        searched, reset = [], []
+
+        def fake_search(*args, **kwargs):
+            searched.append(kwargs.get("palace_path"))
+            if len(searched) == 1:
+                return {
+                    "error": "Search error: Error executing plan: Internal error: Error finding id"
+                }
+            return {"results": [{"text": "ok", "wing": "w", "room": "r"}]}
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+        monkeypatch.setattr(
+            mcp_server,
+            "_force_chroma_cache_reset",
+            lambda palace_path=None: reset.append(palace_path),
+        )
+        monkeypatch.setattr(mcp_server.time, "sleep", lambda _: None)
+
+        result = mcp_server.tool_search(query="anything", palace="other")
+
+        assert result.get("index_recovered") is True
+        assert searched == [other, other]
+        assert reset == [other]
 
     def test_search_does_not_retry_on_non_transient_error(self, monkeypatch, config, kg):
         """Validation / unrelated errors must not trigger the retry path."""
@@ -2271,7 +2307,7 @@ class TestSearchTool:
             return {"error": "Search error: Error executing plan: Internal error: Error finding id"}
 
         monkeypatch.setattr(mcp_server, "search_memories", fake_search)
-        monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", lambda: None)
+        monkeypatch.setattr(mcp_server, "_force_chroma_cache_reset", lambda *a, **k: None)
         monkeypatch.setattr(mcp_server.time, "sleep", lambda _: None)
 
         result = mcp_server.tool_search(query="anything")
@@ -2294,7 +2330,7 @@ class TestSearchTool:
                 return {"error": "Search error: stale-index detected; retry recommended"}
             return {"results": [{"text": "ok", "wing": "w", "room": "r"}]}
 
-        def fake_reset():
+        def fake_reset(palace_path=None):
             reset_calls["n"] += 1
 
         monkeypatch.setattr(mcp_server, "search_memories", fake_search)

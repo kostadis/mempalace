@@ -1366,7 +1366,7 @@ def _is_transient_index_error(result) -> bool:
     )
 
 
-def _force_chroma_cache_reset() -> None:
+def _force_chroma_cache_reset(palace_path: str = None) -> None:
     # Drop the MCP-local caches — both the per-palace dict entry used for
     # cross-palace ``palace=`` reads and the scalar cache used by the
     # default-palace multi-backend path — plus the shared backend's
@@ -1384,16 +1384,23 @@ def _force_chroma_cache_reset() -> None:
         _palace_db_mtime, \
         _metadata_cache, \
         _metadata_cache_time
-    popped = _palace_caches.pop(os.path.abspath(os.path.expanduser(_config.palace_path)), None)
-    cached_client = popped.get("client") if popped else _client_cache
-    _client_cache = None
-    _collection_cache = None
-    _collection_cache_backend = None
-    _collection_cache_palace = None
-    _collection_open_error = None
-    _palace_db_inode = 0
-    _palace_db_mtime = 0.0
-    _invalidate_overview_caches()
+    # ``palace_path`` names the palace to reset (a cross-palace ``palace=``
+    # read on the retry path); None means the default palace. The
+    # default-palace scalars are only touched when the target is the default.
+    default_path = os.path.abspath(os.path.expanduser(_config.palace_path))
+    target = os.path.abspath(os.path.expanduser(palace_path)) if palace_path else default_path
+    is_default = target == default_path
+    popped = _palace_caches.pop(target, None)
+    cached_client = popped.get("client") if popped else (_client_cache if is_default else None)
+    if is_default:
+        _client_cache = None
+        _collection_cache = None
+        _collection_cache_backend = None
+        _collection_cache_palace = None
+        _collection_open_error = None
+        _palace_db_inode = 0
+        _palace_db_mtime = 0.0
+        _invalidate_overview_caches()
     # This runs on the #1315 retry path, which drops caches precisely to
     # re-observe the palace after a transient index error. The capacity verdict
     # is another cached view of that same palace, so it must be dropped too, or
@@ -1403,8 +1410,8 @@ def _force_chroma_cache_reset() -> None:
     try:
         from .palace import get_backend_for_palace
 
-        backend = get_backend_for_palace(_config.palace_path)
-        backend.close_palace(PalaceRef(id=_config.palace_path, local_path=_config.palace_path))
+        backend = get_backend_for_palace(target)
+        backend.close_palace(PalaceRef(id=target, local_path=target))
     except Exception:
         logger.debug("Failed to close cached Chroma backend during cache reset", exc_info=True)
     if cached_client is not None:
@@ -2778,13 +2785,14 @@ def tool_search(
     if _is_transient_index_error(result):
         # Post-bulk-write HNSW flush window (#1315): drop caches, give
         # the segment a moment to settle, retry once. Caller never sees
-        # the transient unless the second attempt also fails.
-        _force_chroma_cache_reset()
+        # the transient unless the second attempt also fails. Retry the
+        # palace that was asked for, not the default one.
+        _force_chroma_cache_reset(resolved)
         time.sleep(2)
         _refresh_vector_disabled_flag()
         result = search_memories(
             sanitized["clean_query"],
-            palace_path=_config.palace_path,
+            palace_path=resolved,
             wing=wing,
             room=room,
             source_file=source_file,
