@@ -492,6 +492,12 @@ def _get_tunnel_file(config=None) -> str:
     return config.tunnel_file
 
 
+def _shared_sibling_file(palace_local_file: str) -> str:
+    """The pre-#48 location of a palace-local file: beside the palace dir."""
+    palace_dir = os.path.dirname(palace_local_file)
+    return os.path.join(os.path.dirname(palace_dir), os.path.basename(palace_local_file))
+
+
 def _legacy_tunnel_file() -> str:
     """The pre-3.3.6 hardcoded path. Kept only for one-time orphan detection."""
     return os.path.join(os.path.expanduser("~"), ".mempalace", "tunnels.json")
@@ -528,14 +534,19 @@ def _load_tunnels(config=None):
             return []
         return data if isinstance(data, list) else []
 
-    legacy = _legacy_tunnel_file()
-    if legacy != current_tunnel_file and os.path.exists(legacy):
-        logger.warning(
-            "Legacy tunnels file at '%s' is being ignored; configured location is '%s'. "
-            "Move or copy the legacy file to the configured path to recover its tunnels.",
-            legacy,
-            current_tunnel_file,
-        )
+    # Earlier locations: the pre-3.3.6 hardcoded file, and the palace's
+    # parent directory (shared by every sibling palace until #48). Neither
+    # is migrated automatically -- which palace owns a shared tunnel is not
+    # knowable from the file -- so name them and move on.
+    for legacy in (_legacy_tunnel_file(), _shared_sibling_file(current_tunnel_file)):
+        if legacy != current_tunnel_file and os.path.exists(legacy):
+            logger.warning(
+                "Legacy tunnels file at '%s' is being ignored; configured location is '%s'. "
+                "Copy the tunnels that belong to this palace into the configured file "
+                "to recover them.",
+                legacy,
+                current_tunnel_file,
+            )
     return []
 
 
