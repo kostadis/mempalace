@@ -30,7 +30,7 @@ from .ids import (
     make_convo_sentinel_id,
     make_exchange_drawer_id,
 )
-from .normalize import normalize
+from .normalize import UnparsedCodexTranscriptError, normalize
 from .entities import entities_metadata
 from .palace import (
     NORMALIZE_VERSION,
@@ -774,6 +774,11 @@ def _prepare_convo(
 
     try:
         content = normalize(str(filepath))
+    except UnparsedCodexTranscriptError as exc:
+        # A recognized Codex rollout with no complete conversation yet (#2469):
+        # skip without registering, so the source stays eligible for retry.
+        logger.warning("Skipping %s: %s; source remains eligible for retry", filepath, exc)
+        return None
     except (OSError, ValueError):
         return ("register", source_file, None, False)
 

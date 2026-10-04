@@ -492,6 +492,8 @@ def _supports_metadata_facets(col) -> bool:
         return False
     capabilities = getattr(backend, "capabilities", None)
     return isinstance(capabilities, (set, frozenset)) and "supports_metadata_facets" in capabilities
+
+
 _METADATA_CACHE_TTL = 5.0  # seconds
 _taxonomy_cache = None
 _taxonomy_cache_time = 0.0

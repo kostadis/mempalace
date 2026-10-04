@@ -933,12 +933,59 @@ def _desktop_toast(body: str, title: str = "MemPalace"):
         pass
 
 
+#: Markers of harness-injected text that lands in the transcript with
+#: ``role: "user"`` but was never typed by the user. A message opening with
+#: any of them is skipped when composing the checkpoint's ``recent:`` line,
+#: which otherwise fills with the same boilerplate in every session instead of
+#: what the session was about. Literal substrings, deliberately: the wrappers
+#: are fixed strings and a regex would cost more for no gain in the hook budget.
+_HARNESS_BOILERPLATE_MARKERS = (
+    "<command-message>",  # slash-command expansion
+    "<command-name>",  # slash-command name, when it leads
+    "<command-args>",  # slash-command arguments
+    "<system-reminder>",  # injected reminders
+    "<local-command-caveat>",  # local command output caveat block
+    "<local-command-stdout>",  # local command output body
+    "<task-notification>",  # background task completion notices
+    "[SYSTEM NOTIFICATION",  # unbracketed notification banner
+    "[Request interrupted by user",  # interruption record, carries no topic
+    "[Image:",  # pasted-image placeholder, no words to summarize
+    "Base directory for this skill:",  # skill preamble
+)
+
+
+def _is_harness_boilerplate(text: str) -> bool:
+    """True when a ``role: user`` message is harness injection, not user words.
+
+    Anchored at the opening of the message, after leading whitespace. Position
+    is the whole discriminator: the harness emits a wrapper *as* the message,
+    so an injection always opens one, while a wrapper appearing later is a
+    human quoting the tooling. Matching anywhere in the body discarded real
+    messages over text further in than the checkpoint ever keeps: someone
+    writing "its events arrive as ``<task-notification>`` messages and wake the
+    loop" thousands of characters into a design note lost the whole note, even
+    though the leading 200 characters :func:`_extract_recent_messages` stores
+    were pure prose.
+
+    A bounded leading *window* was tried before the anchor and is not enough. A
+    quote inside the first 200 characters is still a quote, and a window turns
+    the rule into a tunable with a false-positive rate attached to its size.
+    ``startswith`` has no such knob. Measured over 4,778 real ``role: "user"``
+    text messages, the two agree on every message, so the anchor gives up no
+    recall for the knob it removes.
+    """
+    return text.lstrip().startswith(_HARNESS_BOILERPLATE_MARKERS)
+
+
 def _extract_recent_messages(transcript_path: str, count: int = _RECENT_MSG_COUNT) -> list[str]:
     """Extract the last N user messages from a JSONL transcript.
 
     Handles the same three transcript shapes as :func:`_count_human_messages`:
     Claude Code (role inside ``message``), Cursor (role at top-level), and
     Codex CLI (``event_msg`` payloads).
+    Harness-injected messages are skipped (see
+    :data:`_HARNESS_BOILERPLATE_MARKERS`) so the checkpoint summarizes the
+    conversation rather than the tooling around it.
     """
     path = Path(transcript_path).expanduser()
     if not path.is_file():
@@ -970,7 +1017,7 @@ def _extract_recent_messages(transcript_path: str, count: int = _RECENT_MSG_COUN
                             )
                         if not isinstance(content, str) or not content.strip():
                             continue
-                        if "<command-message>" in content or "<system-reminder>" in content:
+                        if _is_harness_boilerplate(content):
                             continue
                         messages.append(content.strip()[:200])
                     # Codex CLI format
@@ -979,7 +1026,7 @@ def _extract_recent_messages(transcript_path: str, count: int = _RECENT_MSG_COUN
                         if isinstance(payload, dict) and payload.get("type") == "user_message":
                             text = payload.get("message", "")
                             if isinstance(text, str) and text.strip():
-                                if "<command-message>" not in text:
+                                if not _is_harness_boilerplate(text):
                                     messages.append(text.strip()[:200])
                 except (json.JSONDecodeError, AttributeError):
                     pass
@@ -1373,6 +1420,12 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
     match = re.search(r"/\.claude/projects/-([^/]+)", normalized)
     if match:
         encoded = match.group(1)
+        # "<project>/.claude/worktrees/<wt>" flattens to "-<project>--claude-worktrees-<wt>"
+        # here; collapse it to <project> like _wing_from_jsonl_cwd already does for cwd,
+        # or every worktree spawns its own wing.
+        _wt_marker = "-claude-worktrees-"
+        if _wt_marker in encoded:
+            encoded = encoded.split(_wt_marker, 1)[0]
         # Strip platform user-home prefix so the wing isn't dominated by
         # /Users/<user>/ or /home/<user>/.
         m = re.match(r"(?:Users|home)-[^-]+-(.+)", encoded)

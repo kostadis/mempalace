@@ -34,6 +34,7 @@ from .base import (
     PalaceRef,
     QueryResult,
     UnsupportedFilterError,
+    initialize_last_modified_metadata,
 )
 
 _DEFAULT_BIT_WIDTH = 4
@@ -70,7 +71,11 @@ class TurboVecCollection(BaseCollection):
 
     # -- writes ---------------------------------------------------------------
 
+    # turbovec takes explicit vectors and is not wrapped in EmbeddingCollection,
+    # so it stamps last_modified itself, like the chroma and wrapped backends.
+
     def add(self, *, documents, ids, metadatas=None, embeddings=None) -> None:
+        metadatas = initialize_last_modified_metadata(metadatas)
         try:
             self._col.add(ids=ids, documents=documents, metadatas=metadatas,
                           vectors=embeddings)
@@ -78,6 +83,7 @@ class TurboVecCollection(BaseCollection):
             raise DimensionMismatchError(str(e)) from e
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None) -> None:
+        metadatas = initialize_last_modified_metadata(metadatas)
         try:
             self._col.upsert(ids=ids, documents=documents, metadatas=metadatas,
                              vectors=embeddings)

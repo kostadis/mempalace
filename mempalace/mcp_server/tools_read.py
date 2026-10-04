@@ -17,6 +17,8 @@ def _tool_status_via_sqlite(palace_path: str = None) -> dict:
     """
     import sqlite3 as _sqlite3
 
+    from ..config import connect_sqlite_read
+
     if palace_path is None:
         palace_path = _config.palace_path
     db_path = os.path.join(palace_path, "chroma.sqlite3")
@@ -28,7 +30,7 @@ def _tool_status_via_sqlite(palace_path: str = None) -> dict:
     rooms: dict = {}
     total = 0
     try:
-        conn = _sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             row = conn.execute(
                 """

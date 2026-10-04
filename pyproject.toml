@@ -82,7 +82,7 @@ dev = [
     # (wired only into the test-windows job in ci.yml, scoped to the specific
     # error). Local/Linux/macOS runs never rerun, so real failures stay loud.
     "pytest-rerunfailures>=12.0",
-    "ruff==0.16.1",
+    "ruff==0.16.6",
     "psutil>=5.9",
     # Property-based testing — generates hundreds of random inputs per
     # test to find counterexamples the hand-written positive tests miss.
@@ -128,6 +128,9 @@ coreml = ["onnxruntime>=1.16"]
 # turbovecdb 0.5+ statically links the turbovec Rust ANN engine into its
 # native extension (turbovecdb._core); it no longer needs the standalone
 # turbovec Python wheel. Pinned to the local editable via [tool.uv.sources].
+# Current turbovecdb main embeds the turbovec 1.0 engine (format v7 .tvim;
+# older caches are rebuilt from SQLite on first open) while its version string
+# still reads 0.5.0 until the next turbovecdb release.
 turbovec = ["turbovecdb>=0.5"]
 # Multilingual extra kept as a no-op alias for back-compat with
 # `pip install mempalace[multilingual]` — these deps now ship in core.
@@ -156,7 +159,7 @@ dev = [
     # (wired only into the test-windows job in ci.yml, scoped to the specific
     # error). Local/Linux/macOS runs never rerun, so real failures stay loud.
     "pytest-rerunfailures>=12.0",
-    "ruff==0.16.1",
+    "ruff==0.16.6",
     "psutil>=5.9",
     "hypothesis>=6.0",
     "pre-commit>=3.0",
@@ -239,8 +242,8 @@ exclude_lines = [
 ]
 
 [tool.uv.sources]
-# Local editable turbovecdb (0.5.x lives at ~/src/turbovecdb; the index only
-# publishes 0.1.0). Relative path resolves from ~/src/mempalace and any
+# Local editable turbovecdb (latest main at ~/src/turbovecdb, turbovec 1.0
+# engine; the package index only publishes an unrelated 0.1.0). Relative path resolves from ~/src/mempalace and any
 # sibling merge worktree. A clone without a sibling ~/src/turbovecdb
 # cannot `uv sync --extra turbovec` — the turbovec backend is dev-local only.
 turbovecdb = { path = "../turbovecdb", editable = true }

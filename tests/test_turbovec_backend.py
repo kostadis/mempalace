@@ -327,3 +327,22 @@ def test_query_texts_uses_embedding_function(palace, monkeypatch):
     res = col.query(query_texts=["find a please"], n_results=1)
     assert res.ids[0][0] == "a"
     backend.close()
+
+
+@pytest.mark.parametrize("method", ["add", "upsert"])
+def test_writes_initialize_last_modified_from_filed_at(collection, method):
+    """turbovec is not wrapped in EmbeddingCollection, so it must stamp
+    last_modified itself, like the chroma and wrapped backends do (#2147)."""
+    meta = {"wing": "w", "room": "r", "filed_at": "2026-10-04T12:00:00"}
+    getattr(collection, method)(
+        documents=["doc"], ids=["x"], metadatas=[meta], embeddings=[VECS["a"]]
+    )
+    stored = collection.get(ids=["x"]).metadatas[0]
+    assert stored["last_modified"] == "2026-10-04T12:00:00"
+    assert "last_modified" not in meta  # caller's dict is not mutated
+
+
+def test_write_keeps_explicit_last_modified(collection):
+    meta = {"filed_at": "2026-10-01T00:00:00", "last_modified": "2026-10-03T00:00:00"}
+    collection.upsert(documents=["doc"], ids=["x"], metadatas=[meta], embeddings=[VECS["a"]])
+    assert collection.get(ids=["x"]).metadatas[0]["last_modified"] == "2026-10-03T00:00:00"

@@ -10,6 +10,7 @@ import pickle
 import re
 import shlex
 import sqlite3
+import struct
 import time
 from collections import defaultdict
 from numbers import Integral
@@ -19,7 +20,7 @@ from typing import Any, Optional
 import chromadb
 from chromadb.errors import NotFoundError as _ChromaNotFoundError
 
-from ..config import sqlite_read_uri
+from ..config import connect_sqlite_read
 from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
     BaseBackend,
@@ -34,6 +35,7 @@ from .base import (
     QueryResult,
     UnsupportedFilterError,
     _IncludeSpec,
+    initialize_last_modified_metadata,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,6 +55,57 @@ _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
 # Treat only >10x as corruption so normal flush lag or small segments do not get
 # quarantined.
 _HNSW_LINK_TO_DATA_MAX_RATIO = 10.0
+_HNSW_PERSISTENCE_VERSION = 1
+_HNSW_SANE_ELEMENT_CAP = 50_000_000
+# Current chroma-hnswlib header.bin prefix: native-endian int version,
+# followed by 64-bit size_t offsetLevel0, max_elements, and current_count.
+_HNSW_HEADER_PREFIX = struct.Struct("=iQQQ")
+
+
+def _read_hnsw_binary_header(
+    segment_dir: str,
+) -> Optional[dict[str, int]]:
+    """Read the version and count prefix from chroma-hnswlib header.bin."""
+    if struct.calcsize("P") != 8:
+        return None
+
+    header_path = os.path.join(segment_dir, "header.bin")
+    try:
+        with open(header_path, "rb") as handle:
+            raw = handle.read(_HNSW_HEADER_PREFIX.size)
+    except OSError:
+        return None
+
+    if len(raw) != _HNSW_HEADER_PREFIX.size:
+        return None
+
+    try:
+        version, offset_level0, max_elements, current_count = _HNSW_HEADER_PREFIX.unpack(raw)
+    except struct.error:
+        return None
+
+    return {
+        "persistence_version": int(version),
+        "offset_level0": int(offset_level0),
+        "max_elements": int(max_elements),
+        "cur_element_count": int(current_count),
+    }
+
+
+def _hnsw_binary_header_has_impossible_counts(
+    header: dict[str, int],
+) -> bool:
+    """Return True only for impossible counts in the known v1 layout."""
+    if header.get("persistence_version") != _HNSW_PERSISTENCE_VERSION:
+        return False
+
+    max_elements = int(header["max_elements"])
+    current_count = int(header["cur_element_count"])
+    return (
+        current_count > max_elements
+        or max_elements > _HNSW_SANE_ELEMENT_CAP
+        or current_count > _HNSW_SANE_ELEMENT_CAP
+    )
 
 
 def _hnsw_link_to_data_ratio(seg_dir: str) -> Optional[float]:
@@ -431,6 +484,10 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     zero-fill, or partial-flush corruption. Assumes pickle protocol
     >= 2 (``0x80`` PROTO marker).
     """
+    binary_header = _read_hnsw_binary_header(seg_dir)
+    if binary_header is not None and _hnsw_binary_header_has_impossible_counts(binary_header):
+        return False
+
     meta_path = os.path.join(seg_dir, "index_metadata.pickle")
 
     if not os.path.isfile(meta_path):
@@ -452,7 +509,7 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
 def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> list[str]:
     """Rename HNSW segment dirs that look unsafe to open.
 
-    This catches two classes of HNSW corruption before ChromaDB opens the
+    This catches three classes of HNSW corruption before ChromaDB opens the
     native segment reader:
 
     1. stale-by-mtime segments whose ``index_metadata.pickle`` fails the
@@ -503,14 +560,18 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
 
         payload_ratio = _hnsw_link_to_data_ratio(seg_dir)
         payload_corrupt = payload_ratio is not None and payload_ratio > _HNSW_LINK_TO_DATA_MAX_RATIO
+        binary_header = _read_hnsw_binary_header(seg_dir)
+        header_corrupt = binary_header is not None and _hnsw_binary_header_has_impossible_counts(
+            binary_header
+        )
 
-        if not payload_corrupt and sqlite_mtime - hnsw_mtime < stale_seconds:
+        if not payload_corrupt and not header_corrupt and sqlite_mtime - hnsw_mtime < stale_seconds:
             continue
 
         # Stage 2: integrity gate. Mtime drift alone is not corruption because
         # Chroma flushes HNSW asynchronously. A healthy metadata file proves the
         # ordinary stale-by-mtime case is just flush lag.
-        if not payload_corrupt and _segment_appears_healthy(seg_dir):
+        if not payload_corrupt and not header_corrupt and _segment_appears_healthy(seg_dir):
             logger.info(
                 "HNSW mtime gap %.0fs on %s exceeds threshold but segment "
                 "metadata and payload size are intact — flush-lag, not "
@@ -523,7 +584,13 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
         stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         target = f"{seg_dir}.drift-{stamp}"
 
-        if payload_corrupt:
+        if header_corrupt:
+            reason = (
+                "header.bin contains impossible HNSW element counts "
+                f"(max={binary_header['max_elements']:,}, "
+                f"current={binary_header['cur_element_count']:,})"
+            )
+        elif payload_corrupt:
             reason = (
                 f"link_lists.bin/data_level0.bin ratio {payload_ratio:.1f}x "
                 f"exceeds {_HNSW_LINK_TO_DATA_MAX_RATIO:.1f}x"
@@ -559,7 +626,7 @@ def _vector_segment_id(palace_path: str, collection_name: str) -> Optional[str]:
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             row = conn.execute(
                 """
@@ -730,7 +797,7 @@ def _read_sync_threshold(palace_path: str, collection_name: str) -> int:
     if not os.path.isfile(db_path):
         return 1000
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             cur = conn.cursor()
             cur.execute(
@@ -761,7 +828,7 @@ def _collection_has_sync_threshold_metadata(palace_path: str, collection_name: s
         return False
 
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             row = conn.execute(
                 """
@@ -864,6 +931,22 @@ def _pickle_signature(palace_path: str, segment_id: Optional[str]) -> tuple[int,
     return _stat_signature(os.path.join(palace_path, segment_id, "index_metadata.pickle"))
 
 
+def _header_signature(
+    palace_path: str,
+    segment_id: Optional[str],
+) -> tuple[int, int, int]:
+    """Signature of the segment's header.bin."""
+    if not segment_id:
+        return (0, 0, 0)
+    return _stat_signature(
+        os.path.join(
+            palace_path,
+            segment_id,
+            "header.bin",
+        )
+    )
+
+
 def _segment_id_safe(palace_path: str, collection_name: str) -> Optional[str]:
     """``_vector_segment_id`` that never raises, for the pre-probe signature."""
     try:
@@ -873,15 +956,19 @@ def _segment_id_safe(palace_path: str, collection_name: str) -> Optional[str]:
 
 
 def _capacity_fingerprint(palace_path: str, segment_id: Optional[str]) -> tuple:
-    """Signature over every file the probe reads: the sqlite family + the pickle.
+    """Signature over every file the probe reads: sqlite, pickle, and header.
 
-    Both halves must be captured for the same ``segment_id`` so a rewrite of
+    All parts must be captured for the same ``segment_id`` so a rewrite of
     ``index_metadata.pickle`` is caught. The probe reads that pickle partway
     through, then makes two more sqlite calls, so a signature taken only after
     the probe returned would record a mid-probe pickle rewrite as "unchanged"
     while the verdict still reflected the pre-write file (#1471 review).
     """
-    return (_db_family_signature(palace_path), _pickle_signature(palace_path, segment_id))
+    return (
+        _db_family_signature(palace_path),
+        _pickle_signature(palace_path, segment_id),
+        _header_signature(palace_path, segment_id),
+    )
 
 
 def reset_hnsw_capacity_cache() -> None:
@@ -953,7 +1040,7 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
     # Snapshot the files the probe is about to read, before it reads them, and
     # again after — using the segment id the probe itself resolved. Caching
     # only when both snapshots agree makes an external write during the probe
-    # (sqlite OR the pickle) fall through uncached rather than pin a verdict
+    # (sqlite, pickle, OR header) fall through uncached rather than pin a verdict
     # the disk no longer supports.
     before = _capacity_fingerprint(palace_path, _segment_id_safe(palace_path, collection_name))
     out = _hnsw_capacity_status_uncached(palace_path, collection_name)
@@ -1001,6 +1088,31 @@ def _hnsw_capacity_status_uncached(
 
         if seg_id is None or sqlite_count is None:
             out["message"] = "palace state unreadable; skipping HNSW capacity check"
+            return out
+
+        binary_header = _read_hnsw_binary_header(
+            os.path.join(
+                palace_path,
+                seg_id,
+            )
+        )
+        if binary_header is not None and _hnsw_binary_header_has_impossible_counts(binary_header):
+            out.update(
+                {
+                    "status": "diverged",
+                    "diverged": True,
+                    "hnsw_binary_persistence_version": binary_header["persistence_version"],
+                    "hnsw_binary_max_elements": binary_header["max_elements"],
+                    "hnsw_binary_cur_element_count": binary_header["cur_element_count"],
+                    "message": (
+                        "HNSW header.bin contains impossible element counts "
+                        f"(max={binary_header['max_elements']:,}, "
+                        f"current={binary_header['cur_element_count']:,}). "
+                        "Vector reads are disabled until `mempalace repair` "
+                        "rebuilds the index."
+                    ),
+                }
+            )
             return out
 
         hnsw_count = _hnsw_element_count(palace_path, seg_id)
@@ -1094,7 +1206,7 @@ def _sqlite_embedding_count(palace_path: str, collection_name: str) -> Optional[
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             row = conn.execute(
                 """
@@ -1155,7 +1267,7 @@ def _sqlite_wing_room_counts(
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             # Wait out a transient writer/checkpoint lock rather than falling
             # straight back to the expensive vector-index path (#1681).
@@ -1212,7 +1324,7 @@ def sqlite_room_wing_hall_counts(palace_path: str, collection_name: str) -> Opti
     if not os.path.isfile(db_path):
         return None
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             conn.execute("PRAGMA busy_timeout = 3000")
             if (
@@ -1314,7 +1426,7 @@ def sqlite_list_id_metadata(
     if filters is None:
         return None
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             conn.execute("PRAGMA busy_timeout = 3000")
             if (
@@ -1427,7 +1539,7 @@ def sqlite_documents_for_ids(
     wanted = [str(i) for i in ids]
     docs: dict[str, str] = {}
     try:
-        conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+        conn = connect_sqlite_read(db_path)
         try:
             conn.execute("PRAGMA busy_timeout = 3000")
             segments = [
@@ -1821,21 +1933,23 @@ def _close_client(client) -> None:
 
 
 def _clear_chroma_system_cache() -> None:
-    """Drop chromadb's process-global ``SharedSystemClient`` cache.
+    """Drop Chroma's process-global ``SharedSystemClient`` cache.
 
-    chromadb caches its ``System`` (and the live HNSW segment) keyed by path.
-    A bare ``chromadb.PersistentClient(path=...)`` reopen reuses that cached
-    System, so after a peer/rebuild has changed ``chroma.sqlite3`` on disk we
-    would rebuild against the stale in-memory segment and persist an outdated
+    ``clear_system_cache()`` replaces Chroma's system and refcount maps without
+    calling ``System.stop()``. Callers must close every client they own before
+    invoking this helper, while Chroma can still resolve those maps.
+
+    Chroma caches its ``System`` (and the live HNSW segment) keyed by path. A
+    bare ``chromadb.PersistentClient(path=...)`` reopen reuses that cached
+    System, so after a peer or rebuild changes ``chroma.sqlite3`` on disk we
+    would rebuild against stale in-memory state and could persist an outdated
     index over the on-disk changes -- the same data-loss class as #2002,
-    reached via :meth:`ChromaBackend._client` instead of
-    ``mcp_server._get_client``. This mirrors the reset already performed by
-    ``mcp_server._force_chroma_cache_reset`` and ``repair._close_chroma_handles``.
+    reached through :meth:`ChromaBackend._client` instead of
+    ``mcp_server._get_client``.
 
-    The clear is process-global (it evicts every palace's cached System, not
-    just this path); chromadb exposes no per-path eviction. It only fires on the
-    inode/mtime-change branch of ``_client``, never the steady-state hot path,
-    so the redundant rebuild cost is bounded to genuine external-change reopens.
+    The clear is process-global because Chroma exposes no public per-path
+    eviction primitive. It runs only on the external inode/mtime-change branch,
+    never on the steady-state hot path.
     """
     try:
         from chromadb.api.client import SharedSystemClient
@@ -1844,7 +1958,10 @@ def _clear_chroma_system_cache() -> None:
         if callable(clear):
             clear()
     except Exception:
-        logger.debug("Failed to clear chromadb SharedSystemClient cache", exc_info=True)
+        logger.debug(
+            "Failed to clear chromadb SharedSystemClient cache",
+            exc_info=True,
+        )
 
 
 class ChromaCollection(BaseCollection):
@@ -1918,6 +2035,7 @@ class ChromaCollection(BaseCollection):
         misses a case (or skips for performance), reaching the chromadb
         client always goes through here first.
         """
+        metadatas = initialize_last_modified_metadata(metadatas)
         if metadatas is None:
             return None
         return [
@@ -2247,7 +2365,7 @@ class ChromaCollection(BaseCollection):
         # rowid, embedding_id is the user-facing drawer id.
         public_ids: dict[int, str] = {}
         try:
-            conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
+            conn = connect_sqlite_read(db_path)
             conn.row_factory = sqlite3.Row
         except sqlite3.Error:
             logger.debug("Chroma lexical sqlite open failed", exc_info=True)
@@ -2550,6 +2668,23 @@ class ChromaBackend(BaseBackend):
         except OSError:
             return (0, 0.0)
 
+    def _drain_clients(self) -> None:
+        """Close and forget every client owned by this backend.
+
+        Chroma's cache reset is process-global. Draining only the palace that
+        changed would leave this backend's other clients untracked after the
+        reset, so their later ``close()`` calls could not stop their Systems.
+
+        Draining invalidates every ``ChromaCollection`` previously returned by
+        those clients, including collections for unchanged palaces. Callers
+        must reacquire them through :meth:`get_collection`.
+        """
+        clients = list(self._clients.values())
+        self._clients.clear()
+        self._freshness.clear()
+        for client in clients:
+            _close_client(client)
+
     def _client(self, palace_path: str):
         """Return a cached ``PersistentClient``, rebuilding on inode/mtime change.
 
@@ -2596,37 +2731,28 @@ class ChromaBackend(BaseBackend):
 
         if cached is None or inode_changed or mtime_changed or mtime_appeared:
             # Drop the per-process quarantine gate so the HNSW pre-checks
-            # run again against the new disk state.  An inode swap means a
-            # different physical DB (post-restore, fresh palace at the same
-            # path); an mtime/appearance change means an external in-place
-            # write (closet_llm, mine, compress) that may have drifted the
-            # HNSW index while this process was running.
-            if (
+            # run again against the new disk state. An inode swap means a
+            # different physical DB; an mtime/appearance change means an
+            # external writer may have drifted the in-memory HNSW state.
+            external_change = (
                 inode_changed
                 or mtime_changed
                 or (mtime_appeared and palace_path in self._freshness)
-            ):
+            )
+            if external_change:
                 ChromaBackend._quarantined_paths.discard(palace_path)
-                # #2028: the same external change means chromadb's path-keyed
-                # System cache is now stale. Reconstructing PersistentClient
-                # below would reuse the cached System (and its in-memory HNSW
-                # segment), so drop the shared cache first -- otherwise the
-                # rebuilt client persists an outdated index over the on-disk
-                # change. Gated on genuine external change (not first open) so
-                # cold opens never pay the global-evict cost.
+
+                # #2028/#2375: Chroma's cache reset is process-global and only
+                # forgets its maps. Close all clients owned by this backend
+                # first, while their close() calls can still decrement the
+                # refcounts and stop the corresponding Systems.
+                self._drain_clients()
                 _clear_chroma_system_cache()
-            # Release the client we are about to displace. Each live
-            # PersistentClient pins its own copy of every HNSW segment it has
-            # opened (``max_elements * size_data_per_element`` bytes -- ~440 MB
-            # per collection on a 165k-drawer palace), and neither dict
-            # eviction nor _clear_chroma_system_cache() returns that native
-            # memory. Dropping it here keeps a long-lived server flat across
-            # rebuilds instead of accumulating one orphaned index set per
-            # external change. Any ChromaCollection handed out before this
-            # point is invalidated -- which is the intent: the rebuild only
-            # fires when the palace changed underneath us, and serving the
-            # pre-change segment is the stale-index class of #2002/#2028.
-            _close_client(self._clients.pop(palace_path, None))
+            else:
+                # Cold open or a missing-DB invalidation does not require a
+                # global reset; release only the requested path.
+                _close_client(self._clients.pop(palace_path, None))
+
             ChromaBackend._prepare_palace_for_open(palace_path)
             cached = chromadb.PersistentClient(path=palace_path)
             self._clients[palace_path] = cached
@@ -2831,10 +2957,7 @@ class ChromaBackend(BaseBackend):
         self._freshness.pop(path, None)
 
     def close(self) -> None:
-        for client in self._clients.values():
-            _close_client(client)
-        self._clients.clear()
-        self._freshness.clear()
+        self._drain_clients()
         self._closed = True
 
     def health(self, palace: Optional[PalaceRef] = None) -> HealthStatus:

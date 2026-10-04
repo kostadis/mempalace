@@ -9,10 +9,11 @@ import hashlib
 import logging
 import os
 import re
+import sqlite3
 import sys
 import threading
 import time
-from typing import Optional
+from typing import List, Optional
 
 from .backends import (
     BackendClosedError,
@@ -220,6 +221,82 @@ def _enforce_embedder_identity(
     _VALIDATED_IDENTITY.add(key)
 
 
+# The closets collection name is fixed (not user-configurable) — it is the
+# searchable index layer and MemPalace never opens a differently-named closets
+# store. Mirrored independently in repair.py as ``CLOSETS_COLLECTION_NAME``.
+CLOSETS_COLLECTION_NAME = "mempalace_closets"
+# Hierarchical AAAK index layers, written by recursive_indexer and read by
+# tool_search_hierarchical. First-class stores, so the #2347 name check
+# must admit them.
+ROOM_INDICES_COLLECTION_NAME = "mempalace_room_indices"
+WING_INDICES_COLLECTION_NAME = "mempalace_wing_indices"
+
+
+def _allowed_wrapper_collection_names() -> List[str]:
+    """The collection names the ``get_collection`` wrapper routes through.
+
+    The first-class stores are the configured drawers collection (default
+    ``mempalace_drawers``, overridable in config), the closets collection,
+    and the room/wing index layers that hierarchical search reads. Every
+    other name points at a store the search/CLI/MCP layer never reads — the
+    exact silent-miss failure of issue ``#2347``.
+    """
+    from .config import get_configured_collection_name
+
+    allowed = [
+        get_configured_collection_name(),
+        CLOSETS_COLLECTION_NAME,
+        ROOM_INDICES_COLLECTION_NAME,
+        WING_INDICES_COLLECTION_NAME,
+    ]
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in allowed:
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+class CollectionNameMismatchError(ValueError):
+    """Raised when ``get_collection(collection_name=...)`` names a collection the
+    palace wrapper does not own.
+
+    The wrapper (``mempalace.palace.get_collection``) front-loads exactly two
+    collections: the configured drawers collection (default
+    ``mempalace_drawers``, overridable in config) and ``mempalace_closets`` (the
+    searchable index layer). Opening any other name would create or touch a
+    store the rest of MemPalace never reads — so data upserted through it would
+    be invisible to search, MCP, and repair — instead of the caller discovering
+    the miss once their reads come back empty.
+
+    Subclass of :class:`ValueError` so callers that already catch the generic
+    type for a bad string keep working, while ``except
+    CollectionNameMismatchError`` gives the specific signal. This is a distinct
+    failure from :class:`mempalace.backends.CollectionNotInitializedError`
+    (palace + DB present, collection simply not bootstrapped yet): this one means
+    the *name* is not one MemPalace routes reads/writes through.
+    """
+
+    def __init__(self, requested: str, allowed: List[str], palace_path: Optional[str] = None):
+        self.requested = requested
+        self.allowed = list(allowed)
+        self.palace_path = palace_path
+        where = f" in {palace_path}" if palace_path else ""
+        allowed_str = ", ".join(repr(n) for n in allowed)
+        super().__init__(
+            f"collection {requested!r} is not a MemPalace collection{where}: "
+            f"get_collection routes reads and writes through {allowed_str} only. "
+            f"Opening {requested!r} would create or touch a store the rest of "
+            f"MemPalace never reads, so data upserted through it would be "
+            f"invisible to search, MCP, and repair. Use one of the configured "
+            f"names — the drawers collection name (default "
+            f"'mempalace_drawers', overridable in config; expose it with "
+            f"``get_configured_collection_name()``) or the closets collection "
+            f"``get_closets_collection()`` — not an ad-hoc string."
+        )
+
+
 def get_collection(
     palace_path: str,
     collection_name: Optional[str] = None,
@@ -227,8 +304,27 @@ def get_collection(
     backend: Optional[str] = None,
     read_only: bool = False,
     _skip_identity_check: bool = False,
+    _skip_name_check: bool = False,
 ):
-    """Get the palace collection through the backend layer.
+    """Get a first-class MemPalace collection (drawers or closets).
+
+    The wrapper front-loads exactly two collections and is the public surface
+    MCP, miners, the search layer, and the CLI use to open a palace:
+
+    * the **drawers** collection — the verbatim document store. Its name is
+      configurable (default ``mempalace_drawers``); read it via
+      :func:`mempalace.config.get_configured_collection_name` rather than
+      hard-coding the string.
+    * the **closets** collection — the searchable index layer. Always named
+      :data:`mempalace.palace.CLOSETS_COLLECTION_NAME`` ("mempalace_closets");
+      open it through :func:`mempalace.palace.get_closets_collection`.
+
+    Any other name points to a store the rest of MemPalace never reads, so data
+    upserted through it stays invisible to search/CLI/MCP. ``get_collection``
+    therefore raises :class:`CollectionNameMismatchError` (a ``ValueError``)
+    naming both the offending and allowed strings, instead of silently creating
+    that orphan collection (issue ``#2347``). Passing ``collection_name=None``
+    resolves to the configured drawers name and always succeeds.
 
     ``read_only=True`` asks local backends to open storage without schema
     initialization, migrations, or metadata writes. Backends that support a
@@ -237,6 +333,13 @@ def get_collection(
     ``_skip_identity_check`` bypasses the embedder-identity enforcement so the
     ``set-embedder`` override path can open a palace whose recorded model
     differs from the current one (the very state it exists to repair).
+
+    ``_skip_name_check`` is the maintenance escape hatch for tools like
+    ``mempalace_repair_encoding --collection NAME`` that must be able to open a
+    legacy ad-hoc collection name deliberately created before this check
+    existed. Callers on this path take the risk of a mismatched-name orphan;
+    they are explicit and self-aware. The common programmatic-API misuse this
+    check exists to prevent never uses this flag and still fails loudly.
     """
     # One-shot warning if the palace path sits on a DrvFs / 9P / CIFS /
     # NFS mount that breaks ChromaDB + SQLite mmap/flock/fsync semantics.
@@ -247,6 +350,10 @@ def get_collection(
         from .config import get_configured_collection_name
 
         collection_name = get_configured_collection_name()
+    if not _skip_name_check:
+        allowed = _allowed_wrapper_collection_names()
+        if collection_name not in allowed:
+            raise CollectionNameMismatchError(collection_name, allowed, palace_path)
     backend_obj = get_backend_for_palace(palace_path, explicit=backend)
     palace_ref = PalaceRef(id=palace_path, local_path=palace_path)
     backend_options = {"read_only": True} if read_only else None
@@ -486,7 +593,7 @@ def get_room_indices_collection(palace_path: str, create: bool = True):
     projection of that room's leaf closets. Written by ``recursive_indexer``;
     consumed by ``tool_search_hierarchical`` as the middle pruning layer.
     """
-    return get_collection(palace_path, collection_name="mempalace_room_indices", create=create)
+    return get_collection(palace_path, collection_name=ROOM_INDICES_COLLECTION_NAME, create=create)
 
 
 def get_wing_indices_collection(palace_path: str, create: bool = True):
@@ -497,7 +604,7 @@ def get_wing_indices_collection(palace_path: str, create: bool = True):
     retrieval; a ``max_depth=0`` query can stop here without touching
     room indices or leaf closets.
     """
-    return get_collection(palace_path, collection_name="mempalace_wing_indices", create=create)
+    return get_collection(palace_path, collection_name=WING_INDICES_COLLECTION_NAME, create=create)
 
 
 # === Dirty-flag plumbing =====================================================
@@ -1295,7 +1402,16 @@ class MineValidationError(RuntimeError):
             raise ValueError("MineValidationError requires at least one error string")
         if not palace_path:
             raise ValueError("MineValidationError requires a non-empty palace_path")
-        super().__init__(f"FTS5/SQLite quick_check failed: {len(errors)} issue(s)")
+        # Name the SQLite that produced the verdict. #2240 points at this
+        # post-mine check by name: a build that cannot detect a given FTS5
+        # fault reports the same "clean" as one that can. The CLI handler
+        # renders the abort banner, which carries the version; the MCP `mine`
+        # tool and the daemon's job runner render this message instead, so it
+        # belongs in the message.
+        super().__init__(
+            f"FTS5/SQLite quick_check failed: {len(errors)} issue(s) "
+            f"(SQLite {sqlite3.sqlite_version})"
+        )
         self.palace_path = palace_path
         # Freeze the forensic snapshot so handlers cannot mutate it.
         self.errors: tuple[str, ...] = tuple(errors)
@@ -1332,11 +1448,19 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
 
     errors = sqlite_integrity_errors(palace_path)
     if errors:
-        # progress=logger.info, not the default print: this runs inside the
-        # MCP server process too (mcp_server.tool_mine -> miner.mine), where
-        # stdout is the JSON-RPC transport -- a stray print() here would
-        # corrupt the protocol stream and crash the connection.
-        errors = maybe_autoheal_fts5_index(palace_path, errors, progress=logger.info)
+        # Not the default print: this runs inside the MCP server process too
+        # (mcp_server.tool_mine -> miner.mine), where stdout is the JSON-RPC
+        # transport -- a stray print() here would corrupt the protocol stream
+        # and crash the connection.
+        #
+        # warning, not info: this module logs through the `mempalace_mcp`
+        # logger, which sets no level of its own, and nothing configures logging
+        # on the `mempalace mine` path -- so root keeps its default and info
+        # records are dropped. Every message this call can emit describes a palace whose
+        # quick_check already failed -- a rebuild being attempted, refused, or
+        # completed against the operator's data -- so warning is both the level
+        # that survives and the level that fits.
+        errors = maybe_autoheal_fts5_index(palace_path, errors, progress=logger.warning)
     if errors:
         raise MineValidationError(palace_path, errors)
 
