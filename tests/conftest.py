@@ -202,6 +202,21 @@ def _reset_loaded_mcp_writer_state(mcp_server) -> None:
                 setattr(mcp_server, name, value)
 
 
+def _close_and_clear(module, attr):
+    """Close every cached handle in ``module.<attr>`` (a dict), then empty it."""
+    cache = getattr(module, attr, None)
+    if cache is None:
+        return
+    for handle in list(cache.values()):
+        close = getattr(handle, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception:
+                pass
+    cache.clear()
+
+
 @pytest.fixture(autouse=True)
 def _reset_mcp_cache(monkeypatch):
     """Reset cached MCP state between tests without importing mcp_server.
@@ -225,16 +240,16 @@ def _reset_mcp_cache(monkeypatch):
 
             mcp_server = sys.modules.get("mempalace.mcp_server")
             if mcp_server is not None:
+                stop_sync = getattr(mcp_server, "_stop_peer_sync_thread", None)
+                if callable(stop_sync):
+                    try:
+                        stop_sync()
+                    except Exception:
+                        pass
+
                 _reset_loaded_mcp_writer_state(mcp_server)
-                for kg in list(getattr(mcp_server, "_kg_cache", {}).values()):
-                    close = getattr(kg, "close", None)
-                    if close is not None:
-                        try:
-                            close()
-                        except Exception:
-                            pass
-                if hasattr(mcp_server, "_kg_cache"):
-                    mcp_server._kg_cache.clear()
+                _close_and_clear(mcp_server, "_kg_cache")
+                _close_and_clear(mcp_server, "_logstream_by_path")
                 if hasattr(mcp_server, "_palace_caches"):
                     close_entry = getattr(mcp_server, "_close_cached_client", None)
                     if callable(close_entry):
