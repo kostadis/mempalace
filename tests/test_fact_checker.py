@@ -378,4 +378,5 @@ class TestCLI:
 
         from mempalace.fact_checker import _default_palace_path
 
-        assert _default_palace_path() == str(fake_config / "palace")
+        # Fork layout: the fallback palace is <config dir>/palaces/chat.
+        assert _default_palace_path() == str(fake_config / "palaces" / "chat")

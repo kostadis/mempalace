@@ -1071,8 +1071,11 @@ class MempalaceConfig:
     def palace_path(self):
         """Path to the memory palace data directory.
 
-        Defaults to a "palace" sub-directory inside the active config
-        directory, so the palace follows the config wherever XDG places it.
+        Defaults to the chat palace inside the active config directory
+        (``<config dir>/palaces/chat``; ``~/.mempalace/palaces/chat`` unless
+        ``MEMPALACE_CONFIG_DIR`` overrides it). Upstream's fallback is
+        ``<config dir>/palace``, which under ``~/.mempalace`` is the legacy
+        single-palace directory the palace-isolation migration renames away.
         """
         if self._palace_path_override is not None:
             return self._palace_path_override
@@ -1083,7 +1086,7 @@ class MempalaceConfig:
             # when the env var contains unresolved components.
             return os.path.abspath(os.path.expanduser(env_val))
         return os.path.expanduser(
-            self._file_config.get("palace_path", str(self._config_dir / "palace"))
+            self._file_config.get("palace_path", str(self._config_dir / "palaces" / "chat"))
         )
 
     @property
