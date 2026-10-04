@@ -91,10 +91,10 @@ elif not (os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get("MEMPAL_PALA
     #
     # Only the walk-up result is pinned via env var (so every fresh
     # ``MempalaceConfig()`` in this process picks up the campaign palace).
-    # When the resolution comes from ``default_palace`` we leave the env
-    # var alone — the file-level config already encodes the answer and
-    # callers that monkeypatch ``_config`` (tests) need the property to
-    # honour the patched file config rather than a process-wide override.
+    # When the resolution comes from ``default_palace`` no pin is needed:
+    # ``MempalaceConfig.palace_path`` honours ``default_palace`` itself (#44),
+    # so every reader agrees without a process-wide override -- which would
+    # also beat the ``_config`` that tests monkeypatch.
     from ..config import PalaceNotDeclared
 
     _walked = MempalaceConfig().walk_up_palace()
