@@ -326,7 +326,7 @@ def tool_status(palace: str = None):
     # accidentally creating a palace in a non-existent directory (#830).
     col = _get_collection(palace_path=resolved, create=db_exists)
     if not col:
-        return _collection_error_or_no_palace()
+        return _collection_error_or_no_palace(resolved)
     count = col.count()
     wings = {}
     rooms = {}
@@ -337,7 +337,10 @@ def tool_status(palace: str = None):
         "palace_path": resolved,
         "protocol": PALACE_PROTOCOL,
         "aaak_dialect": AAAK_SPEC,
-        "backend": _selected_backend_name(),
+        # A cross-palace status names that palace's backend, not the default's.
+        "backend": _selected_backend_name()
+        if is_default
+        else (_cross_palace_backend(resolved)[0] or "chroma"),
     }
     try:
         if _supports_metadata_facets(col):
