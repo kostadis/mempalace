@@ -35,6 +35,7 @@ from .base import (
     UnsupportedFilterError,
     UnsupportedMaintenanceKindError,
 )
+
 # Chroma is imported lazily below (PEP 562 __getattr__) so it stays optional.
 # pgvector/qdrant/sqlite_exact/milvus import their heavy client deps lazily
 # inside methods, so importing their classes here is cheap and safe on any deploy.
@@ -42,6 +43,7 @@ from .milvus import MilvusBackend, MilvusCollection
 from .pgvector import PgVectorBackend, PgVectorCollection
 from .qdrant import QdrantBackend, QdrantCollection
 from .sqlite_exact import SQLiteExactBackend, SQLiteExactCollection
+from .rust_exact import RustExactBackend, RustExactCollection
 from .registry import (
     available_backends,
     detect_backend_for_path,
@@ -53,6 +55,8 @@ from .registry import (
     resolve_backend_for_palace,
     unregister,
 )
+
+register("rust_exact", RustExactBackend)
 
 
 # Chroma is an OPTIONAL in-tree backend. Import it lazily (PEP 562) so that importing
@@ -92,6 +96,8 @@ __all__ = [
     "QdrantBackend",
     "QdrantCollection",
     "QueryResult",
+    "RustExactBackend",
+    "RustExactCollection",
     "SQLiteExactBackend",
     "SQLiteExactCollection",
     "UnsupportedCapabilityError",

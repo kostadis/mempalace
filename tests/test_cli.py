@@ -299,6 +299,38 @@ def test_cmd_init_normalizes_wing_name_for_topics_registry(mock_config_cls, tmp_
         assert mock_register.call_args.kwargs["wing"] == "my_cool_app"
 
 
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_init_does_not_report_a_registry_update_that_did_not_happen(
+    mock_config_cls, tmp_path, capsys
+):
+    """``add_to_known_entities`` answers ``None`` when it left the registry
+    alone and printed why. Printing "Registry updated" over that would tell
+    the user the opposite of what stderr just said."""
+    project = tmp_path / "app"
+    project.mkdir()
+    detected = {
+        "people": [{"name": "Alice"}],
+        "projects": [],
+        "topics": [],
+        "uncertain": [],
+    }
+    confirmed = {"people": ["Alice"], "projects": [], "topics": []}
+    args = argparse.Namespace(dir=str(project), yes=True)
+    with (
+        patch("mempalace.entity_detector.scan_for_detection", return_value=[project / "a.txt"]),
+        patch("mempalace.entity_detector.detect_entities", return_value=detected),
+        patch("mempalace.entity_detector.confirm_entities", return_value=confirmed),
+        patch("mempalace.miner.add_to_known_entities", return_value=None),
+        patch("mempalace.room_detector_local.detect_rooms_local"),
+        patch("builtins.open", MagicMock()),
+        patch("mempalace.cli._maybe_run_mine_after_init"),
+        patch("mempalace.cli._run_pass_zero", return_value=None),
+    ):
+        cmd_init(args)
+
+    assert "Registry updated" not in capsys.readouterr().out
+
+
 def test_cmd_init_honors_palace_flag(tmp_path, monkeypatch):
     """Regression for #1313: ``cmd_init`` must honor ``--palace`` instead of
     silently writing to ``~/.mempalace``. Mirrors the env-var pattern used
@@ -320,6 +352,16 @@ def test_cmd_init_honors_palace_flag(tmp_path, monkeypatch):
     monkeypatch.setenv("MEMPAL_PALACE_PATH", "")
     monkeypatch.delenv("MEMPALACE_PALACE_PATH")
     monkeypatch.delenv("MEMPAL_PALACE_PATH")
+
+    # cmd_init's MempalaceConfig() has no config_dir, so an unpatched call
+    # here now persists this test's tmp_path into the shared ~/.mempalace
+    # (#2366's fix made init() write what actually resolved, not a constant).
+    from mempalace.config import MempalaceConfig
+
+    monkeypatch.setattr(
+        "mempalace.cli.MempalaceConfig",
+        lambda *a, **kw: MempalaceConfig(*a, config_dir=str(tmp_path / ".mempalace"), **kw),
+    )
 
     args = argparse.Namespace(
         dir=str(project),
@@ -776,6 +818,8 @@ def test_cmd_mine_include_ignored_comma_split(mock_config_cls):
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_mine_daemon_background_submits_job(mock_config_cls, capsys):
     mock_config_cls.return_value.palace_path = "/fake/palace"
+    # Local palace isolation: daemon jobs target the _resolve_cli_palace result.
+    mock_config_cls.return_value.resolved_palace_path.return_value = "/fake/palace"
     args = argparse.Namespace(
         dir="/src",
         palace=None,
@@ -806,6 +850,44 @@ def test_cmd_mine_daemon_background_submits_job(mock_config_cls, capsys):
     payload = mock_submit.call_args.args[1]
     assert payload["include_ignored"] == ["a.txt", "b.txt"]
     assert "job-1" in capsys.readouterr().out
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_daemon_resolves_relative_source_against_caller_cwd(
+    mock_config_cls, tmp_path, monkeypatch
+):
+    """#2441: the daemon outlives this process and keeps its own cwd, so a
+    relative source has to be resolved here, against the caller's cwd, before
+    it enters the payload. _forward_mine_to_hub already does this for the hub
+    path; the daemon path did not."""
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    monkeypatch.chdir(tmp_path)
+    expected_source = os.getcwd()
+    args = argparse.Namespace(
+        dir=".",
+        palace=None,
+        mode="projects",
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="exchange",
+        daemon=True,
+        background=True,
+        backend=None,
+        global_backend=None,
+        max_chunks_per_file=None,
+        redetect_origin=False,
+    )
+    with patch("mempalace.daemon.submit_job", return_value={"id": "job-1"}) as mock_submit:
+        with patch("mempalace.miner.mine") as mock_mine:
+            cmd_mine(args)
+
+    mock_mine.assert_not_called()
+    payload = mock_submit.call_args.args[1]
+    assert payload["source"] == expected_source
 
 
 @patch("mempalace.cli.MempalaceConfig")
@@ -1060,6 +1142,9 @@ def test_mcp_command_prints_setup_guidance(monkeypatch, capsys):
     assert "MemPalace MCP quick setup:" in captured.out
     assert "claude mcp add mempalace -- mempalace-mcp" in captured.out
     assert "codex mcp add mempalace -- mempalace-mcp" in captured.out
+    assert "claude mcp add mempalace-light -- mempalace-light-mcp" in captured.out
+    assert "codex mcp add mempalace-light -- mempalace-light-mcp" in captured.out
+    assert "claude mcp add mempalace -- mempalace-light-mcp" not in captured.out
     assert "\nOptional custom palace:\n" in captured.out
     assert "mempalace-mcp --palace /path/to/palace" in captured.out
     assert "[--palace /path/to/palace]" not in captured.out
@@ -1078,6 +1163,7 @@ def test_mcp_command_uses_custom_palace_path_when_provided(monkeypatch, capsys):
     assert expanded in captured.out
     assert "claude mcp add mempalace -- mempalace-mcp --palace" in captured.out
     assert "codex mcp add mempalace -- mempalace-mcp --palace" in captured.out
+    assert "claude mcp add mempalace-light -- mempalace-light-mcp --palace" in captured.out
     assert "Optional custom palace:" not in captured.out
     assert "[--palace /path/to/palace]" not in captured.out
     assert captured.err == ""
@@ -1092,6 +1178,7 @@ def test_mcp_command_includes_backend_when_provided(monkeypatch, capsys):
 
     captured = capsys.readouterr()
     assert "mempalace-mcp --backend sqlite_exact" in captured.out
+    assert "mempalace-light-mcp --backend sqlite_exact" in captured.out
     assert captured.err == ""
     os.environ.pop("MEMPALACE_BACKEND_EXPLICIT", None)
     os.environ.pop("MEMPALACE_BACKEND", None)
@@ -2434,3 +2521,34 @@ def test_cmd_repair_rebuild_index_alias_uses_sqlite_archive(mock_config_cls, tmp
         archive_existing_dest=True,
         dry_run=False,
     )
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_daemon_targets_resolved_palace_not_config_default(mock_config_cls):
+    """A daemon-routed mine without --palace must target the palace the
+    isolation chain resolves (walk-up / default_palace), not
+    MempalaceConfig().palace_path (the chat-palace default)."""
+    mock_config_cls.return_value.palace_path = "/palaces/chat"
+    mock_config_cls.return_value.resolved_palace_path.return_value = "/palaces/campaign"
+    args = argparse.Namespace(
+        dir="/src",
+        palace=None,
+        mode="projects",
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_mempalaceignore=False,
+        include_ignored=[],
+        extract="exchange",
+        daemon=True,
+        background=True,
+        backend=None,
+        global_backend=None,
+        max_chunks_per_file=None,
+        redetect_origin=False,
+    )
+    with patch("mempalace.daemon.submit_job", return_value={"id": "job-1"}) as mock_submit:
+        cmd_mine(args)
+
+    assert mock_submit.call_args.kwargs["palace_path"] == "/palaces/campaign"
