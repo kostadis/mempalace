@@ -166,6 +166,18 @@ def test_registry_unknown_backend_raises():
         get_backend("no-such-backend-exists")
 
 
+def test_registry_unknown_backend_names_the_resolved_config_file(tmp_path, monkeypatch):
+    from mempalace.backends.registry import BackendUnavailableError
+
+    config_dir = tmp_path / "xdg" / "mempalace"
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(config_dir))
+
+    with pytest.raises(BackendUnavailableError) as excinfo:
+        get_backend("no-such-backend-exists")
+
+    assert str(config_dir / "config.json") in excinfo.value.args[0]
+
+
 def test_resolve_backend_priority_order(tmp_path):
     from mempalace.backends import resolve_backend_for_palace
 

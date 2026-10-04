@@ -576,9 +576,30 @@ def test_diary_agent_for_harness_unknown_falls_back_to_name():
         assert _diary_agent_for_harness(harness) != "session-hook"
 
 
+def test_dsh_harness_is_accepted_and_reads_diary_under_its_own_name():
+    """The DeepSeek Harness plugin drives `hook run --harness dsh`.
+
+    DSH supplies its own transcript (its on-disk session logs are
+    zstd-compressed and unreadable outside the harness), so `dsh` needs nothing
+    beyond being a recognised harness: the same input shape as Claude Code, and
+    a diary identity a `diary_read(agent_name="dsh")` call can actually find.
+    """
+    parsed = hooks_cli_mod._parse_harness_input(
+        {"session_id": "session-x", "transcript_path": "/tmp/t.jsonl"},
+        "dsh",
+    )
+    assert parsed == {
+        "session_id": "session-x",
+        "stop_hook_active": False,
+        "transcript_path": "/tmp/t.jsonl",
+    }
+    assert _diary_agent_for_harness("dsh") == "dsh"
+    assert "dsh" in hooks_cli_mod.SUPPORTED_HARNESSES
+
+
 @pytest.mark.parametrize(
     "harness,expected_agent",
-    [("claude-code", "claude"), ("codex", "codex")],
+    [("claude-code", "claude"), ("codex", "codex"), ("dsh", "dsh")],
 )
 def test_stop_hook_files_checkpoint_under_harness_agent(tmp_path, harness, expected_agent):
     """The Stop hook must file checkpoints under the agent identity that the
@@ -2547,6 +2568,9 @@ def _redirect_palace_root(monkeypatch, tmp_path):
     monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", fake_root)
     monkeypatch.setattr(hooks_cli_mod, "STATE_DIR", fake_root / "hook_state")
     monkeypatch.setattr(hooks_cli_mod, "_state_dir_initialized", False)
+    # The config dir satisfies the kill-switch too (#148); keep it absent so
+    # these tests exercise the "user cleared everything" path.
+    monkeypatch.setattr(hooks_cli_mod, "_config_root", lambda: tmp_path / "absent-config")
     return fake_root
 
 
@@ -2884,6 +2908,31 @@ def test_existing_dir_proceeds_normally(tmp_path, monkeypatch):
     assert (fake_root / "hook_state" / "hook.log").is_file()
 
 
+def test_config_dir_satisfies_kill_switch_without_legacy_root(tmp_path, monkeypatch):
+    """A fresh install since #148 has its config dir but no ~/.mempalace.
+
+    Before the fix every hook short-circuited on such an install, so a fresh
+    ``mempalace init`` followed by a PreCompact hook filed nothing.
+    """
+    fake_root = _redirect_palace_root(monkeypatch, tmp_path)
+    config_root = tmp_path / "xdg" / "mempalace"
+    config_root.mkdir(parents=True)
+    monkeypatch.setattr(hooks_cli_mod, "_config_root", lambda: config_root)
+
+    assert hooks_cli_mod._palace_root_exists() is True
+    _log("test message")
+    assert (fake_root / "hook_state" / "hook.log").is_file()
+
+
+def test_kill_switch_config_root_follows_config_resolution(tmp_path, monkeypatch):
+    """``_config_root`` resolves the way ``mempalace.config`` does."""
+    config_dir = tmp_path / "explicit-config"
+    config_dir.mkdir()
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(config_dir))
+
+    assert hooks_cli_mod._config_root() == config_dir
+
+
 def test_regular_file_at_palace_root_treated_as_absent(tmp_path, monkeypatch):
     """A regular file at ~/.mempalace must be treated the same as absent.
 
@@ -2895,6 +2944,7 @@ def test_regular_file_at_palace_root_treated_as_absent(tmp_path, monkeypatch):
     fake_root = tmp_path / "file-not-dir"
     fake_root.write_text("oops, this is a file not a directory")
     monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", fake_root)
+    monkeypatch.setattr(hooks_cli_mod, "_config_root", lambda: tmp_path / "absent-config")
     monkeypatch.setattr(hooks_cli_mod, "STATE_DIR", fake_root / "hook_state")
     monkeypatch.setattr(hooks_cli_mod, "_state_dir_initialized", False)
 

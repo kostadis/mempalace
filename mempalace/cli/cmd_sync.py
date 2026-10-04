@@ -7,20 +7,25 @@ def cmd_sync(args):
     """Prune drawers whose source files are gitignored, deleted, or moved (#1252)."""
     palace_path = _resolve_cli_palace(args)
 
-    if getattr(args, "background", False) and not getattr(args, "daemon", False):
-        print("mempalace: --background requires --daemon", file=sys.stderr)
-        sys.exit(2)
-
-    if getattr(args, "daemon", False):
-        payload = {
-            "dir": args.dir,
-            "root": list(args.root or []),
-            "wing": args.wing,
-            "dry_run": args.dry_run,
-        }
-        _submit_daemon_cli_job("sync", payload, args, background=getattr(args, "background", False))
+    payload = {
+        "dir": args.dir,
+        "root": list(args.root or []),
+        "wing": args.wing,
+        "dry_run": args.dry_run,
+    }
+    routing = _resolve_cli_write_routing_or_exit(
+        args,
+        "sync",
+    )
+    if routing.use_daemon:
+        _submit_daemon_cli_job(
+            "sync",
+            payload,
+            args,
+            background=bool(getattr(args, "background", False)),
+            auto_start=routing.decision.auto_start_daemon,
+        )
         return
-
     from ..palace import MineAlreadyRunning
     from ..wal import _wal_log
     from ..backends import detect_backend_for_path
@@ -121,8 +126,18 @@ def cmd_sync(args):
     print(f"\n{'=' * 55}\n")
 
 
-def _submit_daemon_cli_job(kind: str, payload: dict, args, *, background: bool) -> None:
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+def _submit_daemon_cli_job(
+    kind: str,
+    payload: dict,
+    args,
+    *,
+    background: bool,
+    auto_start: bool = True,
+) -> None:
+    # Resolve through the palace-isolation chain (alias, walk-up,
+    # default_palace) so a daemon-routed write lands in the same palace the
+    # direct path would use -- never the chat-palace default by accident.
+    palace_path = _resolve_cli_palace(args)
     backend = _backend_arg(args)
     from ..daemon import DaemonError, submit_job
 
@@ -133,7 +148,7 @@ def _submit_daemon_cli_job(kind: str, payload: dict, args, *, background: bool) 
             palace_path=palace_path,
             backend=backend,
             wait=not background,
-            auto_start=True,
+            auto_start=auto_start,
             # A job refused the palace lock is deferred, not failed (#2014), so
             # it never becomes terminal while the holder lives. Waiting it out
             # would strand this terminal behind a peer that can outlive the

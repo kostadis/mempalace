@@ -818,6 +818,8 @@ def test_cmd_mine_include_ignored_comma_split(mock_config_cls):
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_mine_daemon_background_submits_job(mock_config_cls, capsys):
     mock_config_cls.return_value.palace_path = "/fake/palace"
+    # Local palace isolation: daemon jobs target the _resolve_cli_palace result.
+    mock_config_cls.return_value.resolved_palace_path.return_value = "/fake/palace"
     args = argparse.Namespace(
         dir="/src",
         palace=None,
@@ -2519,3 +2521,34 @@ def test_cmd_repair_rebuild_index_alias_uses_sqlite_archive(mock_config_cls, tmp
         archive_existing_dest=True,
         dry_run=False,
     )
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_daemon_targets_resolved_palace_not_config_default(mock_config_cls):
+    """A daemon-routed mine without --palace must target the palace the
+    isolation chain resolves (walk-up / default_palace), not
+    MempalaceConfig().palace_path (the chat-palace default)."""
+    mock_config_cls.return_value.palace_path = "/palaces/chat"
+    mock_config_cls.return_value.resolved_palace_path.return_value = "/palaces/campaign"
+    args = argparse.Namespace(
+        dir="/src",
+        palace=None,
+        mode="projects",
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_mempalaceignore=False,
+        include_ignored=[],
+        extract="exchange",
+        daemon=True,
+        background=True,
+        backend=None,
+        global_backend=None,
+        max_chunks_per_file=None,
+        redetect_origin=False,
+    )
+    with patch("mempalace.daemon.submit_job", return_value={"id": "job-1"}) as mock_submit:
+        cmd_mine(args)
+
+    assert mock_submit.call_args.kwargs["palace_path"] == "/palaces/campaign"
