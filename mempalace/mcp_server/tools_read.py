@@ -236,7 +236,7 @@ def _graph_stats_from_grouped_rows(rows):
     }
 
 
-def _graph_sqlite_reader():
+def _graph_sqlite_reader(config=None):
     """The sqlite grouped-counts reader for this palace, or ``None``.
 
     ``None`` means the graph tools must go through the collection, which is
@@ -245,7 +245,17 @@ def _graph_sqlite_reader():
     """
     from ..palace_graph import sqlite_grouped_counts_reader
 
-    return sqlite_grouped_counts_reader(_config)
+    return sqlite_grouped_counts_reader(config or _config)
+
+
+def _graph_config(resolved, is_default):
+    """Config naming the palace a graph/tunnel/hallway read targets (#45).
+
+    The default palace keeps the server's ``_config`` (tests patch it); any
+    other palace gets a config whose palace_path is pinned to it, which also
+    keys palace_graph's cache and locates that palace's tunnel/hallway files.
+    """
+    return _config if is_default else MempalaceConfig(palace_path=resolved)
 
 
 def _chroma_room_wing_hall_counts():
@@ -424,17 +434,20 @@ Read AAAK naturally — expand codes mentally, treat *markers* as emotional cont
 When WRITING AAAK: use entity codes, mark emotions, keep structure tight."""
 
 
-def tool_list_wings():
-    fast = _sqlite_taxonomy()
+def tool_list_wings(palace: str = None):
+    resolved, is_default, err = _read_target(palace)
+    if err:
+        return err
+    fast = _sqlite_taxonomy() if is_default else None
     if fast is not None:
         _total, wing_rooms = fast
         wings = {}
         for w, room_counts in wing_rooms.items():
             wings[w] = wings.get(w, 0) + sum(room_counts.values())
         return {"wings": wings}
-    col = _get_collection()
+    col = _read_collection(resolved, is_default)
     if not col:
-        return _collection_error_or_no_palace()
+        return _collection_error_or_no_palace(None if is_default else resolved)
     wings = {}
     result = {"wings": wings}
     try:
@@ -455,7 +468,7 @@ def tool_list_wings():
                     "Failed to fetch metadata facets, falling back to client-side loop: %s", e
                 )
             wings.clear()
-            all_meta = _get_cached_metadata(col)
+            all_meta = _get_cached_metadata(col, palace_path=None if is_default else resolved)
             for m in all_meta:
                 m = m or {}
                 w = m.get("wing", "unknown")
@@ -467,12 +480,15 @@ def tool_list_wings():
     return result
 
 
-def tool_list_rooms(wing: str = None):
+def tool_list_rooms(wing: str = None, palace: str = None):
     try:
         wing = _sanitize_optional_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
-    fast = _sqlite_taxonomy()
+    resolved, is_default, err = _read_target(palace)
+    if err:
+        return err
+    fast = _sqlite_taxonomy() if is_default else None
     if fast is not None:
         _total, wing_rooms = fast
         rooms = {}
@@ -482,9 +498,9 @@ def tool_list_rooms(wing: str = None):
             for r, n in room_counts.items():
                 rooms[r] = rooms.get(r, 0) + n
         return {"wing": wing or "all", "rooms": rooms}
-    col = _get_collection()
+    col = _read_collection(resolved, is_default)
     if not col:
-        return _collection_error_or_no_palace()
+        return _collection_error_or_no_palace(None if is_default else resolved)
     rooms = {}
     result = {"wing": wing or "all", "rooms": rooms}
     where = {"wing": wing} if wing else None
@@ -522,14 +538,17 @@ def tool_list_rooms(wing: str = None):
     return result
 
 
-def tool_get_taxonomy():
-    fast = _sqlite_taxonomy()
+def tool_get_taxonomy(palace: str = None):
+    resolved, is_default, err = _read_target(palace)
+    if err:
+        return err
+    fast = _sqlite_taxonomy() if is_default else None
     if fast is not None:
         _total, wing_rooms = fast
         return {"taxonomy": {w: dict(room_counts) for w, room_counts in wing_rooms.items()}}
-    col = _get_collection()
+    col = _read_collection(resolved, is_default)
     if not col:
-        return _collection_error_or_no_palace()
+        return _collection_error_or_no_palace(None if is_default else resolved)
     taxonomy = {}
     result = {"taxonomy": taxonomy}
     try:
@@ -561,7 +580,7 @@ def tool_get_taxonomy():
                 logger.warning(
                     "Failed to fetch metadata facets, falling back to client-side loop: %s", e
                 )
-            all_meta = _get_cached_metadata(col)
+            all_meta = _get_cached_metadata(col, palace_path=None if is_default else resolved)
             for m in all_meta:
                 m = m or {}
                 w = m.get("wing", "unknown")
@@ -971,9 +990,14 @@ def tool_search_hierarchical(
     return _attach_sanitizer_info(result)
 
 
-def tool_check_duplicate(content: str, threshold: float = 0.9):
-    _refresh_vector_disabled_flag()
-    if _vector_disabled:
+def tool_check_duplicate(content: str, threshold: float = 0.9, palace: str = None):
+    resolved, is_default, err = _read_target(palace)
+    if err:
+        return err
+    # The vector-disabled flag describes the default palace's HNSW health only.
+    if is_default:
+        _refresh_vector_disabled_flag()
+    if is_default and _vector_disabled:
         # Without a usable HNSW we can't compute cosine similarity for
         # near-duplicate detection. Report the limitation rather than
         # silently returning "not a duplicate" — false negatives here
@@ -987,9 +1011,9 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
                 "duplicate detection requires vector search; run `mempalace repair` to restore"
             ),
         }
-    col = _get_collection()
+    col = _read_collection(resolved, is_default)
     if not col:
-        return _collection_error_or_no_palace()
+        return _collection_error_or_no_palace(None if is_default else resolved)
     try:
         content = strip_lone_surrogates(content)
         results = col.query(
@@ -1031,47 +1055,62 @@ def tool_get_aaak_spec():
     return {"aaak_spec": AAAK_SPEC}
 
 
-def tool_traverse_graph(start_room: str, max_hops: int = 2):
+def tool_traverse_graph(start_room: str, max_hops: int = 2, palace: str = None):
     """Walk the palace graph from a room. Find connected ideas across wings."""
     max_hops = max(1, min(max_hops, 10))
+    resolved, is_default, err = _read_target(palace)
+    if err:
+        return err
+    graph_config = _graph_config(resolved, is_default)
     # sqlite metadata path does not open HNSW. When it cannot serve, open the
     # collection here so a missing/broken palace still reports why (#1379
     # follow-up) instead of looking like a palace with no such room.
-    if _graph_sqlite_reader() is None:
-        col = _get_collection()
+    if _graph_sqlite_reader(graph_config) is None:
+        col = _read_collection(resolved, is_default)
         if not col:
-            return _collection_error_or_no_palace()
-        return traverse(start_room, col=col, max_hops=max_hops)
-    return traverse(start_room, max_hops=max_hops, config=_config)
+            return _collection_error_or_no_palace(None if is_default else resolved)
+        return traverse(
+            start_room, col=col, max_hops=max_hops, config=None if is_default else graph_config
+        )
+    return traverse(start_room, max_hops=max_hops, config=graph_config)
 
 
-def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
+def tool_find_tunnels(wing_a: str = None, wing_b: str = None, palace: str = None):
     """Find rooms that bridge two wings — the hallways connecting domains."""
     try:
         wing_a = _sanitize_optional_name(wing_a, "wing_a")
         wing_b = _sanitize_optional_name(wing_b, "wing_b")
     except ValueError as e:
         return {"error": str(e)}
-    if _graph_sqlite_reader() is None:
-        col = _get_collection()
+    resolved, is_default, err = _read_target(palace)
+    if err:
+        return err
+    graph_config = _graph_config(resolved, is_default)
+    if _graph_sqlite_reader(graph_config) is None:
+        col = _read_collection(resolved, is_default)
         if not col:
-            return _collection_error_or_no_palace()
-        return find_tunnels(wing_a, wing_b, col=col)
-    return find_tunnels(wing_a, wing_b, config=_config)
+            return _collection_error_or_no_palace(None if is_default else resolved)
+        return find_tunnels(wing_a, wing_b, col=col, config=None if is_default else graph_config)
+    return find_tunnels(wing_a, wing_b, config=graph_config)
 
 
-def tool_graph_stats():
+def tool_graph_stats(palace: str = None):
     """Palace graph overview: nodes, tunnels, edges, connectivity."""
     # Fast path: grouped sqlite read instead of paging all metadata and
     # cold-loading HNSW via build_graph(), which times out on large palaces
     # (#1379). Falls through to the client path for non-chroma backends.
-    fast = _sqlite_graph_stats()
+    resolved, is_default, err = _read_target(palace)
+    if err:
+        return err
+    graph_config = _graph_config(resolved, is_default)
+    # The sqlite fast path reads the default palace (_config) only.
+    fast = _sqlite_graph_stats() if is_default else None
     if fast is not None:
         return fast
-    col = _get_collection()
+    col = _read_collection(resolved, is_default)
     if not col:
-        return _collection_error_or_no_palace()
-    return graph_stats(col=col)
+        return _collection_error_or_no_palace(None if is_default else resolved)
+    return graph_stats(col=col, config=None if is_default else graph_config)
 
 
 def tool_mesh_peers():
@@ -1120,13 +1159,16 @@ def tool_create_tunnel(
         return {"error": str(e)}
 
 
-def tool_list_tunnels(wing: str = None):
+def tool_list_tunnels(wing: str = None, palace: str = None):
     """List all explicit cross-wing tunnels, optionally filtered by wing."""
     try:
         wing = _sanitize_optional_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
-    return list_tunnels(wing)
+    resolved, is_default, err = _read_target(palace)
+    if err:
+        return err
+    return list_tunnels(wing, config=None if is_default else _graph_config(resolved, is_default))
 
 
 def tool_delete_tunnel(tunnel_id: str):
@@ -1136,13 +1178,16 @@ def tool_delete_tunnel(tunnel_id: str):
     return delete_tunnel(tunnel_id)
 
 
-def tool_list_hallways(wing: str = None):
+def tool_list_hallways(wing: str = None, palace: str = None):
     """List within-wing hallway records, optionally filtered by wing."""
     try:
         wing = _sanitize_optional_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
-    return list_hallways(wing)
+    resolved, is_default, err = _read_target(palace)
+    if err:
+        return err
+    return list_hallways(wing, config=None if is_default else _graph_config(resolved, is_default))
 
 
 def tool_delete_hallway(hallway_id: str):
@@ -1152,14 +1197,18 @@ def tool_delete_hallway(hallway_id: str):
     return {"deleted": delete_hallway(hallway_id)}
 
 
-def tool_follow_tunnels(wing: str, room: str):
+def tool_follow_tunnels(wing: str, room: str, palace: str = None):
     """Follow explicit tunnels from a room to see connected drawers in other wings."""
     try:
         wing = sanitize_name(wing, "wing")
         room = sanitize_name(room, "room")
     except ValueError as e:
         return {"error": str(e)}
-    col = _get_collection()
+    resolved, is_default, err = _read_target(palace)
+    if err:
+        return err
+    graph_config = _graph_config(resolved, is_default)
+    col = _read_collection(resolved, is_default)
     if not col:
-        return _collection_error_or_no_palace()
-    return follow_tunnels(wing, room, col=col)
+        return _collection_error_or_no_palace(None if is_default else resolved)
+    return follow_tunnels(wing, room, col=col, config=None if is_default else graph_config)

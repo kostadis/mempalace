@@ -152,7 +152,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         return {"success": False, "error": str(e)}
 
 
-def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
+def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = "", palace: str = None):
     """
     Read an agent's recent diary entries. Returns the last N entries
     in chronological order — the agent's personal journal.
@@ -175,9 +175,12 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
     except ValueError as e:
         return {"error": str(e)}
     last_n = max(1, min(last_n, 100))
-    col = _get_collection()
+    resolved, is_default, err = _read_target(palace)
+    if err:
+        return err
+    col = _read_collection(resolved, is_default)
     if not col:
-        return _collection_error_or_no_palace()
+        return _collection_error_or_no_palace(None if is_default else resolved)
 
     # Build filter: always scope by agent + room=diary. Wing is optional —
     # when empty, return entries across all wings for this agent (matches

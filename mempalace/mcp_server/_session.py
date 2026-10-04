@@ -470,6 +470,26 @@ def _cross_palace_backend(palace_path: str):
     return (detected[0] if detected else None), None
 
 
+def _read_target(palace=None):
+    """Resolve a read tool's optional ``palace=`` argument.
+
+    Returns ``(resolved_path, is_default, error)``. ``error`` is an error
+    dict for an unknown alias, else None. Tools keep their unchanged
+    default-palace path (no-arg ``_get_collection()``, the sqlite fast paths)
+    when ``is_default`` and pass ``resolved`` explicitly otherwise (#45).
+    """
+    try:
+        resolved = os.path.abspath(os.path.expanduser(_resolve_palace_arg(palace)))
+    except ValueError as e:
+        return None, False, {"error": str(e)}
+    return resolved, resolved == _default_palace_path(), None
+
+
+def _read_collection(resolved, is_default):
+    """Open the collection a read tool targets (see :func:`_read_target`)."""
+    return _get_collection() if is_default else _get_collection(palace_path=resolved)
+
+
 def _collection_error_or_no_palace(palace_path=None):
     if (
         palace_path is not None
