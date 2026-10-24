@@ -209,6 +209,20 @@ def main():
         help="Always scan these project-relative paths even if ignored; repeat or pass comma-separated paths",
     )
     p_mine.add_argument(
+        "--files-from",
+        dest="files_from",
+        default=None,
+        metavar="FILE",
+        help=(
+            "Mine exactly the files listed in FILE (newline-separated, relative to DIR "
+            "or absolute under DIR; '-' reads stdin) instead of scanning DIR. Ignore "
+            "files and skip-dirs do not apply. Listed paths that are missing, symlinks, "
+            "not regular files or of an unreadable extension are reported as SKIP lines "
+            "on stderr. Projects mode only; cannot be combined with --include-ignored "
+            "or --no-gitignore/--no-mempalaceignore."
+        ),
+    )
+    p_mine.add_argument(
         "--agent",
         default="mempalace",
         help="Your name — recorded on every drawer (default: mempalace)",
@@ -313,6 +327,38 @@ def main():
         dest="dry_run",
         action="store_false",
         help="Actually delete drawers (overrides --dry-run; requires --wing or a project root)",
+    )
+
+    # sources
+    p_sources = sub.add_parser(
+        "sources",
+        help="List every (wing, source_file) in the palace with drawer counts (read-only)",
+    )
+    p_sources.add_argument("--wing", default=None, help="Limit to one wing")
+    p_sources.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        help="Print a JSON array of {wing, source_file, source_mtime, drawers}",
+    )
+
+    # forget
+    p_forget = sub.add_parser(
+        "forget",
+        help="Delete the drawers of listed source files (dry run unless --apply)",
+    )
+    p_forget.add_argument(
+        "--sources-from",
+        dest="sources_from",
+        required=True,
+        metavar="FILE",
+        help="File of newline-separated source_file values ('-' reads stdin)",
+    )
+    p_forget.add_argument("--wing", default=None, help="Only forget drawers in this wing")
+    p_forget.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually delete (default is a dry run that deletes nothing)",
     )
 
     # search
@@ -1019,6 +1065,8 @@ def main():
         "search": cmd_search,
         "sweep": cmd_sweep,
         "sync": cmd_sync,
+        "sources": cmd_sources,
+        "forget": cmd_forget,
         "mcp": cmd_mcp,
         "serve": cmd_serve,
         "compress": cmd_compress,

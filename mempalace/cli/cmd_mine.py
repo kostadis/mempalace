@@ -3,6 +3,96 @@ if __name__ != "mempalace.cli":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.cli")
 
 
+def _read_files_from(spec):
+    """Read the newline-separated path list for ``--files-from`` (``-`` is stdin)."""
+    try:
+        if spec == "-":
+            text = sys.stdin.read()
+        else:
+            with open(os.path.expanduser(spec), encoding="utf-8", errors="surrogateescape") as fh:
+                text = fh.read()
+    except OSError as exc:
+        print(
+            f"mempalace: cannot read --files-from {spec!r}: {exc.strerror or exc}", file=sys.stderr
+        )
+        sys.exit(2)
+    return [line.strip("\r\n") for line in text.split("\n") if line.strip()]
+
+
+def _prepare_files_from(args, include_ignored, mode, source_adapter):
+    """Validate ``--files-from`` and return the list of Paths to hand to ``miner.mine``.
+
+    Usage errors exit 2. Every listed path that cannot be mined is reported as
+    ``  SKIP: <rel> (<reason>)`` on stderr (the ``scan_project`` format) and is
+    not returned, so nothing is dropped silently. Returned paths are absolute
+    and lexically under the resolved DIR, as ``scan_project`` yields them.
+    """
+    import stat
+
+    from ..miner import READABLE_EXTENSIONS
+
+    if include_ignored or getattr(args, "no_mempalaceignore", False):
+        print(
+            "mempalace: --files-from cannot be combined with --include-ignored, "
+            "--no-gitignore or --no-mempalaceignore (a listed file list bypasses scanning "
+            "and ignore files entirely)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if mode != "projects" or source_adapter:
+        print("mempalace: --files-from is only supported in projects mode", file=sys.stderr)
+        sys.exit(2)
+
+    base = Path(os.path.expanduser(args.dir)).resolve()
+    if not base.is_dir():
+        print(f"mempalace: not a directory: {args.dir}", file=sys.stderr)
+        sys.exit(2)
+
+    def _skip(label, reason):
+        try:
+            print(f"  SKIP: {label} ({reason})", file=sys.stderr)
+        except OSError:
+            pass
+
+    kept = []
+    seen = set()
+    for raw in _read_files_from(args.files_from):
+        p = Path(os.path.expanduser(raw))
+        if not p.is_absolute():
+            p = base / p
+        # Resolve the directory part only: resolving the final component would
+        # turn a symlink into its target and hide it from the symlink check.
+        p = Path(os.path.normpath(str(p)))
+        candidate = p.parent.resolve() / p.name
+        try:
+            rel = candidate.relative_to(base).as_posix()
+        except ValueError:
+            _skip(raw, "outside the mined directory")
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_symlink():
+            _skip(rel, "symlink")
+            continue
+        try:
+            st = candidate.stat()
+        except FileNotFoundError:
+            _skip(rel, "missing")
+            continue
+        except OSError as exc:
+            _skip(rel, f"stat error: {exc.strerror or exc}")
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            _skip(rel, "not a regular file")
+            continue
+        if candidate.suffix.lower() not in READABLE_EXTENSIONS:
+            _skip(rel, f"unsupported extension {candidate.suffix or '(none)'}")
+            continue
+        kept.append(candidate)
+    return kept
+
+
 def cmd_mine(args):
     palace_path = _resolve_cli_palace(args)
     mode = getattr(args, "mode", None) or "projects"
@@ -36,10 +126,21 @@ def cmd_mine(args):
     if source_adapter:
         payload["source_adapter"] = source_adapter
 
+    files_from_list = None
+    if getattr(args, "files_from", None) is not None:
+        files_from_list = _prepare_files_from(args, include_ignored, mode, source_adapter)
+
     routing = _resolve_cli_write_routing_or_exit(
         args,
         "mine",
     )
+    if routing.use_daemon and files_from_list is not None:
+        print(
+            "mempalace: --files-from cannot be submitted to the write daemon; "
+            "run it with direct write routing",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     if routing.use_daemon:
         _submit_daemon_cli_job(
             "mine",
@@ -74,7 +175,14 @@ def cmd_mine(args):
     # direct mine here would be refused. Hand the job to the hub instead —
     # this is how the save hooks keep capturing transcripts on a machine
     # that runs `mempalace serve`.
-    if _mine_args_forwardable(args, include_ignored) and _forward_mine_to_hub(args, palace_path):
+    # A --files-from mine is never forwarded: the mempalace_mine MCP tool has no
+    # parameter for an explicit file list, so forwarding would silently mine the
+    # whole directory instead. Like --include-ignored it takes the direct path.
+    if (
+        files_from_list is None
+        and _mine_args_forwardable(args, include_ignored)
+        and _forward_mine_to_hub(args, palace_path)
+    ):
         return
 
     # --redetect-origin re-runs corpus_origin on the current corpus state
@@ -116,6 +224,8 @@ def cmd_mine(args):
         else:
             from ..miner import mine
 
+            # Only pass ``files`` for --files-from; None would mean "scan" anyway.
+            extra = {} if files_from_list is None else {"files": files_from_list}
             mine(
                 project_dir=args.dir,
                 palace_path=palace_path,
@@ -127,6 +237,7 @@ def cmd_mine(args):
                 include_ignored=include_ignored,
                 workers=getattr(args, "workers", None),
                 max_chunks_per_file=getattr(args, "max_chunks_per_file", None),
+                **extra,
             )
     except MineAlreadyRunning as exc:
         # A live MCP server or another mine is already writing to this

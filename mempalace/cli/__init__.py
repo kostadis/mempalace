@@ -86,6 +86,8 @@ _FRAGMENTS = (
     "_hub.py",
     "cmd_mine.py",
     "cmd_sync.py",
+    "cmd_sources.py",
+    "cmd_forget.py",
     "cmd_query.py",
     "cmd_update.py",
     "cmd_coord.py",
