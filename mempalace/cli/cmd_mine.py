@@ -19,13 +19,16 @@ def _read_files_from(spec):
     return [line.strip("\r\n") for line in text.split("\n") if line.strip()]
 
 
-def _prepare_files_from(args, include_ignored, mode, source_adapter):
+def _prepare_files_from(args, include_ignored, mode, source_adapter, skip_log=None):
     """Validate ``--files-from`` and return the list of Paths to hand to ``miner.mine``.
 
     Usage errors exit 2. Every listed path that cannot be mined is reported as
     ``  SKIP: <rel> (<reason>)`` on stderr (the ``scan_project`` format) and is
     not returned, so nothing is dropped silently. Returned paths are absolute
     and lexically under the resolved DIR, as ``scan_project`` yields them.
+    When ``skip_log`` is given, each such skip is also recorded in it with a
+    reason code (``outside_dir``, ``symlink``, ``missing``, ``stat_error``,
+    ``not_regular``, ``unsupported_ext``).
     """
     import stat
 
@@ -48,7 +51,9 @@ def _prepare_files_from(args, include_ignored, mode, source_adapter):
         print(f"mempalace: not a directory: {args.dir}", file=sys.stderr)
         sys.exit(2)
 
-    def _skip(label, reason):
+    def _skip(label, reason, code=None, rel=None):
+        if skip_log is not None and code:
+            skip_log.add(rel if rel is not None else label, code, reason)
         try:
             print(f"  SKIP: {label} ({reason})", file=sys.stderr)
         except OSError:
@@ -67,33 +72,46 @@ def _prepare_files_from(args, include_ignored, mode, source_adapter):
         try:
             rel = candidate.relative_to(base).as_posix()
         except ValueError:
-            _skip(raw, "outside the mined directory")
+            _skip(
+                raw,
+                "outside the mined directory",
+                "outside_dir",
+                rel=Path(os.path.relpath(str(p), str(base))).as_posix(),
+            )
             continue
         if candidate in seen:
             continue
         seen.add(candidate)
         if candidate.is_symlink():
-            _skip(rel, "symlink")
+            _skip(rel, "symlink", "symlink")
             continue
         try:
             st = candidate.stat()
         except FileNotFoundError:
-            _skip(rel, "missing")
+            _skip(rel, "missing", "missing")
             continue
         except OSError as exc:
-            _skip(rel, f"stat error: {exc.strerror or exc}")
+            _skip(rel, f"stat error: {exc.strerror or exc}", "stat_error")
             continue
         if not stat.S_ISREG(st.st_mode):
-            _skip(rel, "not a regular file")
+            _skip(rel, "not a regular file", "not_regular")
             continue
         if candidate.suffix.lower() not in READABLE_EXTENSIONS:
-            _skip(rel, f"unsupported extension {candidate.suffix or '(none)'}")
+            _skip(
+                rel,
+                f"unsupported extension {candidate.suffix or '(none)'}",
+                "unsupported_ext",
+            )
             continue
         kept.append(candidate)
     return kept
 
 
 def cmd_mine(args):
+    skips_json = getattr(args, "skips_json", None)
+    if skips_json is not None and getattr(args, "files_from", None) is None:
+        print("mempalace: --skips-json requires --files-from", file=sys.stderr)
+        sys.exit(2)
     palace_path = _resolve_cli_palace(args)
     mode = getattr(args, "mode", None) or "projects"
     source_adapter = getattr(args, "source", None)
@@ -127,8 +145,13 @@ def cmd_mine(args):
         payload["source_adapter"] = source_adapter
 
     files_from_list = None
+    skip_log = None
     if getattr(args, "files_from", None) is not None:
-        files_from_list = _prepare_files_from(args, include_ignored, mode, source_adapter)
+        if skips_json is not None:
+            from ..miner import SkipLog
+
+            skip_log = SkipLog(Path(os.path.expanduser(args.dir)).resolve())
+        files_from_list = _prepare_files_from(args, include_ignored, mode, source_adapter, skip_log)
 
     routing = _resolve_cli_write_routing_or_exit(
         args,
@@ -185,17 +208,17 @@ def cmd_mine(args):
     ):
         return
 
-    # --redetect-origin re-runs corpus_origin on the current corpus state
-    # and overwrites <palace>/.mempalace/origin.json before mining proceeds.
-    # Heuristic-only by design — full LLM detection lives on `mempalace init`.
-    if getattr(args, "redetect_origin", False):
-        _run_pass_zero(
-            project_dir=args.dir,
-            palace_dir=palace_path,
-            llm_provider=None,
-        )
-
     try:
+        # --redetect-origin re-runs corpus_origin on the current corpus state
+        # and overwrites <palace>/.mempalace/origin.json before mining proceeds.
+        # Heuristic-only by design — full LLM detection lives on `mempalace init`.
+        if getattr(args, "redetect_origin", False):
+            _run_pass_zero(
+                project_dir=args.dir,
+                palace_dir=palace_path,
+                llm_provider=None,
+            )
+
         if mode == "convos":
             from ..convo_miner import mine_convos
 
@@ -226,6 +249,8 @@ def cmd_mine(args):
 
             # Only pass ``files`` for --files-from; None would mean "scan" anyway.
             extra = {} if files_from_list is None else {"files": files_from_list}
+            if skip_log is not None:
+                extra["skip_log"] = skip_log
             mine(
                 project_dir=args.dir,
                 palace_path=palace_path,
@@ -264,6 +289,18 @@ def cmd_mine(args):
             file=sys.stderr,
         )
         sys.exit(1)
+    finally:
+        # Best effort: write whatever was collected, even if the mine failed
+        # partway. A write error must not mask the mine's own outcome or change
+        # its exit code, so it is only warned about.
+        if skip_log is not None:
+            try:
+                skip_log.write(skips_json)
+            except Exception as exc:
+                print(
+                    f"mempalace: cannot write --skips-json {skips_json!r}: {exc}",
+                    file=sys.stderr,
+                )
 
 
 class UnknownSourceAdapterError(ValueError):

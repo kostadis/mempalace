@@ -160,6 +160,300 @@ class TestFilesFrom:
         assert exc.value.code == 2
 
 
+class _Proxy:
+    """Delegating collection wrapper that lets a test override single methods."""
+
+    def __init__(self, real, **overrides):
+        self._real = real
+        self._overrides = overrides
+
+    def __getattr__(self, name):
+        return self._overrides.get(name, getattr(self._real, name))
+
+
+class TestSkipsJson:
+    BODY = "The quick brown fox jumps over the lazy dog. " * 120  # many chunks
+
+    def _root(self, tmp_path):
+        root = tmp_path / "corpus"
+        root.mkdir()
+        return root
+
+    def _mine(self, monkeypatch, palace_path, root, listing, out, *extra):
+        lst = root.parent / "list.txt"
+        lst.write_text(listing)
+        _run(
+            monkeypatch,
+            "--palace",
+            palace_path,
+            "mine",
+            str(root),
+            "--files-from",
+            str(lst),
+            "--skips-json",
+            str(out),
+            "--wing",
+            "w",
+            "--workers",
+            "1",
+            *extra,
+        )
+        return json.loads(out.read_text())
+
+    @staticmethod
+    def _by_path(records):
+        return {r["path"]: r for r in records}
+
+    def test_listed_but_unminable_cmd_level_codes(self, monkeypatch, tmp_path, palace_path):
+        root = self._root(tmp_path)
+        (root / "real.md").write_text(self.BODY)
+        (root / "link.md").symlink_to(root / "real.md")
+        (root / "adir.md").mkdir()
+        (root / "pic.png").write_bytes(b"\x89PNG")
+        (root / "denied.md").write_text(self.BODY)
+        orig_stat = type(root).stat
+
+        def fake_stat(self, *a, **k):
+            if self.name == "denied.md" and k.get("follow_symlinks", True):
+                raise PermissionError(13, "Permission denied")
+            return orig_stat(self, *a, **k)
+
+        monkeypatch.setattr(type(root), "stat", fake_stat)
+        out = tmp_path / "skips.json"
+        recs = self._mine(
+            monkeypatch,
+            palace_path,
+            root,
+            "real.md\nmissing.md\nlink.md\nadir.md\npic.png\ndenied.md\n../outside.md\n",
+            out,
+        )
+        got = {r["path"]: r["reason"] for r in recs}
+        assert got == {
+            "missing.md": "missing",
+            "link.md": "symlink",
+            "adir.md": "not_regular",
+            "pic.png": "unsupported_ext",
+            "denied.md": "stat_error",
+            "../outside.md": "outside_dir",
+        }
+        assert all(set(r) == {"path", "reason", "detail"} for r in recs)
+        assert "Permission denied" in self._by_path(recs)["denied.md"]["detail"]
+
+    def test_too_large(self, monkeypatch, tmp_path, palace_path):
+        root = self._root(tmp_path)
+        (root / "big.md").write_text(self.BODY)
+        monkeypatch.setattr("mempalace.miner.MAX_FILE_SIZE", 100)
+        recs = self._mine(monkeypatch, palace_path, root, "big.md\n", tmp_path / "o.json")
+        assert [(r["path"], r["reason"]) for r in recs] == [("big.md", "too_large")]
+
+    def test_chunk_cap_and_stderr_unchanged(self, monkeypatch, tmp_path, palace_path, capsys):
+        root = self._root(tmp_path)
+        (root / "long.md").write_text(self.BODY)
+        recs = self._mine(
+            monkeypatch,
+            palace_path,
+            root,
+            "long.md\n",
+            tmp_path / "o.json",
+            "--max-chunks-per-file",
+            "1",
+        )
+        assert [(r["path"], r["reason"]) for r in recs] == [("long.md", "chunk_cap")]
+        assert "! [skip] long.md" in capsys.readouterr().err
+
+    def test_too_short(self, monkeypatch, tmp_path, palace_path):
+        root = self._root(tmp_path)
+        (root / "tiny.md").write_text("x")
+        recs = self._mine(monkeypatch, palace_path, root, "tiny.md\n", tmp_path / "o.json")
+        assert [(r["path"], r["reason"]) for r in recs] == [("tiny.md", "too_short")]
+
+    def test_same_name_in_different_dirs_reports_exact_path(
+        self, monkeypatch, tmp_path, palace_path
+    ):
+        root = self._root(tmp_path)
+        (root / "a").mkdir()
+        (root / "b").mkdir()
+        (root / "a" / "notes.md").write_text(self.BODY)
+        (root / "b" / "notes.md").write_text("x")
+        recs = self._mine(
+            monkeypatch, palace_path, root, "a/notes.md\nb/notes.md\n", tmp_path / "o.json"
+        )
+        assert [(r["path"], r["reason"]) for r in recs] == [("b/notes.md", "too_short")]
+
+    def test_same_name_chunk_cap_path_not_basename(self, monkeypatch, tmp_path, palace_path):
+        root = self._root(tmp_path)
+        (root / "a").mkdir()
+        (root / "b").mkdir()
+        (root / "a" / "n.md").write_text("short but valid " * 5)
+        (root / "b" / "n.md").write_text(self.BODY)
+        recs = self._mine(
+            monkeypatch,
+            palace_path,
+            root,
+            "a/n.md\nb/n.md\n",
+            tmp_path / "o.json",
+            "--max-chunks-per-file",
+            "2",
+        )
+        assert [(r["path"], r["reason"]) for r in recs] == [("b/n.md", "chunk_cap")]
+
+    def test_excluded_and_limit(self, monkeypatch, tmp_path, palace_path):
+        root = self._root(tmp_path)
+        (root / "mempalace.yaml").write_text(
+            "wing: w\nrooms:\n- name: general\n  description: x\nexclude_patterns:\n- skipme.md\n"
+        )
+        for n in ("skipme.md", "one.md", "two.md"):
+            (root / n).write_text(self.BODY)
+        recs = self._mine(
+            monkeypatch,
+            palace_path,
+            root,
+            "skipme.md\none.md\ntwo.md\n",
+            tmp_path / "o.json",
+            "--limit",
+            "1",
+        )
+        assert {r["path"]: r["reason"] for r in recs} == {
+            "skipme.md": "excluded",
+            "two.md": "limit",
+        }
+
+    def _real_collection_proxy(self, monkeypatch, **overrides):
+        import mempalace.miner as miner
+
+        real_get = miner.get_collection
+        monkeypatch.setattr(
+            miner, "get_collection", lambda *a, **k: _Proxy(real_get(*a, **k), **overrides)
+        )
+
+    def test_purge_skipped(self, monkeypatch, tmp_path, palace_path):
+        root = self._root(tmp_path)
+        (root / "f.md").write_text(self.BODY)
+        out = tmp_path / "o.json"
+        assert self._mine(monkeypatch, palace_path, root, "f.md\n", out) == []
+        (root / "f.md").write_text(self.BODY + " changed " * 50)
+        os.utime(root / "f.md", (1, 1))  # force an mtime mismatch -> re-mine
+
+        def boom(**kw):
+            raise RuntimeError("delete refused")
+
+        self._real_collection_proxy(monkeypatch, delete=boom)
+        recs = self._mine(monkeypatch, palace_path, root, "f.md\n", out)
+        assert [(r["path"], r["reason"]) for r in recs] == [("f.md", "purge_skipped")]
+        assert "delete refused" in recs[0]["detail"]
+
+    def test_write_failed(self, monkeypatch, tmp_path, palace_path):
+        root = self._root(tmp_path)
+        (root / "f.md").write_text(self.BODY)
+
+        def boom(**kw):
+            raise RuntimeError("upsert refused")
+
+        self._real_collection_proxy(monkeypatch, upsert=boom)
+        recs = self._mine(monkeypatch, palace_path, root, "f.md\n", tmp_path / "o.json")
+        assert [(r["path"], r["reason"]) for r in recs] == [("f.md", "write_failed")]
+
+    def test_producer_failure_is_failed(self, monkeypatch, tmp_path, palace_path):
+        root = self._root(tmp_path)
+        (root / "sub").mkdir()
+        (root / "sub" / "f.md").write_text(self.BODY)
+
+        def boom(*a, **k):
+            raise RuntimeError("embed down")
+
+        monkeypatch.setattr("mempalace.miner._embed_prepared", boom)
+        recs = self._mine(monkeypatch, palace_path, root, "sub/f.md\n", tmp_path / "o.json")
+        assert [(r["path"], r["reason"]) for r in recs] == [("sub/f.md", "failed")]
+        assert "embed down" in recs[0]["detail"]
+
+    def test_requires_files_from(self, monkeypatch, tmp_path, palace_path, capsys):
+        root = self._root(tmp_path)
+        out = tmp_path / "o.json"
+        with pytest.raises(SystemExit) as exc:
+            _run(
+                monkeypatch,
+                "--palace",
+                palace_path,
+                "mine",
+                str(root),
+                "--skips-json",
+                str(out),
+            )
+        assert exc.value.code == 2
+        assert "--skips-json requires --files-from" in capsys.readouterr().err
+        assert not out.exists()
+
+    def test_empty_array_when_nothing_skipped(self, monkeypatch, tmp_path, palace_path):
+        root = self._root(tmp_path)
+        (root / "ok.md").write_text(self.BODY)
+        out = tmp_path / "o.json"
+        assert self._mine(monkeypatch, palace_path, root, "ok.md\n", out) == []
+        assert not [p for p in tmp_path.iterdir() if p.name.startswith(".skips-")]
+
+    def test_atomic_write_leaves_old_file_and_no_temp_on_failure(
+        self, monkeypatch, tmp_path, palace_path, capsys
+    ):
+        root = self._root(tmp_path)
+        (root / "ok.md").write_text(self.BODY)
+        out = tmp_path / "o.json"
+        out.write_text('["previous"]')
+
+        def boom(*a, **k):
+            raise OSError("replace failed")
+
+        monkeypatch.setattr(os, "replace", boom)
+        lst = tmp_path / "list.txt"
+        lst.write_text("ok.md\nmissing.md\n")
+        _run(
+            monkeypatch,
+            "--palace",
+            palace_path,
+            "mine",
+            str(root),
+            "--files-from",
+            str(lst),
+            "--skips-json",
+            str(out),
+            "--dry-run",
+        )
+        assert out.read_text() == '["previous"]'
+        assert not [p for p in tmp_path.iterdir() if p.name.startswith(".skips-")]
+        assert "cannot write --skips-json" in capsys.readouterr().err
+
+    def test_written_when_mine_fails_partway(self, monkeypatch, tmp_path, palace_path):
+        root = self._root(tmp_path)
+        (root / "ok.md").write_text(self.BODY)
+        out = tmp_path / "o.json"
+
+        def boom(*a, **k):
+            raise RuntimeError("palace exploded")
+
+        monkeypatch.setattr("mempalace.miner.get_collection", boom)
+        lst = tmp_path / "list.txt"
+        lst.write_text("ok.md\nmissing.md\n")
+        with pytest.raises(RuntimeError, match="palace exploded"):
+            _run(
+                monkeypatch,
+                "--palace",
+                palace_path,
+                "mine",
+                str(root),
+                "--files-from",
+                str(lst),
+                "--skips-json",
+                str(out),
+            )
+        assert [(r["path"], r["reason"]) for r in json.loads(out.read_text())] == [
+            ("missing.md", "missing")
+        ]
+
+    def test_help_lists_flag(self, monkeypatch, capsys):
+        with pytest.raises(SystemExit) as exc:
+            _run(monkeypatch, "mine", "--help")
+        assert exc.value.code == 0
+        assert "--skips-json" in capsys.readouterr().out
+
+
 class TestSources:
     def test_json_rows_sorted(self, monkeypatch, seeded, capsys):
         _run(monkeypatch, "--palace", seeded, "sources", "--json")
