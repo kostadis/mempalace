@@ -52,6 +52,50 @@ from .ids import ID_RECIPE, make_drawer_id_from_chunk
 logger = logging.getLogger("mempalace_mcp")
 
 
+class SkipLog:
+    """Collects one record per ``--files-from`` file that was not (fully) mined.
+
+    Records carry the listed path relative to ``root`` (POSIX separators), a
+    machine-readable ``reason`` code and free-text ``detail``. Appends are
+    thread-safe (list.append), so producer threads may record directly.
+    """
+
+    def __init__(self, root):
+        self.root = Path(root)
+        self.records: list = []
+
+    def _rel(self, path) -> str:
+        p = Path(path)
+        try:
+            return p.relative_to(self.root).as_posix()
+        except ValueError:
+            return p.as_posix()
+
+    def add(self, path, reason: str, detail: str = "") -> None:
+        """Record a skip; ``path`` may be absolute (under root) or already relative."""
+        self.records.append({"path": self._rel(path), "reason": reason, "detail": detail})
+
+    def write(self, out) -> None:
+        """Atomically write the records to ``out`` as a JSON array (temp + os.replace)."""
+        import json
+
+        out = os.path.abspath(os.path.expanduser(str(out)))
+        fd, tmp = tempfile.mkstemp(
+            dir=os.path.dirname(out), prefix=".skips-", suffix=".tmp", text=True
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(self.records, fh, ensure_ascii=False, indent=2)
+                fh.write("\n")
+            os.replace(tmp, out)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+
 def _path_within_root(path: Path, root: Path) -> bool:
     try:
         path.expanduser().resolve().relative_to(root.expanduser().resolve())
@@ -60,13 +104,25 @@ def _path_within_root(path: Path, root: Path) -> bool:
         return False
 
 
-def _read_text_no_follow(filepath: Path, root: Path) -> Optional[tuple[str, float]]:
+def _read_text_no_follow(
+    filepath: Path, root: Path, skip_info: Optional[dict] = None
+) -> Optional[tuple[str, float]]:
     """Read ``filepath`` and return ``(content, mtime)`` from the SAME
     ``fstat()`` call that validated the file, so callers never need a
     separate, later ``os.path.getmtime()`` that could observe a file
     modified in between (see #22: a stale re-stat lets appended content
-    be silently and permanently skipped)."""
+    be silently and permanently skipped).
+
+    When ``skip_info`` (a dict) is given, a ``None`` return fills it with
+    ``reason``/``detail`` describing why the file was not read."""
+
+    def _why(reason, detail=""):
+        if skip_info is not None:
+            skip_info["reason"] = reason
+            skip_info["detail"] = detail
+
     if not _path_within_root(filepath, root):
+        _why("outside_dir", "resolves outside the mined directory")
         return None
     # O_NONBLOCK is what makes the S_ISREG check below reachable. Opening a
     # FIFO for reading parks in the kernel until a writer shows up, so
@@ -93,13 +149,25 @@ def _read_text_no_follow(filepath: Path, root: Path) -> Optional[tuple[str, floa
                 raise
             fd = os.open(filepath, flags & ~getattr(os, "O_NONBLOCK", 0))
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_FILE_SIZE:
+        if not stat.S_ISREG(st.st_mode):
+            _why("not_regular", "not a regular file")
+            return None
+        if st.st_size > MAX_FILE_SIZE:
+            _why(
+                "too_large",
+                f"{st.st_size / (1024 * 1024):.1f} MB exceeds "
+                f"{MAX_FILE_SIZE // (1024 * 1024)} MB limit",
+            )
             return None
         mtime = st.st_mtime
         with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f:
             fd = -1
             return f.read(), mtime
-    except OSError:
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            _why("symlink", "symlink")
+        else:
+            _why("stat_error", f"read error: {exc.strerror or exc}")
         return None
     finally:
         if fd != -1:
@@ -1905,6 +1973,7 @@ def _prepare_file(
     min_chunk_size: int = None,
     max_chunks_per_file: Optional[int] = None,
     palace_path: Optional[str] = None,
+    skip_log: Optional[SkipLog] = None,
 ) -> Optional[_PreparedFile]:
     """Read, chunk, and pre-build per-batch documents/ids/metadata.
 
@@ -1926,13 +1995,30 @@ def _prepare_file(
     if not dry_run and file_already_mined(collection, source_file, check_mtime=True):
         return None
 
-    read_result = _read_text_no_follow(filepath, project_path)
+    skip_info: Optional[dict] = {} if skip_log is not None else None
+    read_result = (
+        _read_text_no_follow(filepath, project_path)
+        if skip_info is None
+        else _read_text_no_follow(filepath, project_path, skip_info)
+    )
     if read_result is None:
+        if skip_log is not None:
+            skip_log.add(
+                filepath,
+                skip_info.get("reason", "stat_error"),
+                skip_info.get("detail", ""),
+            )
         return None
     content, read_mtime = read_result
 
     content = content.strip()
     if len(content) < effective_min:
+        if skip_log is not None:
+            skip_log.add(
+                filepath,
+                "too_short",
+                f"content shorter than the {effective_min}-character minimum",
+            )
         return None
 
     room = detect_room(filepath, content, rooms, project_path)
@@ -1957,6 +2043,10 @@ def _prepare_file(
             f"SKIP_FILENAMES if this is a generated artifact",
             file=sys.stderr,
         )
+        if skip_log is not None:
+            skip_log.add(
+                filepath, "chunk_cap", f"produced {len(chunks)} chunks (> {effective_cap})"
+            )
         return _PreparedFile(
             source_file=source_file,
             room=room,
@@ -2043,6 +2133,7 @@ def _write_prepared(
     closets_col,
     wing: str,
     palace_path: Optional[str] = None,
+    skip_log: Optional[SkipLog] = None,
 ) -> int:
     """Single-writer phase: under ``mine_lock``, upsert with pre-computed embeddings.
 
@@ -2084,6 +2175,13 @@ def _write_prepared(
                 file=sys.stderr,
             )
             logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
+            if skip_log is not None:
+                skip_log.add(
+                    source_file,
+                    "purge_skipped",
+                    f"stale-drawer purge failed ({exc!r}); existing drawers left untouched, "
+                    "new drawers not written",
+                )
             return 0
 
         drawers_added = 0
@@ -2174,6 +2272,7 @@ def process_file(
     min_chunk_size: int = None,
     max_chunks_per_file: Optional[int] = None,
     palace_path: Optional[str] = None,
+    skip_log: Optional[SkipLog] = None,
 ) -> tuple:
     """Read, chunk, route, and file one file.
 
@@ -2200,6 +2299,7 @@ def process_file(
         min_chunk_size=min_chunk_size,
         max_chunks_per_file=max_chunks_per_file,
         palace_path=palace_path,
+        skip_log=skip_log,
     )
     if prepared is None:
         return 0, "general", None
@@ -2219,7 +2319,13 @@ def process_file(
     ef = get_embedding_function()
     embeddings_batches = _embed_prepared(prepared, ef)
     drawers_added = _write_prepared(
-        prepared, embeddings_batches, collection, closets_col, wing, palace_path=palace_path
+        prepared,
+        embeddings_batches,
+        collection,
+        closets_col,
+        wing,
+        palace_path=palace_path,
+        skip_log=skip_log,
     )
     return drawers_added, prepared.room, None
 
@@ -2371,6 +2477,7 @@ def mine(
     files: list = None,
     workers: Optional[int] = None,
     max_chunks_per_file: Optional[int] = None,
+    skip_log: Optional[SkipLog] = None,
 ):
     """Mine a project directory into the palace.
 
@@ -2404,6 +2511,7 @@ def mine(
             files=files,
             workers=workers,
             max_chunks_per_file=max_chunks_per_file,
+            skip_log=skip_log,
         )
 
     # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
@@ -2422,6 +2530,7 @@ def mine(
             files=files,
             workers=workers,
             max_chunks_per_file=max_chunks_per_file,
+            skip_log=skip_log,
         )
 
 
@@ -2437,6 +2546,7 @@ def _mine_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run/parall
     files: list = None,
     workers: Optional[int] = None,
     max_chunks_per_file: Optional[int] = None,
+    skip_log: Optional[SkipLog] = None,
 ):
     project_path = Path(project_dir).expanduser().resolve()
     config = load_config(project_dir)
@@ -2458,10 +2568,19 @@ def _mine_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run/parall
             exclude_patterns=exclude_patterns,
         )
     elif exclude_patterns:
+        listed = files
         files = _apply_exclude_patterns_to_prescanned_files(
             files, project_path, exclude_patterns, include_ignored
         )
+        if skip_log is not None:
+            kept = set(files)
+            for f in listed:
+                if f not in kept:
+                    skip_log.add(f, "excluded", "matched exclude_patterns in mempalace.yaml")
     if limit > 0:
+        if skip_log is not None:
+            for f in files[limit:]:
+                skip_log.add(f, "limit", f"beyond --limit {limit}")
         files = files[:limit]
 
     from .embedding import describe_device, get_embedding_function
@@ -2530,6 +2649,7 @@ def _mine_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run/parall
                         min_chunk_size=cfg_min_chunk_size,
                         max_chunks_per_file=effective_chunk_cap,
                         palace_path=palace_path,
+                        skip_log=skip_log,
                     )
                 except KeyboardInterrupt:
                     last_file = filepath.name
@@ -2567,6 +2687,7 @@ def _mine_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run/parall
                     min_chunk_size=cfg_min_chunk_size,
                     max_chunks_per_file=effective_chunk_cap,
                     palace_path=palace_path,
+                    skip_log=skip_log,
                 )
                 if prepared is None:
                     return WorkerResult(
@@ -2607,9 +2728,26 @@ def _mine_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run/parall
                         files_skipped_chunk_cap += 1
                     return
                 prepared, embeddings = result.payload
-                drawers = _write_prepared(
-                    prepared, embeddings, collection, closets_col, wing, palace_path=palace_path
-                )
+                try:
+                    drawers = _write_prepared(
+                        prepared,
+                        embeddings,
+                        collection,
+                        closets_col,
+                        wing,
+                        palace_path=palace_path,
+                        skip_log=skip_log,
+                    )
+                except Exception as exc:
+                    # ParallelPipeline logs and swallows consumer exceptions; the
+                    # file's drawers were cleaned up, so it is not mined.
+                    if skip_log is not None:
+                        skip_log.add(
+                            prepared.source_file,
+                            "write_failed",
+                            f"{type(exc).__name__}: {exc}",
+                        )
+                    raise
                 if drawers == 0:
                     files_skipped += 1
                     return
@@ -2624,6 +2762,13 @@ def _mine_impl(  # noqa: C901 — parallel-pipeline orchestrator: dry-run/parall
                 files_processed += 1
                 files_failed += 1
                 last_file = failed.item_id
+                if skip_log is not None:
+                    # ``failed.item`` is the ``(index, filepath)`` tuple handed to run().
+                    skip_log.add(
+                        failed.item[1],
+                        "failed",
+                        f"{type(failed.exception).__name__}: {failed.exception}",
+                    )
                 print(
                     f"  ! [{failed.item_id[:50]:50}] FAILED: "
                     f"{type(failed.exception).__name__}: {failed.exception}",

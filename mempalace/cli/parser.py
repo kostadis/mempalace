@@ -223,6 +223,18 @@ def main():
         ),
     )
     p_mine.add_argument(
+        "--skips-json",
+        dest="skips_json",
+        default=None,
+        metavar="OUT",
+        help=(
+            "With --files-from: write a JSON array to OUT listing every listed file that "
+            "was not (fully) mined, as {path, reason, detail} objects (path relative to "
+            "DIR, POSIX separators). Written atomically at the end of the run, also after "
+            "a partial failure; '[]' when nothing was skipped. Requires --files-from."
+        ),
+    )
+    p_mine.add_argument(
         "--agent",
         default="mempalace",
         help="Your name — recorded on every drawer (default: mempalace)",
