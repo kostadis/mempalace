@@ -1858,6 +1858,31 @@ class MempalaceConfig:
         return val if val > 0 else _EMBEDDINGGEMMA_BATCH_SIZE
 
     @property
+    def ollama_batch_size(self) -> int:
+        """Inputs per ``/api/embed`` request for the Ollama embedder (#57).
+
+        The miner embeds up to 1000 chunks per call; one request that large
+        crashes Ollama's model runner, so ``OllamaEmbeddingFunction`` splits
+        it. Read from env ``MEMPALACE_OLLAMA_BATCH_SIZE`` first, then
+        ``ollama_batch_size`` in ``config.json``, then the module default
+        (``mempalace.embedding_ollama._OLLAMA_BATCH_SIZE``, 64). Unset,
+        non-numeric, or non-positive values fall back to the default rather
+        than raising (mirrors ``embeddinggemma_batch_size``).
+        """
+        from .embedding_ollama import _OLLAMA_BATCH_SIZE
+
+        raw = os.environ.get("MEMPALACE_OLLAMA_BATCH_SIZE")
+        if raw is None:
+            raw = self._file_config.get("ollama_batch_size")
+        if raw is None:
+            return _OLLAMA_BATCH_SIZE
+        try:
+            val = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return _OLLAMA_BATCH_SIZE
+        return val if val > 0 else _OLLAMA_BATCH_SIZE
+
+    @property
     def hybrid_rank_vector_weight(self) -> float:
         """Weight of the vector (embedding-similarity) signal in the hybrid
         re-rank (``searcher._hybrid_rank``).

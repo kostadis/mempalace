@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **Ollama embedder no longer sends a whole upsert batch in one `/api/embed` request.** The miner embeds up to 1000 chunks per call and `OllamaEmbeddingFunction` posted them as a single request, which crashed Ollama's model runner on large files (400 x 800-char chunks crashed, 300 did not) and recorded the in-flight files as index gaps. Requests are now split into sub-batches of 64 inputs, concatenated in input order, with the vector-count check per sub-batch and the `/api/embeddings` 404 fallback unchanged. Override with `MEMPALACE_OLLAMA_BATCH_SIZE` or `ollama_batch_size` in `config.json` (env, then file, then default; invalid or non-positive values fall back to 64). (#57)
+
 ---
 
 ## [3.10.0] — 2026-09-15

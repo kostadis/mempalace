@@ -31,6 +31,12 @@ from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
 
+# Inputs per ``/api/embed`` request. The miner hands ``__call__`` up to 1000
+# chunks at once; Ollama's model runner crashes on a single request that
+# large (400 x 800-char chunks reproduced it, 300 did not — #57). Override via
+# ``MEMPALACE_OLLAMA_BATCH_SIZE`` / ``ollama_batch_size`` in ``config.json``.
+_OLLAMA_BATCH_SIZE = 64
+
 
 class OllamaEmbeddingError(RuntimeError):
     """Raised when the Ollama embedding endpoint is unreachable, returns an
@@ -134,6 +140,21 @@ def _post_json(url: str, body: dict, timeout: int) -> dict:
     return _post_json_via_pool(url, body, timeout)
 
 
+def _resolve_ollama_batch_size() -> int:
+    """Read the configured Ollama sub-batch size (#57)."""
+    try:
+        from .config import MempalaceConfig
+
+        return MempalaceConfig().ollama_batch_size
+    except Exception:
+        logger.debug(
+            "ollama_batch_size resolution failed; using the %d default",
+            _OLLAMA_BATCH_SIZE,
+            exc_info=True,
+        )
+        return _OLLAMA_BATCH_SIZE
+
+
 def _build_base_class():
     """Return the ChromaDB ``EmbeddingFunction`` base class lazily.
 
@@ -163,6 +184,7 @@ class OllamaEmbeddingFunction:
         model: str,
         endpoint: str,
         timeout: int = 120,
+        batch_size: Optional[int] = None,
     ):
         if not model:
             raise ValueError("OllamaEmbeddingFunction requires a non-empty model name")
@@ -171,6 +193,11 @@ class OllamaEmbeddingFunction:
         self.model = model
         self.endpoint = endpoint.rstrip("/")
         self.timeout = timeout
+        if batch_size is None:
+            batch_size = _resolve_ollama_batch_size()
+        elif batch_size <= 0:
+            raise ValueError("OllamaEmbeddingFunction batch_size must be a positive integer")
+        self.batch_size = batch_size
         # Set on first successful batch call. ``None`` means "not yet
         # discovered"; once flipped to False the class never tries
         # ``/api/embed`` again for this instance, avoiding a 404 round-trip
@@ -268,15 +295,21 @@ class OllamaEmbeddingFunction:
         return self.__call__(input)
 
     def _embed_batch(self, texts: list) -> list:
-        body = {"model": self.model, "input": texts}
-        data = _post_json(f"{self.endpoint}/api/embed", body, self.timeout)
-        embeddings = data.get("embeddings")
-        if not isinstance(embeddings, list) or len(embeddings) != len(texts):
-            raise OllamaEmbeddingError(
-                f"Ollama /api/embed returned {len(embeddings) if isinstance(embeddings, list) else '?'} "
-                f"vectors for {len(texts)} inputs (model={self.model})"
-            )
-        return embeddings
+        """Post ``texts`` to ``/api/embed`` in sub-batches of ``self.batch_size``
+        inputs, concatenating vectors in input order (#57)."""
+        vectors: list = []
+        for start in range(0, len(texts), self.batch_size):
+            chunk = texts[start : start + self.batch_size]
+            body = {"model": self.model, "input": chunk}
+            data = _post_json(f"{self.endpoint}/api/embed", body, self.timeout)
+            embeddings = data.get("embeddings")
+            if not isinstance(embeddings, list) or len(embeddings) != len(chunk):
+                raise OllamaEmbeddingError(
+                    f"Ollama /api/embed returned {len(embeddings) if isinstance(embeddings, list) else '?'} "
+                    f"vectors for {len(chunk)} inputs (model={self.model})"
+                )
+            vectors.extend(embeddings)
+        return vectors
 
     def _embed_single(self, text: str) -> list:
         body = {"model": self.model, "prompt": text}
