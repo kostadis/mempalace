@@ -229,3 +229,152 @@ def test_check_available_reports_missing_model():
         ok, msg = ef.check_available()
     assert ok is False
     assert "ollama pull nomic-embed-text" in msg
+
+
+# ── sub-batching (#57) ──────────────────────────────────────────────────
+
+
+def _recording_urlopen(log):
+    """Fake urlopen that echoes one vector per input, tagged by the input."""
+
+    def fake(req, timeout):
+        body = json.loads(req.data.decode("utf-8"))
+        log.append(body["input"])
+        return _mock_response({"embeddings": [[float(t)] for t in body["input"]]})
+
+    return fake
+
+
+def _no_batch_env(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_OLLAMA_BATCH_SIZE", raising=False)
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(tmp_path))
+
+
+def test_splits_into_sub_batches_and_preserves_order(monkeypatch, tmp_path):
+    _no_batch_env(monkeypatch, tmp_path)
+    ef = OllamaEmbeddingFunction(model="m", endpoint="http://x", batch_size=64)
+    log = []
+    texts = [str(i) for i in range(150)]
+    with patch("mempalace.embedding_ollama.urlopen", side_effect=_recording_urlopen(log)):
+        vectors = ef(texts)
+    assert [len(b) for b in log] == [64, 64, 22]
+    assert vectors == [[float(i)] for i in range(150)]
+
+
+def test_default_batch_size_is_64(monkeypatch, tmp_path):
+    _no_batch_env(monkeypatch, tmp_path)
+    ef = OllamaEmbeddingFunction(model="m", endpoint="http://x")
+    assert ef.batch_size == 64
+    log = []
+    with patch("mempalace.embedding_ollama.urlopen", side_effect=_recording_urlopen(log)):
+        ef([str(i) for i in range(130)])
+    assert [len(b) for b in log] == [64, 64, 2]
+
+
+def test_batch_size_larger_than_input_is_one_request(monkeypatch, tmp_path):
+    _no_batch_env(monkeypatch, tmp_path)
+    ef = OllamaEmbeddingFunction(model="m", endpoint="http://x", batch_size=1000)
+    log = []
+    with patch("mempalace.embedding_ollama.urlopen", side_effect=_recording_urlopen(log)):
+        ef(["1", "2", "3"])
+    assert [len(b) for b in log] == [3]
+
+
+def test_env_override_sets_batch_size(monkeypatch, tmp_path):
+    _no_batch_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("MEMPALACE_OLLAMA_BATCH_SIZE", "10")
+    ef = OllamaEmbeddingFunction(model="m", endpoint="http://x")
+    assert ef.batch_size == 10
+    log = []
+    with patch("mempalace.embedding_ollama.urlopen", side_effect=_recording_urlopen(log)):
+        ef([str(i) for i in range(25)])
+    assert [len(b) for b in log] == [10, 10, 5]
+
+
+def test_explicit_batch_size_beats_env(monkeypatch, tmp_path):
+    _no_batch_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("MEMPALACE_OLLAMA_BATCH_SIZE", "10")
+    ef = OllamaEmbeddingFunction(model="m", endpoint="http://x", batch_size=5)
+    assert ef.batch_size == 5
+
+
+@pytest.mark.parametrize("bad", ["0", "-3", "abc", ""])
+def test_invalid_env_falls_back_to_default(monkeypatch, tmp_path, bad):
+    _no_batch_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("MEMPALACE_OLLAMA_BATCH_SIZE", bad)
+    ef = OllamaEmbeddingFunction(model="m", endpoint="http://x")
+    assert ef.batch_size == 64
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_non_positive_constructor_batch_size_rejected(bad):
+    with pytest.raises(ValueError, match="batch_size"):
+        OllamaEmbeddingFunction(model="m", endpoint="http://x", batch_size=bad)
+
+
+def test_config_json_key_sets_batch_size(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMPALACE_OLLAMA_BATCH_SIZE", raising=False)
+    (tmp_path / "config.json").write_text(json.dumps({"ollama_batch_size": 7}))
+    from mempalace.config import MempalaceConfig
+
+    assert MempalaceConfig(config_dir=str(tmp_path)).ollama_batch_size == 7
+    monkeypatch.setenv("MEMPALACE_OLLAMA_BATCH_SIZE", "3")
+    assert MempalaceConfig(config_dir=str(tmp_path)).ollama_batch_size == 3
+    monkeypatch.setenv("MEMPALACE_OLLAMA_BATCH_SIZE", "0")
+    assert MempalaceConfig(config_dir=str(tmp_path)).ollama_batch_size == 64
+
+
+def test_error_in_second_sub_batch_propagates(monkeypatch, tmp_path):
+    _no_batch_env(monkeypatch, tmp_path)
+    ef = OllamaEmbeddingFunction(model="m", endpoint="http://x", batch_size=2)
+    calls = []
+
+    def fake(req, timeout):
+        body = json.loads(req.data.decode("utf-8"))
+        calls.append(body["input"])
+        if len(calls) == 2:
+            return _mock_response({"embeddings": [[0.0]]})  # short: 1 for 2
+        return _mock_response({"embeddings": [[0.0] for _ in body["input"]]})
+
+    with patch("mempalace.embedding_ollama.urlopen", side_effect=fake):
+        with pytest.raises(OllamaEmbeddingError, match="returned 1 vectors for 2"):
+            ef(["a", "b", "c", "d", "e"])
+    assert len(calls) == 2
+
+
+def test_http_error_in_second_sub_batch_propagates(monkeypatch, tmp_path):
+    from urllib.error import HTTPError
+
+    _no_batch_env(monkeypatch, tmp_path)
+    ef = OllamaEmbeddingFunction(model="m", endpoint="http://x", batch_size=2)
+    calls = []
+
+    def fake(req, timeout):
+        calls.append(1)
+        if len(calls) == 2:
+            raise HTTPError(req.full_url, 500, "boom", {}, io.BytesIO(b"x"))
+        return _mock_response({"embeddings": [[0.0], [0.0]]})
+
+    with patch("mempalace.embedding_ollama.urlopen", side_effect=fake):
+        with pytest.raises(OllamaEmbeddingError, match="HTTP 500"):
+            ef(["a", "b", "c", "d"])
+
+
+def test_404_on_first_sub_batch_falls_back_for_whole_call(monkeypatch, tmp_path):
+    from urllib.error import HTTPError
+
+    _no_batch_env(monkeypatch, tmp_path)
+    ef = OllamaEmbeddingFunction(model="m", endpoint="http://x", batch_size=2)
+    log = []
+
+    def fake(req, timeout):
+        log.append(req.full_url)
+        if req.full_url.endswith("/api/embed"):
+            raise HTTPError(req.full_url, 404, "Not Found", {}, io.BytesIO(b""))
+        return _mock_response({"embedding": [0.5]})
+
+    with patch("mempalace.embedding_ollama.urlopen", side_effect=fake):
+        vectors = ef(["a", "b", "c"])
+    assert log == ["http://x/api/embed"] + ["http://x/api/embeddings"] * 3
+    assert vectors == [[0.5]] * 3
+    assert ef._supports_batch is False
